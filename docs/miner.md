@@ -309,6 +309,48 @@ For running your miner in the background (recommended for production), see the [
 
 ---
 
+## Dry Run: Check Your Miner Can Produce a Submission
+
+Before a validator ever queries you, run the submission pipeline offline against a local face image.
+It uses the same code path a real query does — generate variations, AdaFace identity check, drand
+timelock encryption, upload — and tells you exactly which stage fails if one does:
+
+```bash
+# Simplest: local storage, throwaway key, the standard 5-variation challenge set
+python -m MIID.miner.dry_run_submission --image /path/to/face.png
+
+# Use your real hotkey so signatures and the S3 key path match production,
+# and keep the generated images so you can look at them
+python -m MIID.miner.dry_run_submission --image /path/to/face.png \
+    --wallet-name your_wallet --wallet-hotkey your_hotkey \
+    --save-images ./dryrun_images --output ./dryrun_submissions.json
+```
+
+Output is a per-variation table:
+
+```
+  [OK  ] background_in   612847 bytes  encrypted
+           submissions/dryrun_1761402000/5Fxx.../a1b2c3d4e5f6a7b8/face/background_in_1761402000.png.tlock
+  [DROP] pose_edit — AdaFace similarity below 0.4
+```
+
+Useful flags:
+
+| Flag | Effect |
+|------|--------|
+| `--variations "pose_edit:far,lighting_edit+expression_edit:medium"` | Test specific variations instead of the standard set |
+| `--save-images DIR` | Write the unencrypted variations out so you can inspect quality |
+| `--skip-identity-check` | Show what the model produced before AdaFace filtering (diagnostic only) |
+| `--no-encrypt` | Skip drand timelock — sandbox only, real submissions must be encrypted |
+| `--s3` | Upload to the real bucket instead of local storage (requires a real wallet) |
+| `--debug` | Full bittensor debug logging |
+
+By default nothing touches the shared bucket: encrypted output goes to `MIID_LOCAL_STORAGE`
+(`/tmp/miid_submissions`). The command exits non-zero if it produced no submissions, so it also works
+as a post-setup smoke check.
+
+---
+
 ## Configuration Options
 
 Command-line arguments:

@@ -39,14 +39,11 @@ import hashlib
 import json
 import time
 import typing
-import io
-import gc
 import base64
 import bittensor as bt
 import os
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
-from PIL import Image
 
 from bittensor.core.errors import NotVerifiedException
 
@@ -102,36 +99,17 @@ def _utc_today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def _free_gpu_memory(stage: str = "") -> None:
-    """Release inter-request GPU memory and log resident VRAM."""
-    try:
-        gc.collect()
-        import torch as _torch
-        if _torch.cuda.is_available():
-            _torch.cuda.empty_cache()
-            try:
-                _torch.cuda.ipc_collect()
-            except Exception:
-                pass
-            free_b, total_b = _torch.cuda.mem_get_info(0)
-            reserved_b = _torch.cuda.memory_reserved(0)
-            allocated_b = _torch.cuda.memory_allocated(0)
-            gib = 1024 ** 3
-            bt.logging.info(
-                f"GPU mem [{stage}]: "
-                f"free={free_b / gib:.2f} GiB / total={total_b / gib:.2f} GiB, "
-                f"torch_reserved={reserved_b / gib:.2f} GiB, "
-                f"torch_allocated={allocated_b / gib:.2f} GiB"
-            )
-    except Exception as _e:
-        bt.logging.debug(f"_free_gpu_memory({stage}) failed: {_e}")
-
-
-# Phase 4 imports (optional — miner still registers without these)
+# Phase 4 imports (optional — miner still registers without these).
+# submission_builder pulls in image_generator / drand_encrypt / s3_upload, so a
+# missing image-generation stack still lands in this ImportError.
 try:
-    from MIID.miner.image_generator import decode_base_image, generate_variations, validate_face_variation
     from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
     from MIID.miner.s3_upload import upload_to_s3
+    from MIID.miner.submission_builder import (
+        build_image_submissions,
+        is_valid_image_bytes as _is_valid_image_bytes,
+        is_valid_video_bytes as _is_valid_video_bytes,
+    )
     PHASE4_AVAILABLE = True
 except ImportError as _phase4_err:
     PHASE4_AVAILABLE = False
@@ -395,24 +373,11 @@ class Miner(BaseMinerNeuron):
 
     def is_valid_image_bytes(self, image_bytes: bytes) -> bool:
         """Validate whether raw bytes represent a valid image."""
-        try:
-            with Image.open(io.BytesIO(image_bytes)) as img:
-                img.verify()
-            return True
-        except Exception:
-            return False
+        return _is_valid_image_bytes(image_bytes)
 
     def is_valid_video_bytes(self, video_bytes: bytes, suffix: str = "") -> bool:
         """Lightweight check that bytes look like a short screen-replay video."""
-        if not video_bytes or len(video_bytes) < 32:
-            return False
-        head = video_bytes[:64]
-        ext = (suffix or "").lower()
-        if ext in (".mp4", ".mov", ".m4v"):
-            return b"ftyp" in head
-        if ext == ".webm":
-            return head.startswith(b"\x1a\x45\xdf\xa3")
-        return b"ftyp" in head or head.startswith(b"\x1a\x45\xdf\xa3")
+        return _is_valid_video_bytes(video_bytes, suffix=suffix)
 
     def process_image_request(self, synapse: IdentitySynapse) -> List[S3Submission]:
         """
@@ -422,114 +387,17 @@ class Miner(BaseMinerNeuron):
         encrypts with drand timelock, uploads to S3, and returns
         S3 submission objects.
 
+        The pipeline itself lives in MIID/miner/submission_builder.py so that
+        `python -m MIID.miner.dry_run_submission` can exercise this same code
+        offline, without a validator query.
+
         Args:
             synapse: IdentitySynapse with image_request
 
         Returns:
             List of S3Submission objects
         """
-        image_request = synapse.image_request
-        if not image_request:
-            return []
-
-        _free_gpu_memory("before_request")
-
-        try:
-            bt.logging.info(f"Phase 4: Decoding base image: {image_request.image_filename}")
-            base_image = decode_base_image(image_request.base_image)
-
-            seed_image_name = image_request.image_filename
-            for ext in ('.png', '.jpg', '.jpeg'):
-                if seed_image_name.endswith(ext):
-                    seed_image_name = seed_image_name[:-len(ext)]
-                    break
-
-            bt.logging.info(
-                f"Phase 4: Generating {image_request.requested_variations} variations "
-                f"(from validator: {[f'{v.type}({v.intensity})' for v in image_request.variation_requests]})"
-            )
-            variations = generate_variations(
-                base_image,
-                image_request.variation_requests
-            )
-
-            s3_submissions = []
-            target_round = image_request.target_drand_round
-            challenge_id = image_request.challenge_id or "sandbox_test"
-
-            # Generate path_signature once per challenge (prevents path hijacking)
-            path_message = f"{challenge_id}:{self.wallet.hotkey.ss58_address}"
-            path_signature = self.wallet.hotkey.sign(path_message.encode()).hex()[:16]
-            bt.logging.debug(f"Phase 4: Generated path_signature: {path_signature}")
-
-            for var in variations:
-                try:
-                    if not self.is_valid_image_bytes(var["image_bytes"]):
-                        bt.logging.warning(
-                            f"Phase 4: Skipping invalid/corrupt image for {var['variation_type']}"
-                        )
-                        continue
-
-                    if not validate_face_variation(var, base_image, min_similarity=0.4):
-                        bt.logging.warning(
-                            f"Phase 4: Skipping {var['variation_type']} — face identity not preserved"
-                        )
-                        continue
-
-                    message = f"challenge:{challenge_id}:hash:{var['image_hash']}"
-                    signature = self.wallet.hotkey.sign(message.encode()).hex()
-
-                    if is_timelock_available():
-                        encrypted_data = encrypt_image_for_drand(var["image_bytes"], target_round)
-                        if encrypted_data is None:
-                            bt.logging.warning(f"Phase 4: Encryption failed for {var['variation_type']}")
-                            continue
-                    else:
-                        bt.logging.warning("Phase 4: Timelock not available, using raw bytes (SANDBOX ONLY)")
-                        encrypted_data = var["image_bytes"]
-
-                    s3_key = upload_to_s3(
-                        encrypted_data=encrypted_data,
-                        miner_hotkey=self.wallet.hotkey.ss58_address,
-                        signature=signature,
-                        image_hash=var["image_hash"],
-                        target_round=target_round,
-                        challenge_id=challenge_id,
-                        variation_type=var["variation_type"],
-                        path_signature=path_signature,
-                        seed_image_name=seed_image_name,
-                    )
-
-                    if s3_key:
-                        s3_submissions.append(S3Submission(
-                            s3_key=s3_key,
-                            image_hash=var["image_hash"],
-                            signature=signature,
-                            variation_type=var["variation_type"],
-                            path_signature=path_signature,
-                        ))
-                        bt.logging.debug(f"Phase 4: Created submission for {var['variation_type']}")
-
-                except Exception as e:
-                    bt.logging.error(f"Phase 4: Error processing variation {var['variation_type']}: {e}")
-                    continue
-
-            bt.logging.info(f"Phase 4: Successfully created {len(s3_submissions)} S3 submissions")
-            return s3_submissions
-
-        except Exception as e:
-            bt.logging.error(f"Phase 4: Error in process_image_request: {e}")
-            return []
-        finally:
-            try:
-                del base_image
-            except Exception:
-                pass
-            try:
-                del variations
-            except Exception:
-                pass
-            _free_gpu_memory("after_request")
+        return build_image_submissions(synapse.image_request, self.wallet.hotkey)
 
     def _screen_replay_is_due(self, data: dict, image_request) -> bool:
         """True if this capture's IOTD is allowed to upload on today's UTC date.
