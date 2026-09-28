@@ -126,6 +126,7 @@ This lets you see the output for a given prompt and check if the model works
 on your hardware before running the full miner.
 """
 
+import gc
 import os
 import random
 import logging
@@ -338,6 +339,30 @@ _MODEL_LOADERS: Dict[str, Any] = {
 }
 
 
+def _release_pipeline() -> None:
+    """Drop the cached pipeline and hand its VRAM back.
+
+    A new pipeline must never be loaded while the previous one is still referenced:
+    both would be resident at once, which OOMs anything short of a very large card.
+    """
+    global _cached_pipeline, _cached_model_key
+
+    if _cached_pipeline is None:
+        return
+
+    logger.info("Releasing cached pipeline: %s", _cached_model_key)
+    try:
+        _cached_pipeline.remove_all_hooks()
+    except Exception:  # noqa: BLE001 — not all pipelines carry offload hooks
+        pass
+
+    _cached_pipeline = None
+    _cached_model_key = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _get_pipeline(model_key: str) -> Any:
     """Load the selected model pipeline and reuse it.
 
@@ -347,6 +372,10 @@ def _get_pipeline(model_key: str) -> Any:
 
     if _cached_pipeline is not None and _cached_model_key == model_key:
         return _cached_pipeline
+
+    # Model choice is re-rolled per query, so this is the swap path: free the
+    # outgoing pipeline before the incoming one starts allocating.
+    _release_pipeline()
 
     loader = _MODEL_LOADERS.get(model_key)
     if loader is None:
@@ -368,6 +397,11 @@ def _get_pipeline(model_key: str) -> Any:
         logger.warning(
             "Failed to load %s: %s — falling back to flux_klein", model_key, exc,
         )
+        # A failed load (OOM in particular) can leave partial weights on the card;
+        # the cache is already empty here, so reclaim directly before retrying.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         _cached_pipeline = _load_flux_klein()
         _cached_model_key = "flux_klein"
         return _cached_pipeline

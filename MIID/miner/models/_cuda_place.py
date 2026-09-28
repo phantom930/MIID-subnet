@@ -6,6 +6,21 @@ import os
 import sys
 from typing import Any
 
+# Cards at or below this get sequential (per-layer) offload automatically, because
+# model offload moves a whole submodule at a time and a 4B bf16 transformer is ~8 GB
+# on its own — more than such a card has.
+SMALL_VRAM_GIB = float(os.environ.get("MIID_SMALL_VRAM_GIB", "12"))
+
+
+def _total_vram_gib() -> float:
+    """Total VRAM of cuda:0 in GiB, or 0.0 when it cannot be determined."""
+    try:
+        import torch
+
+        return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
 
 def place_diffusers_pipeline(
     pipe: Any,
@@ -22,7 +37,9 @@ def place_diffusers_pipeline(
       ``MIID_ENABLE_CPU_OFFLOAD`` is ``1`` / ``true`` / ``yes``.
     - For huge models (e.g. FLUX Kontext), ``prefer_sequential_offload=True`` tries
       ``enable_sequential_cpu_offload()`` first (lower peak VRAM than model offload on ~16GB).
-      Disable with ``MIID_SEQUENTIAL_CPU_OFFLOAD=0``.
+      Sequential offload is also chosen automatically on cards below ``SMALL_VRAM_GIB``,
+      where model offload cannot fit a single transformer submodule.
+      Force with ``MIID_SEQUENTIAL_CPU_OFFLOAD=1``, disable with ``0``.
     """
     if dev != "cuda":
         pipe.to(dev)
@@ -38,10 +55,24 @@ def place_diffusers_pipeline(
         pipe.to(dev)
         return
 
-    seq_ok = os.environ.get("MIID_SEQUENTIAL_CPU_OFFLOAD", "1").strip().lower() not in (
-        "0", "false", "no",
-    )
-    if prefer_sequential_offload and seq_ok:
+    seq_env = os.environ.get("MIID_SEQUENTIAL_CPU_OFFLOAD", "").strip().lower()
+    if seq_env in ("0", "false", "no"):
+        use_sequential = False
+    elif seq_env in ("1", "true", "yes"):
+        use_sequential = True
+    else:
+        vram = _total_vram_gib()
+        small_card = 0.0 < vram < SMALL_VRAM_GIB
+        if small_card and not prefer_sequential_offload:
+            print(
+                f"cuda:0 has {vram:.1f} GiB VRAM (< {SMALL_VRAM_GIB:.0f} GiB); using "
+                "sequential CPU offload. Generation will be slower — set "
+                "MIID_SEQUENTIAL_CPU_OFFLOAD=0 to opt out.",
+                file=sys.stderr,
+            )
+        use_sequential = prefer_sequential_offload or small_card
+
+    if use_sequential:
         try:
             pipe.enable_sequential_cpu_offload()
             return

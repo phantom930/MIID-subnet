@@ -66,6 +66,17 @@ def load_pipeline(
         from _cuda_place import place_diffusers_pipeline
 
     place_diffusers_pipeline(pipe, dev, default_offload_on_cuda=True)
+
+    # Decode in slices/tiles rather than one shot: the full-frame decode is a large
+    # single allocation and the last thing to run, so it OOMs on small cards even
+    # when the denoising loop fit.
+    vae = getattr(pipe, "vae", None)
+    if vae is not None:
+        if hasattr(vae, "enable_slicing"):
+            vae.enable_slicing()
+        if hasattr(vae, "enable_tiling"):
+            vae.enable_tiling()
+
     return pipe
 
 
