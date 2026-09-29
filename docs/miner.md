@@ -351,6 +351,66 @@ as a post-setup smoke check.
 
 ---
 
+## Request Archive: What Did I Actually Submit?
+
+Every validator approach is written to disk — what was asked for, what you sent back, and why
+anything was dropped. Records are written whatever the outcome, including requests you refused
+or rounds that crashed, so a quiet miner can be diagnosed after the fact instead of by tailing
+logs and hoping.
+
+Records land **inside your clone**, in `miner_requests/` (gitignored), one directory per request:
+
+```
+MIID-subnet/miner_requests/2026-09-29/20260929T014500Z__challenge_1759000000_5Dvgtk1b__49b25272/record.json
+```
+
+```jsonc
+{
+  "outcome": "submitted",           // or empty / error / no_image_request / phase4_unavailable
+  "validator": { "hotkey": "5Dvg...", "name": "RoundTable21" },
+  "request": {
+    "challenge_id": "challenge_1759000000_5Dvgtk1b",
+    "variation_requests": [ /* every type, intensity and prompt detail you were sent */ ],
+    "base_image": { "sha256": "3a9aa2...", "bytes": 812345 },
+    "daily_seed": { "filename": "844c449c32df_f_doc.png", "date": "2026-09-28" }
+  },
+  "generation": { "model_key": "pulid", "min_similarity": 0.4, "requested": 5, "submitted": 4 },
+  "variation_report": [
+    { "variation_type": "background_in", "status": "submitted", "model": "pulid", "s3_key": "..." },
+    { "variation_type": "pose_edit+expression_edit", "status": "dropped", "model": "pulid",
+      "reason": "AdaFace similarity below 0.4" }
+  ],
+  "submissions": [ /* the exact S3Submission list the validator received */ ],
+  "screen_replay": { "attached": true, "capture_variant": "seed_smiling" }
+}
+```
+
+`generation.model_key` records which approach ran, so you can compare how `flux_klein`, `pulid`
+and `pulid_flux2` are actually performing for you across rounds rather than guessing.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MIID_REQUEST_ARCHIVE` | Directory for records, used as given | `<repo>/miner_requests` |
+| `MIID_ARCHIVE_ENABLED` | Set to `0` to turn archiving off entirely | on |
+| `MIID_ARCHIVE_IMAGES` | Set to `1` to also keep the base image, both seeds and the generated variations | off |
+| `MIID_ARCHIVE_MAX_RECORDS` | Records kept before the oldest are pruned (`0` = unlimited) | 500 |
+
+**Media is not kept by default.** A round's variations run to tens of megabytes and you answer a
+validator roughly hourly, so `MIID_ARCHIVE_IMAGES=1` will grow fast — turn it on while tuning
+quality, then off again. Metadata-only records are a few KB each.
+
+The dry run archives its runs the same way, so offline experiments sit in the same history:
+
+```bash
+python -m MIID.miner.dry_run_submission --image face.png              # archived like a real round
+python -m MIID.miner.dry_run_submission --image face.png --no-archive # or don't
+```
+
+Archiving never affects what a validator receives: if a record cannot be written, the failure is
+logged and the response goes out regardless.
+
+---
+
 ## Configuration Options
 
 Command-line arguments:

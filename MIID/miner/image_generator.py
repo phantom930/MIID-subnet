@@ -79,6 +79,8 @@ def generate_variations(
             - variation_type: str - which type this is (matches request order)
             - image_bytes: bytes - raw image data
             - image_hash: str - SHA256 hash for verification
+            - model_key / model_id: str - which model produced it, so the
+              caller can record the approach used for this request
     """
     if not variation_requests:
         return []
@@ -106,7 +108,9 @@ def generate_variations(
             "image": variation_image,
             "variation_type": var_type,
             "image_bytes": image_bytes,
-            "image_hash": image_hash
+            "image_hash": image_hash,
+            "model_key": model_info["key"],
+            "model_id": model_info["model_id"],
         })
 
         bt.logging.debug(

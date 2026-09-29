@@ -133,6 +133,7 @@ def build_image_submissions(
     encrypt: Optional[bool] = None,
     save_images_dir: Optional[str] = None,
     report: Optional[List[Dict[str, Any]]] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> List[S3Submission]:
     """Generate, validate, encrypt and upload every requested variation.
 
@@ -146,13 +147,29 @@ def build_image_submissions(
             raw bytes and is sandbox/dry-run only: real submissions must be
             timelocked or the validator can read them before reveal.
         save_images_dir: When set, the unencrypted variation is also written
-            here so it can be inspected. Never used on the live path.
+            here so it can be inspected. Used by the dry run, and by the live
+            miner when MIID_ARCHIVE_IMAGES is on.
         report: When a list is passed, one dict per variation is appended
             describing what happened to it (submitted, or why it was dropped).
+        meta: When a dict is passed, run-level facts are written into it —
+            which model was picked, the identity floor, whether encryption was
+            used, and how many variations were requested vs submitted. The
+            request archive stores this so a past round can be explained.
 
     Returns:
         List of S3Submission objects, one per variation that made it through.
     """
+    if meta is not None:
+        meta.update({
+            "model_key": None,
+            "model_id": None,
+            "min_similarity": min_similarity,
+            "encrypted": None,
+            "requested": len(getattr(image_request, "variation_requests", None) or []),
+            "generated": 0,
+            "submitted": 0,
+        })
+
     if image_request is None:
         return []
 
@@ -160,6 +177,8 @@ def build_image_submissions(
 
     base_image = None
     variations = None
+    model_key = None
+    model_id = None
     try:
         bt.logging.info(f"Phase 4: Decoding base image: {image_request.image_filename}")
         base_image = decode_base_image(image_request.base_image)
@@ -175,6 +194,16 @@ def build_image_submissions(
             image_request.variation_requests
         )
 
+        # Which approach produced this batch — identical across the call, but
+        # read off the results so it reflects what actually ran, including the
+        # fallback that kicks in when the chosen model fails to load.
+        model_key = variations[0].get("model_key") if variations else None
+        model_id = variations[0].get("model_id") if variations else None
+        if meta is not None:
+            meta["model_key"] = model_key
+            meta["model_id"] = model_id
+            meta["generated"] = len(variations)
+
         s3_submissions: List[S3Submission] = []
         target_round = image_request.target_drand_round
         challenge_id = image_request.challenge_id or "sandbox_test"
@@ -187,6 +216,8 @@ def build_image_submissions(
             os.makedirs(save_images_dir, exist_ok=True)
 
         should_encrypt = is_timelock_available() if encrypt is None else bool(encrypt)
+        if meta is not None:
+            meta["encrypted"] = should_encrypt
 
         for index, var in enumerate(variations):
             variation_type = var["variation_type"]
@@ -195,7 +226,7 @@ def build_image_submissions(
                     bt.logging.warning(
                         f"Phase 4: Skipping invalid/corrupt image for {variation_type}"
                     )
-                    _record(report, variation_type, "dropped",
+                    _record(report, variation_type, "dropped", model=model_key,
                             reason="invalid or corrupt image bytes")
                     continue
 
@@ -212,7 +243,7 @@ def build_image_submissions(
                     bt.logging.warning(
                         f"Phase 4: Skipping {variation_type} — face identity not preserved"
                     )
-                    _record(report, variation_type, "dropped",
+                    _record(report, variation_type, "dropped", model=model_key,
                             reason=f"AdaFace similarity below {min_similarity}")
                     continue
 
@@ -222,7 +253,7 @@ def build_image_submissions(
                     encrypted_data = encrypt_image_for_drand(var["image_bytes"], target_round)
                     if encrypted_data is None:
                         bt.logging.warning(f"Phase 4: Encryption failed for {variation_type}")
-                        _record(report, variation_type, "dropped",
+                        _record(report, variation_type, "dropped", model=model_key,
                                 reason="drand timelock encryption failed")
                         continue
                 else:
@@ -250,7 +281,7 @@ def build_image_submissions(
                         path_signature=path_signature,
                     ))
                     bt.logging.debug(f"Phase 4: Created submission for {variation_type}")
-                    _record(report, variation_type, "submitted",
+                    _record(report, variation_type, "submitted", model=model_key,
                             s3_key=s3_key,
                             image_hash=var["image_hash"],
                             encrypted=should_encrypt,
@@ -259,20 +290,26 @@ def build_image_submissions(
                     bt.logging.warning(
                         f"Phase 4: Upload returned no key for {variation_type}"
                     )
-                    _record(report, variation_type, "dropped",
+                    _record(report, variation_type, "dropped", model=model_key,
                             reason="upload failed (S3 and local storage)")
 
             except Exception as e:
                 bt.logging.error(f"Phase 4: Error processing variation {variation_type}: {e}")
-                _record(report, variation_type, "dropped", reason=f"{type(e).__name__}: {e}")
+                _record(report, variation_type, "dropped", model=model_key,
+                        reason=f"{type(e).__name__}: {e}")
                 continue
 
         bt.logging.info(f"Phase 4: Successfully created {len(s3_submissions)} S3 submissions")
+        if meta is not None:
+            meta["submitted"] = len(s3_submissions)
         return s3_submissions
 
     except Exception as e:
         bt.logging.error(f"Phase 4: Error in build_image_submissions: {e}")
-        _record(report, "*", "failed", reason=f"{type(e).__name__}: {e}")
+        _record(report, "*", "failed", model=model_key,
+                reason=f"{type(e).__name__}: {e}")
+        if meta is not None:
+            meta["error"] = f"{type(e).__name__}: {e}"
         return []
     finally:
         base_image = None

@@ -54,6 +54,20 @@ from MIID.utils.media_paths import ensure_viable_media_path, sanitize_media_file
 # Base miner class
 from MIID.base.miner import BaseMinerNeuron
 
+# Request/submission archive. Deliberately imported outside the Phase 4 try
+# block below: a miner without the image stack still receives requests, and
+# those approaches are worth recording too.
+from MIID.miner.request_archive import (
+    archive_enabled,
+    archive_images_enabled,
+    media_dir,
+    new_record,
+    record_outcome,
+    resolve_archive_dir,
+    save_request_media,
+    write_record,
+)
+
 # screen_replay.json lives under MIID/miner/real_image_miner_guide/. Miners fill
 # it in (or run the helper submit_real_photo.py) to queue a real screen-replay
 # submission. See MIID/miner/real_image_miner_guide/README.md.
@@ -144,6 +158,23 @@ class Miner(BaseMinerNeuron):
         self.output_path = os.path.join(self.config.logging.logging_dir, "mining_results")
         os.makedirs(self.output_path, exist_ok=True)
         bt.logging.info(f"Mining results will be saved to: {self.output_path}")
+
+        # Every validator approach is archived here: what was asked, what was
+        # submitted, and why anything was dropped. Lands in the checkout at
+        # miner_requests/ (gitignored), not under ~/.bittensor. Metadata only
+        # unless MIID_ARCHIVE_IMAGES is set — see MIID/miner/request_archive.py.
+        self.request_archive_dir = resolve_archive_dir()
+        if archive_enabled():
+            bt.logging.info(
+                f"Request archive: {self.request_archive_dir} "
+                f"(media {'kept' if archive_images_enabled() else 'not kept'} — "
+                f"set MIID_ARCHIVE_IMAGES=1 to keep it)"
+            )
+        else:
+            bt.logging.warning(
+                "Request archive: DISABLED (MIID_ARCHIVE_ENABLED=0). Requests and "
+                "submissions will not be stored."
+            )
 
         self.axon.verify_fns[IdentitySynapse.__name__] = self._verify_validator_request
 
@@ -245,9 +276,12 @@ class Miner(BaseMinerNeuron):
         start_time = time.time()
         bt.logging.info(f"Starting run {run_id}, timeout={timeout:.1f}s")
 
+        record = self._new_archive_record(synapse)
+
         if synapse.image_request is None:
             bt.logging.warning("Received synapse with no image_request; returning empty response.")
             synapse.s3_submissions = []
+            self._finish_archive_record(record, outcome="no_image_request", submissions=[])
             return synapse
 
         req = synapse.image_request
@@ -273,13 +307,31 @@ class Miner(BaseMinerNeuron):
                 "Install with: pip install -r requirements-miner.txt"
             )
             synapse.s3_submissions = []
+            self._finish_archive_record(
+                record,
+                outcome="phase4_unavailable",
+                submissions=[],
+                error="image-generation packages not installed",
+            )
             return synapse
 
+        # Per-variation outcomes and the run's model choice, collected for the
+        # archive so a past round can be explained without re-reading logs.
+        report: List[dict] = []
+        meta: dict = {}
+        pipeline_error = None
+
         try:
-            s3_submissions = self.process_image_request(synapse)
+            s3_submissions = self.process_image_request(
+                synapse,
+                report=report,
+                meta=meta,
+                save_images_dir=self._archive_media_dir(record, req),
+            )
             bt.logging.info(f"Phase 4: Generated {len(s3_submissions)} S3 submissions")
         except Exception as e:
             bt.logging.error(f"Phase 4: Failed to process image request: {e}")
+            pipeline_error = f"{type(e).__name__}: {e}"
             s3_submissions = []
 
         # Try to attach a real screen-replay submission (active slot, or a
@@ -293,7 +345,85 @@ class Miner(BaseMinerNeuron):
         total_time = time.time() - start_time
         bt.logging.info(f"Request completed in {total_time:.2f}s of {timeout:.1f}s allowed.")
 
+        self._finish_archive_record(
+            record,
+            outcome=("error" if pipeline_error else
+                     "submitted" if s3_submissions else "empty"),
+            submissions=s3_submissions,
+            report=report,
+            meta=meta,
+            error=pipeline_error,
+            screen_replay=self._describe_screen_replay(sr_sub),
+        )
+
         return synapse
+
+    # ------------------------------------------------------------------
+    # Request archive
+    #
+    # None of these may raise: archiving is bookkeeping, and a failure to
+    # write a record must never turn into a failed response to a validator.
+    # ------------------------------------------------------------------
+
+    def _new_archive_record(self, synapse: IdentitySynapse) -> Optional[dict]:
+        """Open an archive record for this approach."""
+        if not archive_enabled():
+            return None
+        try:
+            hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None)
+            return new_record(
+                "miner",
+                image_request=synapse.image_request,
+                validator_hotkey=hotkey,
+                validator_name=self.WHITELISTED_VALIDATORS.get(hotkey),
+                miner_hotkey=self.wallet.hotkey.ss58_address,
+            )
+        except Exception as e:
+            bt.logging.debug(f"request_archive: could not open record: {e}")
+            return None
+
+    def _archive_media_dir(self, record: Optional[dict], image_request) -> Optional[str]:
+        """Media directory for this record, and the seeds written into it.
+
+        Returns None unless MIID_ARCHIVE_IMAGES is set, in which case the
+        generated variations are written there by the submission builder.
+        """
+        if record is None or not archive_images_enabled():
+            return None
+        try:
+            save_request_media(record, image_request, self.request_archive_dir)
+            target = media_dir(record, self.request_archive_dir)
+            return str(target) if target else None
+        except Exception as e:
+            bt.logging.debug(f"request_archive: could not prepare media dir: {e}")
+            return None
+
+    @staticmethod
+    def _describe_screen_replay(submission: Optional[S3Submission]) -> dict:
+        """Summarize whether a real capture rode along with this response."""
+        if submission is None:
+            return {"attached": False}
+        uav = submission.screen_replay_uav
+        return {
+            "attached": True,
+            "s3_key": submission.s3_key,
+            "s3_key_angle2": submission.s3_key_angle2,
+            "image_hash": submission.image_hash,
+            "image_hash_angle2": submission.image_hash_angle2,
+            "capture_variant": getattr(uav, "capture_variant", None),
+            "seed_image": getattr(uav, "seed_image", None),
+            "date": getattr(uav, "date", None),
+        }
+
+    def _finish_archive_record(self, record: Optional[dict], **fields) -> None:
+        """Close and write a record. Swallows every failure by design."""
+        if record is None:
+            return
+        try:
+            record_outcome(record, **fields)
+            write_record(record, self.request_archive_dir)
+        except Exception as e:
+            bt.logging.warning(f"request_archive: could not store record: {e}")
 
     def _persist_iotd_seeds(self, image_request) -> None:
         """Write today's and tomorrow's IOTD to disk for screen-replay captures.
@@ -379,7 +509,14 @@ class Miner(BaseMinerNeuron):
         """Lightweight check that bytes look like a short screen-replay video."""
         return _is_valid_video_bytes(video_bytes, suffix=suffix)
 
-    def process_image_request(self, synapse: IdentitySynapse) -> List[S3Submission]:
+    def process_image_request(
+        self,
+        synapse: IdentitySynapse,
+        *,
+        report: Optional[List[dict]] = None,
+        meta: Optional[dict] = None,
+        save_images_dir: Optional[str] = None,
+    ) -> List[S3Submission]:
         """
         Process an image variation request end-to-end.
 
@@ -393,11 +530,22 @@ class Miner(BaseMinerNeuron):
 
         Args:
             synapse: IdentitySynapse with image_request
+            report: Optional list collecting one entry per variation, for the
+                request archive.
+            meta: Optional dict collecting the run's model choice and counts.
+            save_images_dir: Optional directory for the unencrypted variations
+                (set only when MIID_ARCHIVE_IMAGES is on).
 
         Returns:
             List of S3Submission objects
         """
-        return build_image_submissions(synapse.image_request, self.wallet.hotkey)
+        return build_image_submissions(
+            synapse.image_request,
+            self.wallet.hotkey,
+            report=report,
+            meta=meta,
+            save_images_dir=save_images_dir,
+        )
 
     def _screen_replay_is_due(self, data: dict, image_request) -> bool:
         """True if this capture's IOTD is allowed to upload on today's UTC date.

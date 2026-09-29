@@ -43,6 +43,16 @@ from typing import Any, Dict, List, Optional, Tuple
 import bittensor as bt
 
 from MIID.protocol import ImageRequest, VariationRequest
+from MIID.miner.request_archive import (
+    archive_enabled,
+    archive_images_enabled,
+    media_dir,
+    new_record,
+    record_outcome,
+    resolve_archive_dir,
+    save_request_media,
+    write_record,
+)
 
 
 # Searched in order when --image is omitted. seeds/ is populated by a running
@@ -317,6 +327,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write the S3Submission list to this JSON file.",
     )
     parser.add_argument(
+        "--archive-dir",
+        help="Directory to store the request/submission record in, used as given "
+             "(default: MIID_REQUEST_ARCHIVE, else <repo>/miner_requests).",
+    )
+    parser.add_argument(
+        "--no-archive", action="store_true",
+        help="Do not store a request/submission record for this run.",
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         help="Enable bittensor debug logging.",
     )
@@ -416,16 +435,47 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"  destination: {destination}\n"
     )
 
+    # --- archive this approach like the live miner does --------------------
+    archiving = archive_enabled() and not args.no_archive
+    archive_root = resolve_archive_dir(args.archive_dir)
+    record = None
+    save_images_dir = args.save_images
+    if archiving:
+        record = new_record(
+            "dry_run",
+            image_request=image_request,
+            miner_hotkey=getattr(hotkey, "ss58_address", None),
+        )
+        if archive_images_enabled():
+            save_request_media(record, image_request, archive_root)
+            if not save_images_dir:
+                target = media_dir(record, archive_root)
+                save_images_dir = str(target) if target else None
+
     # --- run the real pipeline -------------------------------------------
     report: List[Dict[str, Any]] = []
+    meta: Dict[str, Any] = {}
     submissions = build_image_submissions(
         image_request,
         hotkey,
         min_similarity=min_similarity,
         encrypt=encryption_possible,
-        save_images_dir=args.save_images,
+        save_images_dir=save_images_dir,
         report=report,
+        meta=meta,
     )
+
+    if record is not None:
+        record_outcome(
+            record,
+            outcome="submitted" if submissions else "empty",
+            submissions=submissions,
+            report=report,
+            meta=meta,
+        )
+        archived = write_record(record, archive_root)
+        if archived:
+            print(f"Archived this run to {archived}")
 
     _print_report(report, submissions, len(variation_requests), destination)
 
