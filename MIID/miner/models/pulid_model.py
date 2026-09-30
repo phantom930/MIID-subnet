@@ -21,6 +21,8 @@ from typing import Optional
 import torch
 from PIL import Image
 
+# Neither backend here is step-distilled (Nunchaku PuLID, or the FLUX.1
+# Kontext fallback), so this stays at 20 — see flux_kontext_model.
 DEFAULT_STEPS = int(os.environ.get("MIID_INFERENCE_STEPS", "20"))
 DEFAULT_GUIDANCE = float(os.environ.get("MIID_GUIDANCE_SCALE", "3.5"))
 INTENSITY_GUIDANCE_MULT = {"light": 0.92, "medium": 1.0, "far": 1.12}
@@ -133,34 +135,65 @@ def generate(
     intensity: str = "medium",
     num_steps: Optional[int] = None,
     guidance_scale: Optional[float] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    seed: Optional[int] = None,
+    identity_bias: float = 0.0,
+    negative_prompt: Optional[str] = None,
 ) -> Image.Image:
-    """Generate a variation using whichever PuLID backend was loaded."""
-    mult = INTENSITY_GUIDANCE_MULT.get(intensity, 1.0)
+    """Generate a variation using whichever PuLID backend was loaded.
+
+    ``identity_bias`` (0–1) is raised on an identity retry: on the true PuLID
+    path it raises ``id_weight`` so the reference embedding dominates; on the
+    Kontext fallback it eases the prompt off instead.
+    """
+    try:
+        from ._common import fit_to_target, generation_size, make_generator, supported_kwargs
+    except ImportError:
+        from _common import fit_to_target, generation_size, make_generator, supported_kwargs
+
+    bias = max(0.0, min(1.0, identity_bias))
+    mult = INTENSITY_GUIDANCE_MULT.get(intensity, 1.0) * (1.0 - 0.15 * bias)
     guidance = (guidance_scale or DEFAULT_GUIDANCE) * mult
     steps = num_steps or DEFAULT_STEPS
+
+    _h = os.environ.get("MIID_KONTEXT_HEIGHT", "").strip()
+    _w = os.environ.get("MIID_KONTEXT_WIDTH", "").strip()
+    if _h.isdigit() and _w.isdigit():
+        gen_w, gen_h = int(_w), int(_h)
+    else:
+        gen_w, gen_h = generation_size(width, height)
 
     if _loaded_backend == "nunchaku":
         out = pipe(
             prompt,
             id_image=image,
-            id_weight=1,
+            id_weight=1 + 0.5 * bias,
             num_inference_steps=min(steps, 28),
             guidance_scale=guidance,
+            **supported_kwargs(
+                pipe,
+                width=gen_w,
+                height=gen_h,
+                generator=make_generator(seed),
+                negative_prompt=negative_prompt,
+            ),
         )
     else:
-        kw = {}
-        _h = os.environ.get("MIID_KONTEXT_HEIGHT", "").strip()
-        _w = os.environ.get("MIID_KONTEXT_WIDTH", "").strip()
-        if _h.isdigit() and _w.isdigit():
-            kw["height"], kw["width"] = int(_h), int(_w)
         out = pipe(
             prompt=prompt,
             image=image,
             num_inference_steps=steps,
             guidance_scale=guidance,
-            **kw,
+            **supported_kwargs(
+                pipe,
+                width=gen_w,
+                height=gen_h,
+                generator=make_generator(seed),
+                negative_prompt=negative_prompt,
+            ),
         )
-    return out.images[0]
+    return fit_to_target(out.images[0], width, height)
 
 
 # ── Testing ──────────────────────────────────────────────────────────────────

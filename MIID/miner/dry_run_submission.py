@@ -233,9 +233,14 @@ def _print_report(
         marker = {"submitted": "OK  ", "dropped": "DROP", "failed": "FAIL"}.get(status, "??  ")
         line = f"  [{marker}] {entry.get('variation_type', '?')}"
         if status == "submitted":
+            similarity = entry.get("identity_similarity")
+            identity = "identity n/a" if similarity is None else f"identity {similarity:.3f}"
             line += (
                 f"  {entry.get('bytes', 0)} bytes"
                 f"  {'encrypted' if entry.get('encrypted') else 'RAW (unencrypted)'}"
+                f"  {identity}"
+                f"  kept attempt {entry.get('winning_attempt', 1)}"
+                f"/{entry.get('attempts', 1)}"
                 f"\n           {entry.get('s3_key', '')}"
             )
         else:
@@ -295,12 +300,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--min-similarity", type=float, default=None,
-        help="AdaFace floor for keeping a variation (default: the miner's 0.4).",
+        help="AdaFace similarity a variation is regenerated to reach "
+             "(default: the miner's MIID_IDENTITY_TARGET, 0.6). The best "
+             "attempt is submitted either way.",
     )
     parser.add_argument(
         "--skip-identity-check", action="store_true",
-        help="Keep variations regardless of AdaFace similarity. Diagnostic only — "
-             "it shows what the model produced before identity filtering.",
+        help="Accept the first generation of each variation without retrying. "
+             "Diagnostic only — it shows what the model produced before any "
+             "identity-driven regeneration.",
     )
     parser.add_argument(
         "--no-encrypt", action="store_true",
@@ -431,7 +439,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"  image      : {image_path}\n"
         f"  variations : {', '.join(f'{v.type}({v.intensity})' for v in variation_requests)}\n"
         f"  encryption : {'drand timelock' if encryption_possible else 'OFF (raw bytes)'}\n"
-        f"  identity   : {'skipped' if args.skip_identity_check else f'AdaFace >= {min_similarity}'}\n"
+        f"  identity   : {'no retries' if args.skip_identity_check else f'retry until AdaFace >= {min_similarity}'}\n"
         f"  destination: {destination}\n"
     )
 

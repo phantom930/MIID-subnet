@@ -10,6 +10,7 @@
 import gc
 import io
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import bittensor as bt
@@ -17,6 +18,7 @@ from PIL import Image
 
 from MIID.protocol import S3Submission
 from MIID.miner.image_generator import (
+    IDENTITY_TARGET,
     decode_base_image,
     generate_variations,
     validate_face_variation,
@@ -25,10 +27,27 @@ from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_availa
 from MIID.miner.s3_upload import upload_to_s3
 
 
-# AdaFace cosine-similarity floor. Variations below it are dropped instead of
-# submitted: the grading API scores identity preservation, so shipping a
-# variation that lost the face is worse than shipping nothing for that slot.
-DEFAULT_MIN_SIMILARITY = 0.4
+# AdaFace cosine-similarity a variation should reach. It is a *retry target*,
+# not a drop floor: generate_variations() re-rolls a slot that misses it with
+# the edit held back, and the best attempt is submitted either way.
+#
+# Submitting a weak variation beats dropping it. The validator averages over
+# the requested types and scores a missing one as validation_score 0 AND
+# identity_preservation 0 (MIID/validator/reward.py), so a dropped slot is
+# strictly worse than any image that arrives — including on the identity
+# threshold that decides whether the miner is ranked at all. Worse still, the
+# grading API samples one slot per round: drop the slot it picked and the whole
+# round scores zero.
+#
+# Set MIID_DROP_BELOW_SIMILARITY=1 to restore the old drop-on-miss behaviour.
+DEFAULT_MIN_SIMILARITY = IDENTITY_TARGET
+
+
+def _drop_below_similarity() -> bool:
+    """Whether a variation under the identity target is dropped, not submitted."""
+    return os.environ.get("MIID_DROP_BELOW_SIMILARITY", "0").strip().lower() in (
+        "1", "true", "yes",
+    )
 
 # Extensions stripped from image_filename to get the S3 seed-name component.
 _SEED_NAME_EXTENSIONS = (".png", ".jpg", ".jpeg")
@@ -141,7 +160,9 @@ def build_image_submissions(
         image_request: The validator's ImageRequest (base image + requests).
         hotkey: Keypair used to sign submissions (``wallet.hotkey`` in the
             live miner).
-        min_similarity: AdaFace floor below which a variation is dropped.
+        min_similarity: AdaFace similarity a variation is regenerated to reach.
+            The best attempt is submitted whether or not it gets there, unless
+            MIID_DROP_BELOW_SIMILARITY is set — see DEFAULT_MIN_SIMILARITY.
         encrypt: ``None`` (default) encrypts whenever drand timelock is
             available — this is what the live miner does. ``False`` forces
             raw bytes and is sandbox/dry-run only: real submissions must be
@@ -189,10 +210,13 @@ def build_image_submissions(
             f"Phase 4: Generating {image_request.requested_variations} variations "
             f"(from validator: {[f'{v.type}({v.intensity})' for v in image_request.variation_requests]})"
         )
+        generation_started = time.monotonic()
         variations = generate_variations(
             base_image,
-            image_request.variation_requests
+            image_request.variation_requests,
+            identity_target=min_similarity,
         )
+        generation_seconds = time.monotonic() - generation_started
 
         # Which approach produced this batch — identical across the call, but
         # read off the results so it reflects what actually ran, including the
@@ -203,6 +227,10 @@ def build_image_submissions(
             meta["model_key"] = model_key
             meta["model_id"] = model_id
             meta["generated"] = len(variations)
+            # Archived so a slow round can be attributed: generation dominates
+            # the response, and the rest (encrypt + upload) is the remainder
+            # against the record's duration_seconds.
+            meta["generation_seconds"] = round(generation_seconds, 1)
 
         s3_submissions: List[S3Submission] = []
         target_round = image_request.target_drand_round
@@ -239,13 +267,30 @@ def build_image_submissions(
                         f.write(var["image_bytes"])
                     bt.logging.debug(f"Phase 4: Wrote {local_copy}")
 
-                if not validate_face_variation(var, base_image, min_similarity=min_similarity):
+                similarity = var.get("identity_similarity")
+                meets_identity = validate_face_variation(
+                    var, base_image, min_similarity=min_similarity
+                )
+                if not meets_identity:
+                    shown = "no face detected" if similarity is None else f"{similarity:.3f}"
+                    if _drop_below_similarity():
+                        bt.logging.warning(
+                            f"Phase 4: Dropping {variation_type} — identity "
+                            f"{shown} < {min_similarity} "
+                            f"(MIID_DROP_BELOW_SIMILARITY is set)"
+                        )
+                        _record(report, variation_type, "dropped", model=model_key,
+                                identity_similarity=similarity,
+                                attempts=var.get("attempts"),
+                                winning_attempt=var.get("winning_attempt"),
+                                reason=f"AdaFace similarity below {min_similarity}")
+                        continue
                     bt.logging.warning(
-                        f"Phase 4: Skipping {variation_type} — face identity not preserved"
+                        f"Phase 4: Submitting {variation_type} below the identity "
+                        f"target ({shown} < {min_similarity}) — best of "
+                        f"{var.get('attempts', 1)} attempt(s); a missing slot "
+                        f"would score lower still"
                     )
-                    _record(report, variation_type, "dropped", model=model_key,
-                            reason=f"AdaFace similarity below {min_similarity}")
-                    continue
 
                 signature = sign_media_hash(hotkey, challenge_id, var["image_hash"])
 
@@ -285,6 +330,9 @@ def build_image_submissions(
                             s3_key=s3_key,
                             image_hash=var["image_hash"],
                             encrypted=should_encrypt,
+                            identity_similarity=similarity,
+                            attempts=var.get("attempts"),
+                            winning_attempt=var.get("winning_attempt"),
                             bytes=len(encrypted_data))
                 else:
                     bt.logging.warning(

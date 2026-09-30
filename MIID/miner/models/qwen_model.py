@@ -96,21 +96,43 @@ def generate(
     intensity: str = "medium",
     num_steps: Optional[int] = None,
     guidance_scale: Optional[float] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    seed: Optional[int] = None,
+    identity_bias: float = 0.0,
+    negative_prompt: Optional[str] = None,
 ) -> Image.Image:
-    """Generate a single variation and return the PIL Image."""
+    """Generate a single variation and return the PIL Image.
+
+    ``identity_bias`` (0–1) is raised on an identity retry: it lowers the CFG
+    scale so the edit instruction pulls the face around less.
+    """
+    try:
+        from ._common import fit_to_target, generation_size, make_generator, supported_kwargs
+    except ImportError:
+        from _common import fit_to_target, generation_size, make_generator, supported_kwargs
+
+    bias = max(0.0, min(1.0, identity_bias))
     steps = num_steps or DEFAULT_STEPS
     guidance = guidance_scale or DEFAULT_GUIDANCE
+    gen_w, gen_h = generation_size(width, height)
+
+    # Seed every call: the previous fixed seed made an identity retry
+    # reproduce the attempt that had just failed.
+    generator = make_generator(0 if seed is None else seed)
+
     out = pipe(
         image=[image],
         prompt=prompt,
-        generator=torch.manual_seed(0),
-        true_cfg_scale=TRUE_CFG_SCALE,
-        negative_prompt=" ",
+        generator=generator,
+        true_cfg_scale=TRUE_CFG_SCALE * (1.0 - 0.2 * bias),
+        negative_prompt=negative_prompt or " ",
         num_inference_steps=steps,
         guidance_scale=guidance,
         num_images_per_prompt=1,
+        **supported_kwargs(pipe, width=gen_w, height=gen_h),
     )
-    return out.images[0]
+    return fit_to_target(out.images[0], width, height)
 
 
 # ── Testing ──────────────────────────────────────────────────────────────────

@@ -22,6 +22,9 @@ import torch
 from PIL import Image
 
 MODEL_ID = "black-forest-labs/FLUX.1-Kontext-dev"
+# Kontext is NOT step-distilled — unlike the FLUX.2 Klein models it degrades
+# below ~20 steps, so this default stays where it is even though it is the
+# slowest backend.
 DEFAULT_STEPS = int(os.environ.get("MIID_INFERENCE_STEPS", "20"))
 DEFAULT_GUIDANCE = float(os.environ.get("MIID_GUIDANCE_SCALE", "3.5"))
 INTENSITY_GUIDANCE_MULT = {"light": 0.92, "medium": 1.0, "far": 1.12}
@@ -76,17 +79,37 @@ def generate(
     intensity: str = "medium",
     num_steps: Optional[int] = None,
     guidance_scale: Optional[float] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    seed: Optional[int] = None,
+    identity_bias: float = 0.0,
+    negative_prompt: Optional[str] = None,
 ) -> Image.Image:
-    """Generate a single variation and return the PIL Image."""
-    strength = INTENSITY_TO_STRENGTH.get(intensity, 0.55)
+    """Generate a single variation and return the PIL Image.
+
+    ``identity_bias`` (0–1) is raised on an identity retry: it pulls the
+    denoising strength down so less of the reference face is repainted.
+    """
+    try:
+        from ._common import fit_to_target, generation_size, make_generator, supported_kwargs
+    except ImportError:
+        from _common import fit_to_target, generation_size, make_generator, supported_kwargs
+
+    bias = max(0.0, min(1.0, identity_bias))
+    strength = INTENSITY_TO_STRENGTH.get(intensity, 0.55) * (1.0 - 0.25 * bias)
     guidance = guidance_scale or DEFAULT_GUIDANCE
     steps = num_steps or DEFAULT_STEPS
 
-    kw = {}
+    # MIID_KONTEXT_WIDTH/HEIGHT stay an operator override for the size we
+    # *generate* at (it exists to fit a smaller card); otherwise follow the
+    # caller. Either way fit_to_target below still delivers the requested
+    # output size, so the override trades detail for VRAM, not compliance.
     _h = os.environ.get("MIID_KONTEXT_HEIGHT", "").strip()
     _w = os.environ.get("MIID_KONTEXT_WIDTH", "").strip()
     if _h.isdigit() and _w.isdigit():
-        kw["height"], kw["width"] = int(_h), int(_w)
+        gen_w, gen_h = int(_w), int(_h)
+    else:
+        gen_w, gen_h = generation_size(width, height)
 
     out = pipe(
         prompt=prompt,
@@ -94,9 +117,15 @@ def generate(
         num_inference_steps=steps,
         guidance_scale=guidance,
         strength=strength,
-        **kw,
+        **supported_kwargs(
+            pipe,
+            width=gen_w,
+            height=gen_h,
+            generator=make_generator(seed),
+            negative_prompt=negative_prompt,
+        ),
     )
-    return out.images[0]
+    return fit_to_target(out.images[0], width, height)
 
 
 # ── Testing ──────────────────────────────────────────────────────────────────

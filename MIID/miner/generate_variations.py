@@ -109,6 +109,14 @@ Helpful environment variables
 - ``MIID_MODEL_RANDOM``: set to ``1`` to randomly pick among base models
 - ``MIID_INFERENCE_STEPS``: change number of generation steps
 - ``MIID_GUIDANCE_SCALE``: change prompt strength
+- ``MIID_OUTPUT_WIDTH`` / ``MIID_OUTPUT_HEIGHT``: output size, default the
+  1015 x 1350 the validator asks for; set both to 0 to ship raw model output
+- ``MIID_IDENTITY_TARGET``: AdaFace similarity a variation must reach before it
+  is accepted without a retry (default 0.6 — the validator's own gate)
+- ``MIID_IDENTITY_RETRIES``: extra attempts per variation when it misses that
+  target (default 1)
+- ``MIID_GENERATION_BUDGET_SECONDS``: wall-clock budget for one request's
+  generation, retries included (default 900, inside the validator's 1200s)
 - ``HF_TOKEN``: Hugging Face access token
 
 =============================================================================
@@ -156,7 +164,13 @@ def _resolve_device() -> str:
 
 DEVICE = _resolve_device()
 
-NUM_INFERENCE_STEPS = int(os.environ.get("MIID_INFERENCE_STEPS", "20"))
+# None means "let each backend use its own default", which is what you want:
+# the FLUX.2-klein models are step-distilled and are done in ~8 steps, while
+# FLUX.1 Kontext is not and needs ~20. A single global number either wastes
+# minutes on the distilled models or starves the others. MIID_INFERENCE_STEPS
+# still overrides every backend when an operator sets it.
+_STEPS_ENV = os.environ.get("MIID_INFERENCE_STEPS", "").strip()
+NUM_INFERENCE_STEPS: Optional[int] = int(_STEPS_ENV) if _STEPS_ENV.isdigit() else None
 
 GUIDANCE_SCALE = float(os.environ.get("MIID_GUIDANCE_SCALE", "3.5"))
 
@@ -167,6 +181,57 @@ INTENSITY_TO_STRENGTH: Dict[str, float] = {
     "medium": 0.55,
     "far":    0.75,
 }
+
+# Output geometry the validator asks for. IMAGE_VARIATION_REQUIREMENTS (in
+# MIID/validator/image_variations.py) is appended to every request's `detail`:
+# "Professional passport-style portraits, 3:4 aspect ratio, head-and-shoulders
+# composition from chest up. Recommended output resolution: 1015 x 1350 pixels."
+# The grading API scores compliance, so producing the model's default square
+# frame costs points on every single variation. Set MIID_OUTPUT_WIDTH /
+# MIID_OUTPUT_HEIGHT to 0 to disable resizing and ship the raw model output.
+TARGET_WIDTH = int(os.environ.get("MIID_OUTPUT_WIDTH", "1015"))
+TARGET_HEIGHT = int(os.environ.get("MIID_OUTPUT_HEIGHT", "1350"))
+
+# Steered away from on every generation. The grading API judges photographic
+# quality alongside identity, and these are the failure modes a portrait edit
+# falls into on its own. Note the FLUX.2 Klein pipelines do not accept a
+# negative prompt at all (supported_kwargs drops it), so the framing defence
+# below has to hold on its own in the positive prompt.
+NEGATIVE_PROMPT = (
+    "different person, face swap, distorted or deformed face, asymmetric eyes, "
+    "extra fingers, blurry, low resolution, jpeg artifacts, oversaturated, "
+    "cartoon, anime, illustration, painting, 3d render, plastic skin, "
+    "watermark, text, logo, extreme close-up, selfie crop, cropped head, "
+    "shoulders out of frame, multiple people"
+)
+
+# Stated first on every generation, never suppressed.
+#
+# The validator already appends this requirement to each request's `detail`
+# ("All images are Professional passport-style portraits, 3:4 aspect ratio,
+# head-and-shoulders composition from chest up..."), but it lands at the tail of
+# a long instruction string where the model under-weights it — observed result:
+# correct background and accessory, but a tight selfie crop, which the grading
+# API scored negative. Leading with it, in imperative form and with the failure
+# mode named explicitly, is what keeps the frame compliant.
+FRAMING_CLAUSE = (
+    "Professional passport-style portrait photograph, 3:4 vertical format. "
+    "Frame the subject head-and-shoulders from mid-chest up: the whole head "
+    "with headroom above it and both shoulders fully inside the frame, subject "
+    "centred and facing the camera. Not an extreme close-up, not a selfie crop "
+    "— do not fill the frame with the face. Sharp focus, natural skin texture, "
+    "even photographic exposure."
+)
+
+# The validator's own copy of the requirement, stripped from the edit text so it
+# is stated once (above, forcefully) instead of twice (here, weakly).
+_REQUIREMENTS_PREFIX = "All images are Professional passport-style portraits"
+
+IDENTITY_CLAUSE = (
+    "Keep the identity of the reference person exactly: same facial structure "
+    "and proportions, same eyes, nose, mouth and jawline, same skin tone, same "
+    "hair, same apparent age and gender. Do not restyle or beautify the face."
+)
 
 # =============================================================================
 # Available models
@@ -445,14 +510,59 @@ def _get_type_and_intensity(req: Any) -> Tuple[str, str]:
     return (_canonical_background_type(req, var_type), intensity)
 
 
-def _get_prompt_from_request(req: Any, var_type: str, intensity: str) -> str:
-    """Build generation prompt from protocol fields (description + detail)."""
+def _strip_requirements(text: Optional[str]) -> str:
+    """Drop the validator's trailing requirements boilerplate from one field.
+
+    FRAMING_CLAUSE restates it at the front of the prompt, so leaving the
+    original in place would only repeat the constraint in its weaker wording.
+    Anything after the marker is that boilerplate, so the tail goes with it.
+    """
+    cleaned = (text or "").strip()
+    marker = cleaned.find(_REQUIREMENTS_PREFIX)
+    if marker != -1:
+        cleaned = cleaned[:marker]
+    return cleaned.strip().rstrip(".").strip()
+
+
+def _get_prompt_from_request(
+    req: Any, var_type: str, intensity: str, identity_bias: float = 0.0,
+) -> str:
+    """Build the generation prompt from the protocol fields.
+
+    Order matters, and it is: framing, then the edit, then identity. The
+    grading API's validation_score is the whole ranking signal (identity is a
+    1e-5 tiebreaker), and it scores both whether the requested edit landed and
+    whether the result obeys the passport-portrait composition — so those two
+    take the front of the prompt, where the model weights them most.
+
+    ``identity_bias`` > 0 marks a retry after the face drifted too far, and
+    adds an explicit instruction to hold the edit back.
+    """
     description = getattr(req, "description", None) or (req.get("description") if isinstance(req, dict) else None) or ""
     detail = getattr(req, "detail", None) or (req.get("detail") if isinstance(req, dict) else None) or ""
-    parts = [p.strip() for p in (description, detail) if p and p.strip()]
-    if parts:
-        return f"Same person, same identity, {', '.join(parts)}. Preserve face identity."
-    return f"Same person, same identity, {var_type} variation ({intensity} intensity). Preserve face identity."
+
+    edit = ". ".join(
+        _strip_requirements(p).rstrip(".")
+        for p in (description, detail)
+        if _strip_requirements(p)
+    )
+    if not edit:
+        edit = f"{var_type} variation at {intensity} intensity"
+
+    parts = [
+        FRAMING_CLAUSE,
+        "The subject is the SAME person as the reference image.",
+        f"Apply this edit: {edit}.",
+        IDENTITY_CLAUSE,
+    ]
+
+    if identity_bias > 0:
+        parts.append(
+            "Apply the edit conservatively — the face must stay clearly "
+            "recognizable as the reference person."
+        )
+
+    return " ".join(parts)
 
 
 # =============================================================================
@@ -460,64 +570,55 @@ def _get_prompt_from_request(req: Any, var_type: str, intensity: str) -> str:
 # =============================================================================
 
 
+def _common_generate_kwargs(
+    intensity: str, seed: Optional[int], identity_bias: float,
+) -> Dict[str, Any]:
+    """The arguments every backend's ``generate()`` takes the same way."""
+    return {
+        "intensity": intensity,
+        "num_steps": NUM_INFERENCE_STEPS,
+        "guidance_scale": GUIDANCE_SCALE,
+        "width": TARGET_WIDTH,
+        "height": TARGET_HEIGHT,
+        "seed": seed,
+        "identity_bias": identity_bias,
+        "negative_prompt": NEGATIVE_PROMPT,
+    }
+
+
 def _generate_with_flux_klein(
-    pipe: Any, base_image: Image.Image, prompt: str, intensity: str,
+    pipe: Any, base_image: Image.Image, prompt: str, **kwargs: Any,
 ) -> Image.Image:
     from .models.flux_klein_model import generate
-    return generate(
-        pipe, base_image, prompt,
-        intensity=intensity,
-        num_steps=NUM_INFERENCE_STEPS,
-        guidance_scale=GUIDANCE_SCALE,
-    )
+    return generate(pipe, base_image, prompt, **kwargs)
 
 
 def _generate_with_pulid(
-    pipe: Any, base_image: Image.Image, prompt: str, intensity: str,
+    pipe: Any, base_image: Image.Image, prompt: str, **kwargs: Any,
 ) -> Image.Image:
     from .models.pulid_model import generate
-    return generate(
-        pipe, base_image, prompt,
-        intensity=intensity,
-        num_steps=NUM_INFERENCE_STEPS,
-        guidance_scale=GUIDANCE_SCALE,
-    )
+    return generate(pipe, base_image, prompt, **kwargs)
 
 
 def _generate_with_pulid_flux2(
-    pipe: Any, base_image: Image.Image, prompt: str, intensity: str,
+    pipe: Any, base_image: Image.Image, prompt: str, **kwargs: Any,
 ) -> Image.Image:
     from .models.pulid_flux2_model import generate
-    return generate(
-        pipe, base_image, prompt,
-        intensity=intensity,
-        num_steps=NUM_INFERENCE_STEPS,
-        guidance_scale=GUIDANCE_SCALE,
-    )
+    return generate(pipe, base_image, prompt, **kwargs)
 
 
 def _generate_with_flux_kontext(
-    pipe: Any, base_image: Image.Image, prompt: str, intensity: str,
+    pipe: Any, base_image: Image.Image, prompt: str, **kwargs: Any,
 ) -> Image.Image:
     from .models.flux_kontext_model import generate
-    return generate(
-        pipe, base_image, prompt,
-        intensity=intensity,
-        num_steps=NUM_INFERENCE_STEPS,
-        guidance_scale=GUIDANCE_SCALE,
-    )
+    return generate(pipe, base_image, prompt, **kwargs)
 
 
 def _generate_with_qwen(
-    pipe: Any, base_image: Image.Image, prompt: str, intensity: str,
+    pipe: Any, base_image: Image.Image, prompt: str, **kwargs: Any,
 ) -> Image.Image:
     from .models.qwen_model import generate
-    return generate(
-        pipe, base_image, prompt,
-        intensity=intensity,
-        num_steps=NUM_INFERENCE_STEPS,
-        guidance_scale=GUIDANCE_SCALE,
-    )
+    return generate(pipe, base_image, prompt, **kwargs)
 
 
 _GENERATORS: Dict[str, Any] = {
@@ -534,20 +635,90 @@ _GENERATORS: Dict[str, Any] = {
 # =============================================================================
 
 
+def active_model_key() -> Optional[str]:
+    """The model actually loaded right now — not necessarily the one selected.
+
+    ``_get_pipeline()`` falls back to ``flux_klein`` when the chosen model
+    fails to load, and the miner records which approach really ran.
+    """
+    return _cached_model_key
+
+
+def generate_one(
+    base_image: Image.Image,
+    req: Any,
+    model_key: Optional[str] = None,
+    attempt: int = 0,
+) -> Dict[str, Any]:
+    """Generate a single variation for one validator request.
+
+    Separate from :func:`generate_variations` so a caller that measured the
+    result — the identity check in ``image_generator`` — can re-roll one slot
+    without regenerating the others. The pipeline is cached, so a retry costs
+    one denoising pass, not another model load.
+
+    Args:
+        base_image: PIL Image of the base face.
+        req: One validator request with ``.type`` and ``.intensity``.
+        model_key: Model to use; selected fresh when omitted.
+        attempt: 0 for the first try. Higher values re-roll the seed and raise
+            ``identity_bias``, trading edit strength for identity retention.
+
+    Returns:
+        Dict with ``image``, ``variation_type``, ``model_key``, ``model_id``
+        and ``attempt``.
+    """
+    model_key = model_key or _select_model()
+    pipe = _get_pipeline(model_key)
+
+    # _get_pipeline may have fallen back; generate with what is actually loaded.
+    loaded_key = _cached_model_key or model_key
+    model_type = AVAILABLE_MODELS[loaded_key]["type"]
+    generator = _GENERATORS.get(model_type)
+    if generator is None:
+        raise RuntimeError(
+            f"No generation handler for model type '{model_type}'.  "
+            f"Registered types: {list(_GENERATORS.keys())}"
+        )
+
+    var_type, intensity = _get_type_and_intensity(req)
+    # Each attempt steps 40% further toward "hold the face, soften the edit",
+    # capped at 0.8 so a variation never collapses into a copy of the input.
+    identity_bias = min(0.8, 0.4 * attempt)
+    prompt = _get_prompt_from_request(req, var_type, intensity, identity_bias)
+    seed = random.randint(0, 2**31 - 1)
+
+    try:
+        gen_image = generator(
+            pipe, base_image, prompt,
+            **_common_generate_kwargs(intensity, seed, identity_bias),
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"Variation failed for {var_type}({intensity}) "
+            f"with {loaded_key} on attempt {attempt}: {e}"
+        ) from e
+
+    return {
+        "image": gen_image,
+        "variation_type": var_type,
+        "model_key": loaded_key,
+        "model_id": AVAILABLE_MODELS[loaded_key]["model_id"],
+        "attempt": attempt,
+    }
+
+
 def generate_variations(
     base_image: Image.Image,
     variation_requests: List[Any],
     model_key: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Generate image variations from a base face image.
+    """Generate one image variation per validator request, first attempt only.
 
-    Step by step:
-    1. Pick the model.
-    2. Load the model.
-    3. Read the request type and intensity.
-    4. Build the prompt.
-    5. Generate the image.
-    6. Return results in the same format the miner already expects.
+    Picks and loads the model once, then runs :func:`generate_one` for each
+    request. No identity checking happens here — ``image_generator`` owns that,
+    because it is the layer that can re-roll a slot that came back too far from
+    the reference face.
 
     Args:
         base_image: PIL Image of the base face.
@@ -555,44 +726,20 @@ def generate_variations(
             ``.intensity`` (e.g. ``VariationRequest`` or dict).
 
     Returns:
-        List of dicts with ``"image"`` (PIL Image) and ``"variation_type"`` (str).
+        List of dicts as returned by :func:`generate_one` — ``image``,
+        ``variation_type``, ``model_key``, ``model_id``, ``attempt``.
     """
     if not variation_requests:
         return []
 
     model_key = model_key or _select_model()
-    pipe = _get_pipeline(model_key)
-    model_type = AVAILABLE_MODELS[model_key]["type"]
-    generator = _GENERATORS.get(model_type)
-
-    if generator is None:
-        raise RuntimeError(
-            f"No generation handler for model type '{model_type}'.  "
-            f"Registered types: {list(_GENERATORS.keys())}"
-        )
 
     logger.info(
         "Generating %d variation(s) with %s (%s)",
         len(variation_requests), model_key, AVAILABLE_MODELS[model_key]["model_id"],
     )
 
-    results: List[Dict[str, Any]] = []
-
-    for req in variation_requests:
-        var_type, intensity = _get_type_and_intensity(req)
-        prompt = _get_prompt_from_request(req, var_type, intensity)
-
-        try:
-            gen_image = generator(pipe, base_image, prompt, intensity)
-        except Exception as e:
-            raise RuntimeError(
-                f"Variation failed for {var_type}({intensity}) "
-                f"with {model_key}: {e}"
-            ) from e
-
-        results.append({
-            "image": gen_image,
-            "variation_type": var_type,
-        })
-
-    return results
+    return [
+        generate_one(base_image, req, model_key=model_key)
+        for req in variation_requests
+    ]

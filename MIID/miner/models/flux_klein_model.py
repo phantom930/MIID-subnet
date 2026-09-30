@@ -21,7 +21,11 @@ import torch
 from PIL import Image
 
 MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
-DEFAULT_STEPS = int(os.environ.get("MIID_INFERENCE_STEPS", "20"))
+# FLUX.2 Klein is step-distilled (it ignores guidance_scale for the same
+# reason), so it converges in single-digit steps. Measured on this pipeline at
+# 1015x1350: ~6.5s/step, and 20 steps produced no visible quality or identity
+# gain over 8 — just 78s more per variation, ~6 min per 5-slot request.
+DEFAULT_STEPS = int(os.environ.get("MIID_INFERENCE_STEPS", "8"))
 DEFAULT_GUIDANCE = float(os.environ.get("MIID_GUIDANCE_SCALE", "3.5"))
 INTENSITY_GUIDANCE_MULT = {"light": 0.92, "medium": 1.0, "far": 1.12}
 
@@ -87,18 +91,42 @@ def generate(
     intensity: str = "medium",
     num_steps: Optional[int] = None,
     guidance_scale: Optional[float] = None,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    seed: Optional[int] = None,
+    identity_bias: float = 0.0,
+    negative_prompt: Optional[str] = None,
 ) -> Image.Image:
-    """Generate a single variation and return the PIL Image."""
-    mult = INTENSITY_GUIDANCE_MULT.get(intensity, 1.0)
+    """Generate a single variation and return the PIL Image.
+
+    ``identity_bias`` (0–1) is raised on an identity retry: it eases the
+    prompt off so the result drifts less far from the reference face.
+    """
+    try:
+        from ._common import fit_to_target, generation_size, make_generator, supported_kwargs
+    except ImportError:
+        from _common import fit_to_target, generation_size, make_generator, supported_kwargs
+
+    bias = max(0.0, min(1.0, identity_bias))
+    mult = INTENSITY_GUIDANCE_MULT.get(intensity, 1.0) * (1.0 - 0.15 * bias)
     guidance = (guidance_scale or DEFAULT_GUIDANCE) * mult
     steps = num_steps or DEFAULT_STEPS
+    gen_w, gen_h = generation_size(width, height)
+
     out = pipe(
         prompt=prompt,
         image=[image],
         num_inference_steps=steps,
         guidance_scale=guidance,
+        **supported_kwargs(
+            pipe,
+            width=gen_w,
+            height=gen_h,
+            generator=make_generator(seed),
+            negative_prompt=negative_prompt,
+        ),
     )
-    return out.images[0]
+    return fit_to_target(out.images[0], width, height)
 
 
 # ── Testing ──────────────────────────────────────────────────────────────────

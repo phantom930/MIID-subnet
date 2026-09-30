@@ -11,6 +11,14 @@ identity-preserving if similarity is at or above the threshold (default 0.7).
   - validate_single_variation(base_image, variation_image, model=None, min_similarity=0.7, device='cpu') -> bool
   - compare_faces(original_image_path, variation_image_paths, model=None, device='cpu') -> dict
 
+For the miner's hot path — five variations plus retries against one base face —
+use the cached helpers instead, which load the checkpoint once and let the base
+embedding be reused:
+
+  - get_shared_model(device=None) -> model
+  - embed_image(image, model=None, device=None) -> tensor | None
+  - similarity_to_embedding(base_embedding, variation_image, ...) -> float | None
+
 Prerequisites:
   1. Clone the AdaFace repository:
      git clone https://github.com/mk-minchul/AdaFace.git MIID/miner/AdaFace
@@ -288,6 +296,76 @@ def _path_from_image(img):
     raise TypeError("base_image and variation_image must be a file path (str) or PIL Image")
 
 
+# =============================================================================
+# Shared model / embedding cache
+# =============================================================================
+#
+# One validator request compares five variations — plus any identity retries —
+# against the same base face. Loading the ir_50 checkpoint per comparison (what
+# `model=None` did) costs far more than the comparison itself, and re-embedding
+# the base image every time is pure waste. Both are cached for the process
+# lifetime so a retry is affordable inside the validator's request timeout.
+
+_shared_model = None
+_shared_model_device = None
+
+
+def get_shared_model(device=None):
+    """Load the AdaFace model once and reuse it for every later comparison.
+
+    ``device`` defaults to the same device the MTCNN aligner was built on, so
+    the two halves of the pipeline do not bounce tensors between CPU and GPU.
+    """
+    global _shared_model, _shared_model_device
+
+    dev = device or _resolve_mtcnn_device()
+    if _shared_model is not None and _shared_model_device == dev:
+        return _shared_model
+
+    model = load_adaface_model(device="cuda" if dev.startswith("cuda") else "cpu")
+    if getattr(align, "mtcnn_model", None) is None:
+        align.mtcnn_model = mtcnn.MTCNN(device=dev, crop_size=(112, 112))
+
+    _shared_model = model
+    _shared_model_device = dev
+    return model
+
+
+def embed_image(image, model=None, device=None):
+    """Normalized AdaFace embedding for a PIL Image or a path, or None.
+
+    None means MTCNN found no face — for a generated variation that is itself
+    the answer: the grading API will not find one either.
+    """
+    dev = device or _shared_model_device or _resolve_mtcnn_device()
+    model = model if model is not None else get_shared_model(dev)
+
+    path, cleanup = _path_from_image(image)
+    try:
+        return extract_face_embedding(
+            model, path, device="cuda" if dev.startswith("cuda") else "cpu"
+        )
+    finally:
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
+
+
+def similarity_to_embedding(base_embedding, variation_image, model=None, device=None):
+    """Cosine similarity between a cached base embedding and one variation.
+
+    Returns None when either side has no detectable face.
+    """
+    if base_embedding is None:
+        return None
+    var_embedding = embed_image(variation_image, model=model, device=device)
+    if var_embedding is None:
+        return None
+    return compute_cosine_similarity(base_embedding, var_embedding)
+
+
 def validate_single_variation(base_image, variation_image, model=None, min_similarity=0.7, device='cpu'):
     """
     Validate that a single variation image preserves the identity of the base face.
@@ -296,17 +374,17 @@ def validate_single_variation(base_image, variation_image, model=None, min_simil
     Args:
         base_image: Original face image as file path (str) or PIL Image
         variation_image: Variation image as file path (str) or PIL Image
-        model: AdaFace model (if None, will be loaded)
+        model: AdaFace model (if None, the shared cached model is used)
         min_similarity: Minimum cosine similarity to consider identity preserved (default 0.7)
         device: Device to run inference on ('cpu' or 'cuda')
 
     Returns:
         True if similarity >= min_similarity, False otherwise (or if embedding extraction fails)
     """
-    base_path, _ = _path_from_image(base_image)
-    var_path, _ = _path_from_image(variation_image)
-    results = compare_faces(base_path, [var_path], model=model, device=device)
-    similarity = results.get(var_path)
+    base_embedding = embed_image(base_image, model=model, device=device)
+    similarity = similarity_to_embedding(
+        base_embedding, variation_image, model=model, device=device
+    )
     if similarity is None:
         return False
     return similarity >= min_similarity
@@ -325,17 +403,12 @@ def compare_faces(original_image_path, variation_image_paths, model=None, device
     Returns:
         Dictionary mapping variation paths to similarity scores
     """
-    # Load model if not provided
+    # Load model if not provided — shared, so repeated calls do not reload the
+    # checkpoint (and re-initialize MTCNN) every time.
     if model is None:
-        model = load_adaface_model(device=device)
-        # Initialize MTCNN if not already done
-        if not hasattr(align, "mtcnn_model") or align.mtcnn_model is None:
-            mtcnn_device = (
-                _resolve_mtcnn_device()
-                if device == "cuda" and _cuda_works()
-                else "cpu"
-            )
-            align.mtcnn_model = mtcnn.MTCNN(device=mtcnn_device, crop_size=(112, 112))
+        model = get_shared_model(
+            "cuda:0" if device == "cuda" and _cuda_works() else "cpu"
+        )
     
     print(f"\nExtracting embedding from original image: {original_image_path}")
     original_embedding = extract_face_embedding(model, original_image_path, device=device)
