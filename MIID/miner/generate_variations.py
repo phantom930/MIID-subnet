@@ -76,6 +76,11 @@ How intensity works
 - ``medium`` makes a balanced edit.
 - ``far`` allows a bigger change.
 
+Three of the five slots in a standard round are *combined* ones, where the
+validator sends ``"lighting_edit+expression_edit"`` against ``"light+far"``.
+Each component is phrased at its own intensity (see ``EDIT_PHRASES``), and the
+slot as a whole is driven at its strongest component's bin.
+
 =============================================================================
 Simple setup steps
 =============================================================================
@@ -232,6 +237,104 @@ IDENTITY_CLAUSE = (
     "and proportions, same eyes, nose, mouth and jawline, same skin tone, same "
     "hair, same apparent age and gender. Do not restyle or beautify the face."
 )
+
+# The validator joins a combined slot's components with this, in both `type`
+# ("lighting_edit+expression_edit") and `intensity` ("light+far").  See
+# COMBINED_VARIATION_SEPARATOR in MIID/validator/image_variations.py.
+COMBINED_SEPARATOR = "+"
+
+# Ordering over the intensity bins, so a combined slot can be reduced to the
+# single scalar the backends' guidance multiplier expects.
+INTENSITY_RANK: Dict[str, int] = {"light": 0, "medium": 1, "far": 2}
+_RANK_TO_INTENSITY = {rank: name for name, rank in INTENSITY_RANK.items()}
+
+# The validator appends the accessory to a background slot's `detail` behind
+# this marker, in a richer wording than the copy it puts in `description`
+# ("Baseball cap or similar sports cap" vs "Add baseball cap").  It is graded
+# content, so it is lifted out and stated once, from the better source.
+_ACCESSORY_MARKER = "Additionally, include: "
+
+# One handwritten instruction per (type, intensity) the validator can ask for.
+#
+# The protocol's own `description` is a *taxonomy entry* ("Modify illumination
+# direction, intensity, or color temperature") and `detail` is the actual
+# directive ("Subtle brightness or contrast change") — so relaying both, which
+# is what merging the two fields does, spends half the prompt restating the
+# category in vaguer words that contradict the directive.  On a combined slot
+# it also drags the schema tokens in with it: "Combined variation — apply all
+# of the following while preserving identity: lighting_edit (light): ...".
+#
+# The type vocabulary is closed (5 types x 3 bins), so the miner can carry its
+# own phrasing and skip the taxonomy entirely.  Anything outside this table
+# falls back to the merge — see _get_prompt_from_request.
+EDIT_PHRASES: Dict[Tuple[str, str], str] = {
+    ("pose_edit", "light"): (
+        "Turn the head very slightly off-axis, roughly 15 degrees — a subtle "
+        "tilt, with both eyes still fully visible."
+    ),
+    ("pose_edit", "medium"): (
+        "Turn the head clearly to one side, roughly 30 degrees, into a "
+        "three-quarter view where the far jawline is partly visible."
+    ),
+    ("pose_edit", "far"): (
+        "Turn the head well past 45 degrees into a near-profile view: the far "
+        "eye partly hidden, the chin angled away from the camera."
+    ),
+    ("lighting_edit", "light"): (
+        "Light the subject softly and evenly — a gentle shift in brightness "
+        "and contrast, shadows kept diffuse."
+    ),
+    ("lighting_edit", "medium"): (
+        "Light the subject from one clear directional source to the side, with "
+        "noticeable modelling shadows down one cheek and a moderate shift in "
+        "exposure."
+    ),
+    ("lighting_edit", "far"): (
+        "Light the subject with a single hard off-axis source: deep, "
+        "high-contrast shadows across the face and a strong warm or cool "
+        "colour cast."
+    ),
+    ("expression_edit", "light"): (
+        "Give the subject a faint, barely-there smile, with a relaxed brow and "
+        "a calm, attentive look."
+    ),
+    ("expression_edit", "medium"): (
+        "Give the subject a clearly changed expression — an open smile, a "
+        "serious set to the mouth, or mild surprise."
+    ),
+    ("expression_edit", "far"): (
+        "Give the subject a pronounced expression — laughing with the mouth "
+        "open, or visibly surprised or concerned, with the eyes and brow fully "
+        "engaged."
+    ),
+    ("background_in", "light"): (
+        "Keep the same indoor room behind the subject, but shift the wall "
+        "colour, soften the background blur, or vary its texture."
+    ),
+    ("background_in", "medium"): (
+        "Place the subject in a different but plausible indoor setting — an "
+        "office, a cafe, a hotel lobby — entirely indoors."
+    ),
+    ("background_in", "far"): (
+        "Place the subject in a clearly different indoor setting with its own "
+        "interior design and visible depth, such as a gallery, studio or "
+        "lobby. Keep the background fully indoors, with no outdoor elements "
+        "anywhere in the frame."
+    ),
+    ("background_out", "light"): (
+        "Keep the same outdoor setting behind the subject, but shift the depth "
+        "of field, the scene texture, or the direction of the light slightly."
+    ),
+    ("background_out", "medium"): (
+        "Place the subject in a different but plausible outdoor setting — a "
+        "park, a street corner, a waterfront."
+    ),
+    ("background_out", "far"): (
+        "Place the subject in a clearly different outdoor setting with its own "
+        "composition and depth, such as an urban street, a beach promenade, a "
+        "mountain overlook or a garden path."
+    ),
+}
 
 # =============================================================================
 # Available models
@@ -499,15 +602,66 @@ def _canonical_background_type(req: Any, var_type: str) -> str:
     return "background_in"
 
 
+def _split_components(var_type: str, raw_intensity: str) -> List[Tuple[str, str]]:
+    """Split a slot into its (type, intensity) components.
+
+    Three of the five slots in a standard round are combined ones, where the
+    validator sends ``"lighting_edit+expression_edit"`` against
+    ``"light+far"``. A single slot simply yields one pair.
+
+    A malformed pairing — a differing number of types and intensities, which
+    the protocol does not currently produce but miners and validators upgrade
+    independently — spreads the first intensity across every component rather
+    than dropping the slot.
+    """
+    types = [t for t in var_type.split(COMBINED_SEPARATOR) if t]
+    levels = [i for i in raw_intensity.split(COMBINED_SEPARATOR) if i]
+
+    if len(levels) != len(types):
+        head = levels[0] if levels else DEFAULT_INTENSITY
+        levels = [head] * len(types)
+
+    return [
+        (t, level if level in INTENSITY_RANK else DEFAULT_INTENSITY)
+        for t, level in zip(types, levels)
+    ]
+
+
+def _effective_intensity(components: List[Tuple[str, str]]) -> str:
+    """The single intensity bin that stands for a whole slot.
+
+    The backends take one scalar ``intensity`` and turn it into a guidance
+    multiplier, so a combined slot has to collapse to one bin. The strongest
+    component is the honest reading: ``pose_edit(far)+expression_edit(light)``
+    is a far edit that happens to carry a light component, and treating it as
+    anything less under-drives the edit the grading API is looking for.
+    """
+    if not components:
+        return DEFAULT_INTENSITY
+    return _RANK_TO_INTENSITY[max(INTENSITY_RANK[level] for _, level in components)]
+
+
 def _get_type_and_intensity(req: Any) -> Tuple[str, str]:
-    """Extract .type and .intensity from a VariationRequest-like object or dict."""
+    """Extract .type and .intensity from a VariationRequest-like object or dict.
+
+    The type is returned verbatim (beyond the background canonicalisation),
+    because it becomes ``variation_type`` on the result and thence the S3 key
+    the grading API reads — a combined slot stays ``"lighting_edit+pose_edit"``.
+
+    The intensity is *not* verbatim: it is reduced to the single bin the
+    backends understand. Rejecting the combined form outright, which is what
+    a membership test against the three bins does, silently sent every
+    combined slot through as ``medium`` — and ``medium`` is the one bin whose
+    guidance multiplier is exactly 1.0, so the validator's intensity reached
+    the model through nothing at all on three of the five scored slots.
+    """
     var_type = getattr(req, "type", None) or (req.get("type") if isinstance(req, dict) else None)
     intensity = getattr(req, "intensity", None) or (req.get("intensity") if isinstance(req, dict) else None)
     if not var_type:
         raise ValueError("variation_requests entry missing 'type'")
-    if intensity not in ("light", "medium", "far"):
-        intensity = DEFAULT_INTENSITY
-    return (_canonical_background_type(req, var_type), intensity)
+
+    canonical = _canonical_background_type(req, var_type)
+    return (canonical, _effective_intensity(_split_components(canonical, intensity or "")))
 
 
 def _strip_requirements(text: Optional[str]) -> str:
@@ -524,6 +678,59 @@ def _strip_requirements(text: Optional[str]) -> str:
     return cleaned.strip().rstrip(".").strip()
 
 
+def _req_field(req: Any, name: str) -> str:
+    """Read one field off a VariationRequest-like object or a dict."""
+    value = getattr(req, name, None)
+    if value is None and isinstance(req, dict):
+        value = req.get(name)
+    return (value or "").strip()
+
+
+def _accessory_from_detail(detail: str) -> str:
+    """The accessory a background slot asks for, or "" when there is none.
+
+    The validator appends it to `detail` behind _ACCESSORY_MARKER, after the
+    requirements boilerplate has been stripped off the tail.
+    """
+    cleaned = _strip_requirements(detail)
+    marker = cleaned.find(_ACCESSORY_MARKER)
+    if marker == -1:
+        return ""
+    return cleaned[marker + len(_ACCESSORY_MARKER):].strip().rstrip(".").strip()
+
+
+def _soften(level: str) -> str:
+    """One intensity bin down, floored at ``light``."""
+    return _RANK_TO_INTENSITY[max(0, INTENSITY_RANK[level] - 1)]
+
+
+def _edit_clause(
+    components: List[Tuple[str, str]], identity_bias: float,
+) -> Optional[str]:
+    """Written instructions for a slot's components, or None if unrecognised.
+
+    None means some component is outside EDIT_PHRASES — a variation type added
+    on the validator side against a miner that has not been upgraded yet. The
+    caller falls back to relaying the protocol text, so an unknown type still
+    generates something rather than raising.
+    """
+    phrases = []
+    for comp_type, level in components:
+        # A retry means the face already drifted past the identity floor, and
+        # pose is what moves an embedding furthest — so give that component a
+        # bin back rather than flattening the whole edit. The alternative is a
+        # variation dropped at the 0.4 floor in submission_builder, which
+        # scores zero; a slightly under-driven edit still scores.
+        if identity_bias > 0 and comp_type == "pose_edit":
+            level = _soften(level)
+        phrase = EDIT_PHRASES.get((comp_type, level))
+        if phrase is None:
+            return None
+        phrases.append(phrase)
+
+    return " ".join(phrases) if phrases else None
+
+
 def _get_prompt_from_request(
     req: Any, var_type: str, intensity: str, identity_bias: float = 0.0,
 ) -> str:
@@ -535,26 +742,46 @@ def _get_prompt_from_request(
     whether the result obeys the passport-portrait composition — so those two
     take the front of the prompt, where the model weights them most.
 
-    ``identity_bias`` > 0 marks a retry after the face drifted too far, and
-    adds an explicit instruction to hold the edit back.
-    """
-    description = getattr(req, "description", None) or (req.get("description") if isinstance(req, dict) else None) or ""
-    detail = getattr(req, "detail", None) or (req.get("detail") if isinstance(req, dict) else None) or ""
+    The edit itself is written here from (type, intensity) rather than
+    assembled out of the request's `description` and `detail`. Those two
+    fields are a category label and a directive respectively, so merging them
+    states each instruction twice in two strengths, and on a combined slot it
+    carries the schema's own tokens into the prompt. EDIT_PHRASES covers every
+    type the validator currently sends; anything else falls back to the merge.
 
-    edit = ". ".join(
-        _strip_requirements(p).rstrip(".")
-        for p in (description, detail)
-        if _strip_requirements(p)
-    )
-    if not edit:
-        edit = f"{var_type} variation at {intensity} intensity"
+    ``identity_bias`` > 0 marks a retry after the face drifted too far, and
+    holds the edit back — generally, and on the pose component specifically.
+    """
+    description = _req_field(req, "description")
+    detail = _req_field(req, "detail")
+
+    components = _split_components(var_type, _req_field(req, "intensity"))
+    written = _edit_clause(components, identity_bias)
 
     parts = [
         FRAMING_CLAUSE,
         "The subject is the SAME person as the reference image.",
-        f"Apply this edit: {edit}.",
-        IDENTITY_CLAUSE,
     ]
+
+    if written is not None:
+        parts.append(written)
+        # The accessory is randomised per round, so it cannot live in the
+        # table — but it is graded content, so it is carried over from the
+        # request. `detail` holds the fuller of the validator's two wordings.
+        accessory = _accessory_from_detail(detail)
+        if accessory:
+            parts.append(f"Also include: {accessory}.")
+    else:
+        edit = ". ".join(
+            _strip_requirements(p).rstrip(".")
+            for p in (description, detail)
+            if _strip_requirements(p)
+        )
+        if not edit:
+            edit = f"{var_type} variation at {intensity} intensity"
+        parts.append(f"Apply this edit: {edit}.")
+
+    parts.append(IDENTITY_CLAUSE)
 
     if identity_bias > 0:
         parts.append(
