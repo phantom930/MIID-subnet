@@ -14,6 +14,9 @@
 # Image bytes are NOT stored by default — a round's variations run to tens of
 # megabytes and the miner answers a validator roughly hourly. Set
 # MIID_ARCHIVE_IMAGES=1 to keep them too.
+#
+# Records older than 24 hours are deleted whenever a new one is written
+# (MIID_ARCHIVE_RETENTION_HOURS; 0 keeps them until the record cap).
 
 import base64
 import hashlib
@@ -44,6 +47,12 @@ DEFAULT_ARCHIVE_DIR = PROJECT_ROOT / DEFAULT_ARCHIVE_DIRNAME
 # Keep this many request directories, newest first. 0 disables pruning.
 DEFAULT_MAX_RECORDS = 500
 
+# Drop request directories older than this many hours (a rolling window, not
+# a calendar day, so the archive is never emptied at midnight UTC). With
+# MIID_ARCHIVE_IMAGES=1 a day of rounds is already a few hundred megabytes.
+# 0 disables age-based pruning.
+DEFAULT_RETENTION_HOURS = 24.0
+
 
 def _env_flag(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -68,6 +77,26 @@ def max_records() -> int:
         return max(0, int(os.environ.get("MIID_ARCHIVE_MAX_RECORDS", DEFAULT_MAX_RECORDS)))
     except (TypeError, ValueError):
         return DEFAULT_MAX_RECORDS
+
+
+def retention_hours() -> float:
+    """How long request directories are kept (MIID_ARCHIVE_RETENTION_HOURS)."""
+    try:
+        return max(0.0, float(
+            os.environ.get("MIID_ARCHIVE_RETENTION_HOURS", DEFAULT_RETENTION_HOURS)
+        ))
+    except (TypeError, ValueError):
+        return DEFAULT_RETENTION_HOURS
+
+
+def _started_at(directory: Path) -> Optional[datetime]:
+    """Start time encoded in a request directory's name (see record_dir)."""
+    try:
+        return datetime.strptime(
+            directory.name.split("__", 1)[0], "%Y%m%dT%H%M%SZ"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def resolve_archive_dir(override: Optional[str] = None) -> Path:
@@ -313,10 +342,13 @@ def write_record(record: Dict[str, Any], root: Path) -> Optional[Path]:
         return None
 
 
-def prune(root: Path, keep: Optional[int] = None) -> None:
-    """Drop the oldest request directories beyond the retention limit."""
+def prune(
+    root: Path, keep: Optional[int] = None, max_age_hours: Optional[float] = None,
+) -> None:
+    """Drop request directories past the age limit or beyond the count limit."""
     keep = max_records() if keep is None else keep
-    if keep <= 0:
+    max_age_hours = retention_hours() if max_age_hours is None else max_age_hours
+    if keep <= 0 and max_age_hours <= 0:
         return
     try:
         dirs = sorted(
@@ -324,8 +356,16 @@ def prune(root: Path, keep: Optional[int] = None) -> None:
             key=lambda p: p.name,
             reverse=True,
         )
-        for stale in dirs[keep:]:
-            shutil.rmtree(stale, ignore_errors=True)
+        stale = dirs[keep:] if keep > 0 else []
+        if max_age_hours > 0:
+            cutoff = _utc_now().timestamp() - max_age_hours * 3600
+            for directory in dirs[:len(dirs) - len(stale)]:
+                started = _started_at(directory)
+                # A name that does not parse is not ours to judge by age.
+                if started is not None and started.timestamp() < cutoff:
+                    stale.append(directory)
+        for directory in stale:
+            shutil.rmtree(directory, ignore_errors=True)
         # Tidy up day folders left empty by the sweep.
         for day in root.glob("*"):
             if day.is_dir() and not any(day.iterdir()):

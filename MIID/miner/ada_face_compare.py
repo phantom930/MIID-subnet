@@ -366,6 +366,71 @@ def similarity_to_embedding(base_embedding, variation_image, model=None, device=
     return compute_cosine_similarity(base_embedding, var_embedding)
 
 
+# Degrees of yaw per unit shift of the nose along the eye line and along the
+# mouth line (see face_yaw_signature). Least-squares fit on 180 archived
+# variations against MediaPipe FaceLandmarker yaw, the benchmark's pose
+# measure: correlation 0.98, median error 0.9°, 90th percentile 3.3°. It reads
+# a little low at the top of the fitted range (29° for 31°) and no archived
+# image turned past 34°, so beyond that it is a monotonic extrapolation.
+_YAW_PER_EYE_SHIFT = 45.0
+_YAW_PER_MOUTH_SHIFT = 30.2
+
+
+def face_yaw_signature(image):
+    """A yaw signature for the largest face in ``image``, or None if no face.
+
+    Uses the five MTCNN landmarks the aligner already computes: where the nose
+    projects along the eye line (0 at one eye, 1 at the other) and along the
+    mouth line (relative to its centre). Only meaningful as a difference
+    between two images of the same face, which is how face_yaw_delta uses it.
+    """
+    if not isinstance(image, Image.Image):
+        image = Image.open(image)
+    if getattr(align, "mtcnn_model", None) is None:
+        get_shared_model()
+    mt = align.mtcnn_model
+    try:
+        boxes, landmarks = mt.detect_faces(
+            image.convert("RGB"), mt.min_face_size, mt.thresholds,
+            mt.nms_thresholds, mt.factor,
+        )
+    except Exception:
+        return None
+    if len(landmarks) == 0:
+        return None
+    i = int(np.argmax([(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]))
+    xs, ys = landmarks[i][0:5], landmarks[i][5:10]
+    left_eye, right_eye, nose, mouth_l, mouth_r = (
+        np.array([xs[j], ys[j]]) for j in range(5)
+    )
+    eye_line = right_eye - left_eye
+    mouth_line = mouth_r - mouth_l
+    if np.dot(eye_line, eye_line) < 1.0 or np.dot(mouth_line, mouth_line) < 1.0:
+        return None
+    along_eyes = np.dot(nose - left_eye, eye_line) / np.dot(eye_line, eye_line)
+    along_mouth = (
+        np.dot(nose - (mouth_l + mouth_r) / 2, mouth_line)
+        / np.dot(mouth_line, mouth_line)
+    )
+    return float(along_eyes), float(along_mouth)
+
+
+def face_yaw_delta(base_signature, variation_image):
+    """Absolute head turn in degrees between the base face and a variation.
+
+    None when either face cannot be found.
+    """
+    if base_signature is None:
+        return None
+    signature = face_yaw_signature(variation_image)
+    if signature is None:
+        return None
+    return abs(
+        _YAW_PER_EYE_SHIFT * (signature[0] - base_signature[0])
+        + _YAW_PER_MOUTH_SHIFT * (signature[1] - base_signature[1])
+    )
+
+
 def validate_single_variation(base_image, variation_image, model=None, min_similarity=0.7, device='cpu'):
     """
     Validate that a single variation image preserves the identity of the base face.

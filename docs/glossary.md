@@ -211,7 +211,7 @@ Hardcoded unless the row says otherwise.
 | `MIID_INFERENCE_STEPS` / `MIID_GUIDANCE_SCALE` | Diffusion knobs, default 20 and 3.5. |
 | `MIID_USE_S3`, `MIID_S3_BUCKET`, `MIID_S3_REGION`, `MIID_LOCAL_STORAGE` | Storage routing. |
 | `MIID_IMAGES_SERVER` | Base image / IOTD server, default `http://52.44.186.20:5000` (validator only). The only external endpoint that is overridable. |
-| `MIID_REQUEST_ARCHIVE`, `MIID_ARCHIVE_ENABLED`, `MIID_ARCHIVE_IMAGES`, `MIID_ARCHIVE_MAX_RECORDS` | Request-archive location, on/off, whether media is kept (off by default), and retention. |
+| `MIID_REQUEST_ARCHIVE`, `MIID_ARCHIVE_ENABLED`, `MIID_ARCHIVE_IMAGES`, `MIID_ARCHIVE_MAX_RECORDS`, `MIID_ARCHIVE_RETENTION_HOURS` | Request-archive location, on/off, whether media is kept (off by default), and retention. |
 | `BT_NO_PARSE_CLI_ARGS` | Set to `false` by [`MIID/utils/config.py`](../MIID/utils/config.py). bittensor ≥ 10.5 defaults it to `true`, which silently drops every CLI arg and leaves `config.neuron` missing. Do not remove it. |
 | **Flags you cannot turn off** | `--neuron.UAV_grading`, `--wandb.disable`, `--wandb.cleanup_runs`, `--neuron.nominatim_cache_enabled` are `action="store_true"` with `default=True`. Changing them means editing `config.py`. |
 

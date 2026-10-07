@@ -394,6 +394,7 @@ and `pulid_flux2` are actually performing for you across rounds rather than gues
 | `MIID_ARCHIVE_ENABLED` | Set to `0` to turn archiving off entirely | on |
 | `MIID_ARCHIVE_IMAGES` | Set to `1` to also keep the base image, both seeds and the generated variations | off |
 | `MIID_ARCHIVE_MAX_RECORDS` | Records kept before the oldest are pruned (`0` = unlimited) | 500 |
+| `MIID_ARCHIVE_RETENTION_HOURS` | Records older than this many hours are deleted when a new one is written (`0` = no age limit) | 24 |
 
 **Media is not kept by default.** A round's variations run to tens of megabytes and you answer a
 validator roughly hourly, so `MIID_ARCHIVE_IMAGES=1` will grow fast — turn it on while tuning
@@ -408,6 +409,58 @@ python -m MIID.miner.dry_run_submission --image face.png --no-archive # or don't
 
 Archiving never affects what a validator receives: if a record cannot be written, the failure is
 logged and the response goes out regardless.
+
+---
+
+## Benchmark: What Score Will My Submissions Get?
+
+The grading API never tells a miner its per-variation `validation_score`. The benchmark
+predicts it offline from archived rounds: it re-measures each submitted image the way the
+published score sheet describes (`docs/Face Variation Reward System.pdf`, Cycle 4) and maps the
+result to a score from −5 to 5. It also reports what that score means for reward. Records need
+images, so run the miner with `MIID_ARCHIVE_IMAGES=1`.
+
+```bash
+bash scripts/miner/benchmark.sh                          # every archived round with images
+bash scripts/miner/benchmark.sh --last 10 --html bench.html -v
+bash scripts/miner/benchmark.sh --base face.png --image out.png \
+    --type lighting_edit+pose_edit --intensity medium+far  # one image outside the archive
+```
+
+The first run creates `bench_env/`, which uses `miner_env`'s packages and adds MediaPipe. It
+then downloads the MediaPipe task files and CLIP into `~/.cache/miid_benchmark` and the
+Hugging Face cache. Nothing is installed into `miner_env`, and everything runs on CPU by default
+(`--device cuda` to share the miner's GPU). Measurements are cached per record in
+`benchmark.json`, so a re-run only re-scores.
+
+Per variation it prints the predicted score, AdaFace identity, Δrep, and the main reason. For
+each round it prints:
+
+- **Expected KAV.** The validator grades one random slot per round and gives it 0 unless that
+  slot's identity is at least 0.6, so this is the mean over slots of `score / 5` for slots that
+  pass that gate.
+- **Δrep if reviewed.** The reputation change from the manual-review table (+0.10 for a 5,
+  −0.10 for a −3). Reputation (UAV) carries 90% of miner emissions.
+
+The summary breaks scores down by model and by slot, so you can compare `flux_klein`, `pulid`
+and `pulid_flux2` on your own submissions.
+
+| Check | Score | Basis |
+|-------|-------|-------|
+| AdaFace identity < 0.4, face count ≠ 1, gender-mismatched religious covering | −3 | score sheet |
+| Face > 15.5% narrower than the seed | −4 | score sheet |
+| Face pixels copied from the seed | −5 | sheet; detection threshold estimated |
+| Duplicate of the seed / resolution ≤ 512×672 / face not dominant | −1 | sheet; dominance threshold estimated |
+| Claimed variation not detected | −2 | sheet; detector thresholds estimated |
+| Every requested component at the requested intensity | 5 | sheet; intensity bins estimated |
+| Partial match, wrong intensity, or an unrequested extra variation | 3 | sheet |
+| Identity 0.4–0.6 | at most 1 | Cycle 1 flowchart |
+| Background slot: accessory match + background changed + identity ≥ 0.6 | 5 (4 without background change) | score sheet |
+
+These are predictions, not grades. The score sheet says *what* the grader checks but not the
+numeric cut-offs its detectors use, so the pose, expression, lighting, background and accessory
+thresholds were calibrated by eye against archived rounds. They are all in
+`MIID/benchmark/scoring.py` (`T`), with the source of each rule.
 
 ---
 

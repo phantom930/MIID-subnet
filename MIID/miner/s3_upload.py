@@ -35,6 +35,9 @@ USE_S3 = os.environ.get("MIID_USE_S3", "true").lower() == "true" and REQUESTS_AV
 # Local storage directory (fallback or for sandbox testing)
 LOCAL_STORAGE_DIR = Path(os.environ.get("MIID_LOCAL_STORAGE", "/tmp/miid_submissions"))
 
+# HTTP PUT attempts per object before falling back to local storage.
+PUT_ATTEMPTS = max(1, int(os.environ.get("MIID_S3_PUT_ATTEMPTS", "4")))
+
 
 def upload_via_http_put(s3_key: str, data: bytes, content_type: str = 'application/octet-stream') -> bool:
     """Upload file to S3 using HTTP PUT (for public write buckets).
@@ -51,26 +54,35 @@ def upload_via_http_put(s3_key: str, data: bytes, content_type: str = 'applicati
         return False
     
     url = f"https://{S3_BUCKET_NAME}.s3.{S3_REGION}.amazonaws.com/{s3_key}"
-    
-    try:
-        response = requests.put(
-            url,
-            data=data,
-            headers={
-                'Content-Type': content_type,
-            },
-            timeout=30
-        )
-        
-        if response.status_code in [200, 204]:
-            return True
-        else:
-            bt.logging.warning(f"[S3 HTTP PUT] Upload failed with status {response.status_code}: {response.text[:200]}")
-            return False
-            
-    except requests.exceptions.RequestException as e:
-        bt.logging.warning(f"[S3 HTTP PUT] Request failed: {e}")
-        return False
+
+    # A single dropped TLS connection (SSLEOFError, 2026-10-07 10:01) used to
+    # send the slot to local storage, where no validator can fetch it — a
+    # missing submission. Transient failures are retried; a 4xx is not.
+    for attempt in range(1, PUT_ATTEMPTS + 1):
+        try:
+            response = requests.put(
+                url,
+                data=data,
+                headers={
+                    'Content-Type': content_type,
+                },
+                timeout=30
+            )
+            if response.status_code in [200, 204]:
+                return True
+            bt.logging.warning(
+                f"[S3 HTTP PUT] Upload failed with status {response.status_code} "
+                f"(attempt {attempt}/{PUT_ATTEMPTS}): {response.text[:200]}"
+            )
+            if 400 <= response.status_code < 500:
+                return False
+        except requests.exceptions.RequestException as e:
+            bt.logging.warning(
+                f"[S3 HTTP PUT] Request failed (attempt {attempt}/{PUT_ATTEMPTS}): {e}"
+            )
+        if attempt < PUT_ATTEMPTS:
+            time.sleep(2 * attempt)
+    return False
 
 
 def ensure_local_storage():

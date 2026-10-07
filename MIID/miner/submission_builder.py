@@ -23,6 +23,7 @@ from MIID.miner.image_generator import (
     generate_variations,
     validate_face_variation,
 )
+from MIID.miner.generate_variations import subject_gender_from_filename
 from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
 from MIID.miner.s3_upload import upload_to_s3
 
@@ -215,6 +216,7 @@ def build_image_submissions(
             base_image,
             image_request.variation_requests,
             identity_target=min_similarity,
+            subject_gender=subject_gender_from_filename(image_request.image_filename),
         )
         generation_seconds = time.monotonic() - generation_started
 

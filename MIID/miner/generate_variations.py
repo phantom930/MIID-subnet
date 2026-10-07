@@ -119,7 +119,8 @@ Helpful environment variables
 - ``MIID_IDENTITY_TARGET``: AdaFace similarity a variation must reach before it
   is accepted without a retry (default 0.6 — the validator's own gate)
 - ``MIID_IDENTITY_RETRIES``: extra attempts per variation when it misses that
-  target (default 1)
+  target, or when its measured head turn misses the requested pose range
+  (default 2)
 - ``MIID_GENERATION_BUDGET_SECONDS``: wall-clock budget for one request's
   generation, retries included (default 900, inside the validator's 1200s)
 - ``HF_TOKEN``: Hugging Face access token
@@ -142,6 +143,7 @@ on your hardware before running the full miner.
 import gc
 import os
 import random
+import re
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -254,6 +256,77 @@ _RANK_TO_INTENSITY = {rank: name for name, rank in INTENSITY_RANK.items()}
 # content, so it is lifted out and stated once, from the better source.
 _ACCESSORY_MARKER = "Additionally, include: "
 
+# The validator's religious-covering request is "Religious head covering
+# (hijab, turban, kippah, taqiyah, etc.) appropriate to subject". Relayed as
+# is, the model reads the first item and draws a hijab on men too — and the
+# grading score sheet gives -3 for a covering that does not match the seed's
+# gender. That was the largest single loss in the archive (22 of 145
+# variations), so the covering is chosen here, from the subject's gender.
+_RELIGIOUS_MARKER = "religious head covering"
+# Men get a taqiyah only. The grader classifies the accessory with a
+# confidence cut-off (score sheet: "background accessory path insufficient
+# match" = 0, or -1 without a background), and CLIP-style models read a
+# wrapped turban as a bandana: raw CLIP put "bandana" first on 9 of 9 of our
+# turbans, and the turban graded -1 by RoundTable21 on 2026-10-07 read 94%
+# bandana / 6% religious covering.
+RELIGIOUS_COVERINGS: Dict[str, Tuple[str, ...]] = {
+    "m": (
+        "a white Muslim prayer cap (taqiyah / kufi) with a fine crocheted "
+        "pattern, fitted on the crown of his head, with his ears, jawline and "
+        "neck left uncovered — not a headscarf, not a turban",
+    ),
+    "f": (
+        "a hijab headscarf wrapped around her head that covers her hair, ears "
+        "and neck while her whole face stays visible",
+    ),
+}
+
+
+def subject_gender_from_filename(name: Optional[str]) -> Optional[str]:
+    """"m" / "f" from a validator base filename (e.g. ``070f3abdfcf9_m.png``)."""
+    if not name:
+        return None
+    match = re.search(r"_([mf])(?:_[a-z]+)?\.[a-z0-9]+$", name.lower())
+    return match.group(1) if match else None
+
+
+# Concrete renderings of the validator's other accessories, keyed by a phrase
+# from its `detail` text. The grader scores the accessory by classifier
+# confidence, and on 2026-10-07 the muted versions the bare text produced
+# failed it: CLIP with the validator's own wording read 7 of 9 snug grey
+# beanies and 3 of 12 dark caps as "no head accessory" (< 0.5). Contrast with
+# the hair and the item's defining shape are what carry the confidence.
+ACCESSORY_RENDERINGS: Tuple[Tuple[str, str], ...] = (
+    # First: the brim-hat text itself says "(not baseball cap)".
+    ("brim hat", "a wide-brim hat (a fedora or sun hat) with a clearly "
+                 "visible brim all the way round — not a baseball cap"),
+    ("knit hat", "a chunky cable-knit winter beanie in a bright solid colour, "
+                 "with a thick folded cuff, pulled down over the top of the "
+                 "head so it clearly sits above the hair"),
+    ("baseball cap", "a baseball cap in a bright solid colour with a curved "
+                     "visor pointing forward, clearly a sports cap"),
+    ("bandana", "a bandana with a bold paisley print tied over the top of the "
+                "head, knotted at the back"),
+)
+
+
+def _resolve_accessory(accessory: str, subject_gender: Optional[str]) -> str:
+    """A concrete accessory to draw, gender-appropriate for a religious covering."""
+    lowered = accessory.lower()
+    if _RELIGIOUS_MARKER not in lowered:
+        for phrase, rendering in ACCESSORY_RENDERINGS:
+            if phrase in lowered:
+                return rendering
+        return accessory
+    options = RELIGIOUS_COVERINGS.get(subject_gender or "")
+    if not options:
+        return (
+            f"{accessory}; choose the covering that matches the subject's own "
+            "gender — a hijab only for a woman, a taqiyah prayer cap only for "
+            "a man"
+        )
+    return random.choice(options)
+
 # One handwritten instruction per (type, intensity) the validator can ask for.
 #
 # The protocol's own `description` is a *taxonomy entry* ("Modify illumination
@@ -267,36 +340,54 @@ _ACCESSORY_MARKER = "Additionally, include: "
 # The type vocabulary is closed (5 types x 3 bins), so the miner can carry its
 # own phrasing and skip the taxonomy entirely.  Anything outside this table
 # falls back to the merge — see _get_prompt_from_request.
+#
+# Pose phrases ask for more rotation than the bin names. FLUX.2 Klein ignores
+# guidance_scale (it is step-distilled), so wording is the only lever, and the
+# reference image pulls the head back toward frontal: across 145 archived
+# variations the measured yaw medians were 4° for "light" (asked ±15°), 19° for
+# "medium" (±30°) and 22° for "far" (>45°). Asking past the target lands in it.
+# {side} is filled with left/right per generation.
 EDIT_PHRASES: Dict[Tuple[str, str], str] = {
     ("pose_edit", "light"): (
-        "Turn the head very slightly off-axis, roughly 15 degrees — a subtle "
-        "tilt, with both eyes still fully visible."
+        "Rotate the head about 20 degrees to the {side}: the nose points "
+        "clearly off-centre and one cheek shows more than the other, while "
+        "both eyes stay fully visible. The head must not face the camera "
+        "straight on."
     ),
     ("pose_edit", "medium"): (
-        "Turn the head clearly to one side, roughly 30 degrees, into a "
-        "three-quarter view where the far jawline is partly visible."
+        "Rotate the head about 40 degrees to the {side} into a clear "
+        "three-quarter view: the far cheek recedes, the far ear is hidden and "
+        "the nose overlaps the far cheek."
     ),
     ("pose_edit", "far"): (
-        "Turn the head well past 45 degrees into a near-profile view: the far "
-        "eye partly hidden, the chin angled away from the camera."
+        "Rotate the head 70 degrees to the {side} into a near-profile view: "
+        "the nose seen in profile against the background, the far eye almost "
+        "hidden, the near ear fully visible. Shoulders may stay toward the "
+        "camera, but the face points to the side."
     ),
+    # Generators brighten the face on their own; "a gentle shift in
+    # brightness" on top of that read as a medium change in most rounds.
     ("lighting_edit", "light"): (
-        "Light the subject softly and evenly — a gentle shift in brightness "
-        "and contrast, shadows kept diffuse."
+        "Change the lighting only subtly: keep the overall exposure close to "
+        "the reference, with slightly softer or slightly warmer light and "
+        "faint, diffuse shadows."
     ),
     ("lighting_edit", "medium"): (
-        "Light the subject from one clear directional source to the side, with "
-        "noticeable modelling shadows down one cheek and a moderate shift in "
-        "exposure."
+        "Light the subject from one clear directional source on the {side}: "
+        "that half of the face is bright, the other half falls into a clearly "
+        "visible shadow down the cheek, nose and jaw."
     ),
     ("lighting_edit", "far"): (
         "Light the subject with a single hard off-axis source: deep, "
         "high-contrast shadows across the face and a strong warm or cool "
         "colour cast."
     ),
+    # "Faint, barely-there" landed on both sides of light: no change at all
+    # on some rounds, a full smile on others. A named, closed-mouth smile is a
+    # visible but bounded change.
     ("expression_edit", "light"): (
-        "Give the subject a faint, barely-there smile, with a relaxed brow and "
-        "a calm, attentive look."
+        "Give the subject a small closed-mouth smile: the corners of the lips "
+        "lifted, lips together with no teeth showing, and a relaxed brow."
     ),
     ("expression_edit", "medium"): (
         "Give the subject a clearly changed expression — an open smile, a "
@@ -307,23 +398,36 @@ EDIT_PHRASES: Dict[Tuple[str, str], str] = {
         "open, or visibly surprised or concerned, with the eyes and brow fully "
         "engaged."
     ),
+    # The base image is a plain studio backdrop, so "keep the same room" kept
+    # the blank backdrop — and the grader's background check found no
+    # background. Light still has to be a real, if quiet, setting.
+    # Backgrounds must read as a real scene to the grader's background check:
+    # a white-walled gallery graded -1 ("no background detected") on
+    # 2026-10-07, so every level names concrete, visible furniture or scenery
+    # and light blur only.
     ("background_in", "light"): (
-        "Keep the same indoor room behind the subject, but shift the wall "
-        "colour, soften the background blur, or vary its texture."
+        "Replace the plain backdrop with a real indoor room behind the "
+        "subject — a coloured wall with a shelf, a plant or a framed picture, "
+        "slightly out of focus but clearly recognisable, never a blank or "
+        "white backdrop."
     ),
     ("background_in", "medium"): (
         "Place the subject in a different but plausible indoor setting — an "
-        "office, a cafe, a hotel lobby — entirely indoors."
+        "office with desks and shelves, a cafe with tables and warm lights, "
+        "or a hotel lobby with furniture — entirely indoors, with the room "
+        "clearly visible behind them."
     ),
     ("background_in", "far"): (
         "Place the subject in a clearly different indoor setting with its own "
-        "interior design and visible depth, such as a gallery, studio or "
-        "lobby. Keep the background fully indoors, with no outdoor elements "
-        "anywhere in the frame."
+        "interior design and visible depth, such as a library with full "
+        "bookshelves, a busy open-plan office or a richly furnished hotel "
+        "lobby — colourful and detailed, not white walls. Keep the background "
+        "fully indoors, with no outdoor elements anywhere in the frame."
     ),
     ("background_out", "light"): (
-        "Keep the same outdoor setting behind the subject, but shift the depth "
-        "of field, the scene texture, or the direction of the light slightly."
+        "Replace the plain backdrop with a real outdoor scene in daylight — "
+        "trees, a path or building fronts behind the subject, slightly out of "
+        "focus but clearly recognisable as outdoors, never a blank backdrop."
     ),
     ("background_out", "medium"): (
         "Place the subject in a different but plausible outdoor setting — a "
@@ -333,6 +437,20 @@ EDIT_PHRASES: Dict[Tuple[str, str], str] = {
         "Place the subject in a clearly different outdoor setting with its own "
         "composition and depth, such as an urban street, a beach promenade, a "
         "mountain overlook or a garden path."
+    ),
+}
+
+# Appended on a retry after image_generator measured the head turn outside
+# the requested range. Klein under-rotates far more often than it over-rotates:
+# the first rounds on the "70 degrees" wording still landed at 21–34°.
+POSE_HINTS: Dict[str, str] = {
+    "more": (
+        "The previous attempt barely turned the head: turn it clearly further "
+        "this time — the change of angle must be obvious at a glance."
+    ),
+    "less": (
+        "Keep the head turn modest — no more than the angle described, with "
+        "the face still mostly toward the camera."
     ),
 }
 
@@ -358,7 +476,10 @@ AVAILABLE_MODELS: Dict[str, Dict[str, Any]] = {
         "type": "pulid",
         "params": "~12B",
         "license": "NeurIPS 2024 (ByteDance) / FLUX dev non-commercial",
-        "base": True,
+        # Out of the random pool: without nunchaku it is FLUX.1 Kontext, which
+        # kept the seed's face pixels (copy-paste risk) and returned unchanged
+        # images for pose/expression slots. Still selectable via MIID_MODEL.
+        "base": False,
         "notes": (
             "PuLID: Pure and Lightning ID Customization. Very high identity "
             "fidelity. Uses Nunchaku PuLIDFluxPipeline on CUDA; falls back to "
@@ -597,6 +718,15 @@ def _canonical_background_type(req: Any, var_type: str) -> str:
         req.get("detail") if isinstance(req, dict) else None
     ) or ""
     blob = f"{description} {detail}".lower()
+    # The description names the environment outright ("Indoor background
+    # change"). A bare "outdoor" search is wrong: the indoor far detail ends
+    # "...with no outdoor elements", which sent indoor requests out as
+    # background_out — wrong label and an outdoor scene.
+    if "indoor background" in blob:
+        return "background_in"
+    if "outdoor background" in blob:
+        return "background_out"
+    blob = blob.replace("no outdoor", "").replace("no indoor", "")
     if "outdoor" in blob:
         return "background_out"
     return "background_in"
@@ -625,6 +755,15 @@ def _split_components(var_type: str, raw_intensity: str) -> List[Tuple[str, str]
         (t, level if level in INTENSITY_RANK else DEFAULT_INTENSITY)
         for t, level in zip(types, levels)
     ]
+
+
+def requested_pose_level(req: Any) -> Optional[str]:
+    """The intensity a slot asks of its pose_edit component, or None."""
+    var_type = _req_field(req, "type")
+    for comp_type, level in _split_components(var_type, _req_field(req, "intensity")):
+        if comp_type == "pose_edit":
+            return level
+    return None
 
 
 def _effective_intensity(components: List[Tuple[str, str]]) -> str:
@@ -715,6 +854,8 @@ def _edit_clause(
     generates something rather than raising.
     """
     phrases = []
+    # One side per slot, so a pose turn and a directional light agree.
+    side = random.choice(("left", "right"))
     for comp_type, level in components:
         # A retry means the face already drifted past the identity floor, and
         # pose is what moves an embedding furthest — so give that component a
@@ -726,13 +867,15 @@ def _edit_clause(
         phrase = EDIT_PHRASES.get((comp_type, level))
         if phrase is None:
             return None
-        phrases.append(phrase)
+        phrases.append(phrase.replace("{side}", side))
 
     return " ".join(phrases) if phrases else None
 
 
 def _get_prompt_from_request(
     req: Any, var_type: str, intensity: str, identity_bias: float = 0.0,
+    subject_gender: Optional[str] = None,
+    pose_hint: Optional[str] = None,
 ) -> str:
     """Build the generation prompt from the protocol fields.
 
@@ -751,12 +894,20 @@ def _get_prompt_from_request(
 
     ``identity_bias`` > 0 marks a retry after the face drifted too far, and
     holds the edit back — generally, and on the pose component specifically.
+
+    ``subject_gender`` ("m" / "f") turns the validator's generic religious
+    head covering into one that matches the subject — see _resolve_accessory.
+
+    ``pose_hint`` ("more" / "less") follows a measured head turn that missed
+    the requested range, and pushes the next attempt the other way.
     """
     description = _req_field(req, "description")
     detail = _req_field(req, "detail")
 
     components = _split_components(var_type, _req_field(req, "intensity"))
     written = _edit_clause(components, identity_bias)
+    if written is not None and pose_hint in POSE_HINTS:
+        written = f"{written} {POSE_HINTS[pose_hint]}"
 
     parts = [
         FRAMING_CLAUSE,
@@ -770,7 +921,13 @@ def _get_prompt_from_request(
         # request. `detail` holds the fuller of the validator's two wordings.
         accessory = _accessory_from_detail(detail)
         if accessory:
-            parts.append(f"Also include: {accessory}.")
+            # Exactly one item: the score sheet treats a second accessory as
+            # a mismatch, and generators like to add a scarf under a cap.
+            parts.append(
+                f"The subject is wearing {_resolve_accessory(accessory, subject_gender)}. "
+                "This is the only accessory added — no other hat, scarf or "
+                "head covering — and the subject keeps their own clothing."
+            )
     else:
         edit = ". ".join(
             _strip_requirements(p).rstrip(".")
@@ -876,6 +1033,9 @@ def generate_one(
     req: Any,
     model_key: Optional[str] = None,
     attempt: int = 0,
+    subject_gender: Optional[str] = None,
+    identity_bias: Optional[float] = None,
+    pose_hint: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate a single variation for one validator request.
 
@@ -890,6 +1050,11 @@ def generate_one(
         model_key: Model to use; selected fresh when omitted.
         attempt: 0 for the first try. Higher values re-roll the seed and raise
             ``identity_bias``, trading edit strength for identity retention.
+        subject_gender: "m" / "f" (see subject_gender_from_filename) or None.
+        identity_bias: Overrides the attempt-derived bias. A retry for a head
+            turn that fell short passes 0: the face held, the edit did not.
+        pose_hint: "more" / "less" when an earlier attempt's measured head
+            turn missed the requested range (see POSE_HINTS).
 
     Returns:
         Dict with ``image``, ``variation_type``, ``model_key``, ``model_id``
@@ -911,8 +1076,12 @@ def generate_one(
     var_type, intensity = _get_type_and_intensity(req)
     # Each attempt steps 40% further toward "hold the face, soften the edit",
     # capped at 0.8 so a variation never collapses into a copy of the input.
-    identity_bias = min(0.8, 0.4 * attempt)
-    prompt = _get_prompt_from_request(req, var_type, intensity, identity_bias)
+    if identity_bias is None:
+        identity_bias = min(0.8, 0.4 * attempt)
+    prompt = _get_prompt_from_request(
+        req, var_type, intensity, identity_bias, subject_gender=subject_gender,
+        pose_hint=pose_hint,
+    )
     seed = random.randint(0, 2**31 - 1)
 
     try:
@@ -939,6 +1108,7 @@ def generate_variations(
     base_image: Image.Image,
     variation_requests: List[Any],
     model_key: Optional[str] = None,
+    subject_gender: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Generate one image variation per validator request, first attempt only.
 
@@ -967,6 +1137,6 @@ def generate_variations(
     )
 
     return [
-        generate_one(base_image, req, model_key=model_key)
+        generate_one(base_image, req, model_key=model_key, subject_gender=subject_gender)
         for req in variation_requests
     ]
