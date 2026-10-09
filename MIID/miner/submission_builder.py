@@ -11,7 +11,7 @@ import gc
 import io
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import bittensor as bt
 from PIL import Image
@@ -154,6 +154,8 @@ def build_image_submissions(
     save_images_dir: Optional[str] = None,
     report: Optional[List[Dict[str, Any]]] = None,
     meta: Optional[Dict[str, Any]] = None,
+    deadline: Optional[float] = None,
+    retry_cutoff_fn: Optional[Callable[[], Optional[float]]] = None,
 ) -> List[S3Submission]:
     """Generate, validate, encrypt and upload every requested variation.
 
@@ -177,6 +179,11 @@ def build_image_submissions(
             which model was picked, the identity floor, whether encryption was
             used, and how many variations were requested vs submitted. The
             request archive stores this so a past round can be explained.
+        deadline: Wall-clock time (time.time()) by which generation must be
+            done for the response to reach the validator in time; None keeps
+            the fixed GENERATION_BUDGET_SECONDS (dry runs).
+        retry_cutoff_fn: Extra wall-clock cap on optional retries, re-read
+            before each one (the miner's queue of waiting requests).
 
     Returns:
         List of S3Submission objects, one per variation that made it through.
@@ -217,6 +224,8 @@ def build_image_submissions(
             image_request.variation_requests,
             identity_target=min_similarity,
             subject_gender=subject_gender_from_filename(image_request.image_filename),
+            deadline=deadline,
+            retry_cutoff_fn=retry_cutoff_fn,
         )
         generation_seconds = time.monotonic() - generation_started
 

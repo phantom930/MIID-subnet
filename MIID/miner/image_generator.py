@@ -8,12 +8,15 @@ import base64
 import hashlib
 import io
 import os
+import statistics
 import time
+from collections import deque
 import bittensor as bt
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 from PIL import Image
 
 from MIID.miner.generate_variations import (
+    SCREEN_REPLAY_TYPE,
     active_model_key,
     generate_one,
     get_selected_model_info,
@@ -36,14 +39,15 @@ IDENTITY_TARGET = float(os.environ.get("MIID_IDENTITY_TARGET", "0.6"))
 
 # Extra attempts per variation when the first one misses IDENTITY_TARGET.
 # Two, because ~14% of archived slots still landed under 0.6 after one retry,
-# and such a slot scores 0 whenever it is the one the validator samples. The
-# time-budget guard below stops retrying before the dendrite timeout.
+# and such a slot scores 0 whenever it is the one the validator samples.
+# Whether they run is a question of time: see generate_variations.
 IDENTITY_RETRIES = int(os.environ.get("MIID_IDENTITY_RETRIES", "2"))
 
-# Wall-clock budget for one request's generation, retries included. The
-# validator's dendrite timeout is --neuron.timeout (default 1200s) and the
-# response still has to be encrypted and uploaded inside it, so retries stop
-# well before that: a late response scores nothing at all.
+# Upper bound on one request's generation, retries included, counted from the
+# start of generation. The binding limit is usually the request's own
+# deadline (validator send time + its 1200 s timeout, minus upload and voice),
+# which the miner passes in: time spent queued behind other validators counts
+# against it, and a late response scores nothing at all.
 GENERATION_BUDGET_SECONDS = float(
     os.environ.get("MIID_GENERATION_BUDGET_SECONDS", "900")
 )
@@ -171,6 +175,135 @@ def _pose_miss(level: Optional[str], yaw: Optional[float]) -> Tuple[float, Optio
     return 0.0, None
 
 
+# Retry priority, part 1: the chance that one more attempt lifts a slot over
+# the identity target, by its best identity so far and by which attempt it
+# would be. Measured on 324 slots that retried in the miner log, 2026-10-06
+# 20:03 to 10-08 (up to three attempts per slot): a near miss converts far more
+# often than a distant one, and a third attempt less often than a second.
+# Rows: (lowest best identity, odds on attempt 2, odds on attempt 3).
+_IDENTITY_RETRY_ODDS = (
+    (0.55, 0.60, 0.45),
+    (0.50, 0.34, 0.30),
+    (0.00, 0.33, 0.22),
+)
+# Retry priority, part 2: what a successful retry is worth relative to an
+# identity rescue. A head turn outside its range costs at most a partial
+# match, and the grader has been lenient on angle; the screen_replay slot is
+# ignored by the grading API (validator image_variations.py) and has never
+# missed the identity target anyway.
+POSE_RETRY_ODDS = 0.5
+POSE_RETRY_WEIGHT = 0.3
+SCREEN_REPLAY_RETRY_WEIGHT = 0.25
+
+# Seconds one generate + score cycle takes, until this process has measured
+# its own (median of recent non-first attempts; FLUX.2 Klein on the 16 GB card
+# runs ~37 s). The miner also uses it to estimate a queued request's workload.
+DEFAULT_CYCLE_SECONDS = 40.0
+_recent_cycles: Deque[float] = deque(maxlen=30)
+
+
+def cycle_estimate() -> float:
+    """Expected seconds for one more attempt, from recent measurements."""
+    if not _recent_cycles:
+        return DEFAULT_CYCLE_SECONDS
+    return float(statistics.median(_recent_cycles))
+
+
+def _req_type(req: Any) -> Optional[str]:
+    return getattr(req, "type", None) or (
+        req.get("type") if isinstance(req, dict) else None
+    )
+
+
+def _is_screen_replay(req: Any) -> bool:
+    return _req_type(req) == SCREEN_REPLAY_TYPE
+
+
+class _Slot:
+    """One requested variation and the best attempt at it so far."""
+
+    def __init__(self, index: int, req: Any):
+        self.index = index
+        self.req = req
+        self.pose_level = requested_pose_level(req)
+        self.screen_replay = _is_screen_replay(req)
+        self.best: Optional[Dict] = None
+        self.best_key: Optional[Tuple] = None
+        self.generated = 0
+        self.identity_misses = 0
+        self.identity_ok = False
+        self.pose_miss = 0.0
+        self.pose_direction: Optional[str] = None
+
+    @property
+    def satisfied(self) -> bool:
+        return self.best is not None and self.identity_ok and self.pose_miss == 0.0
+
+    def record(self, result: Dict, target: float) -> None:
+        """Score one attempt and keep it if it is the best so far.
+
+        Rank: clearing the identity target first (under it the grade is capped
+        whatever the edit), then the head turn's distance from its range, then
+        similarity. A variation AdaFace cannot read a face in (None) is the
+        worst outcome there is — the grading API scores it 0 for identity — so
+        it ranks below every scored one.
+        """
+        similarity = result["identity_similarity"]
+        identity_ok = similarity is not None and similarity >= target
+        miss, direction = _pose_miss(self.pose_level, result.get("pose_yaw"))
+        if not identity_ok:
+            self.identity_misses += 1
+        key = (
+            identity_ok,
+            -miss if identity_ok else 0.0,
+            -1.0 if similarity is None else similarity,
+        )
+        if self.best is None or key > self.best_key:
+            self.best, self.best_key = result, key
+            self.identity_ok, self.pose_miss, self.pose_direction = (
+                identity_ok, miss, direction,
+            )
+
+    def retry_priority(self, attempts_allowed: int) -> Optional[float]:
+        """Expected value of one more attempt, or None if it needs none."""
+        if self.best is None or self.satisfied or self.generated >= attempts_allowed:
+            return None
+        if self.identity_ok:
+            value = POSE_RETRY_ODDS * POSE_RETRY_WEIGHT
+        else:
+            similarity = self.best["identity_similarity"]
+            column = 1 if self.generated < 2 else 2
+            value = next(
+                row[column] for row in _IDENTITY_RETRY_ODDS
+                if (similarity or 0.0) >= row[0]
+            )
+        if self.screen_replay:
+            value *= SCREEN_REPLAY_RETRY_WEIGHT
+        return value
+
+    def next_settings(self) -> Tuple[float, Optional[str]]:
+        """(identity_bias, pose_hint) for the next attempt.
+
+        An identity miss holds the edit back, more with each miss; a head turn
+        outside its range re-rolls at full strength with a nudge in the right
+        direction (the face held; the turn did not).
+        """
+        if self.identity_ok:
+            return 0.0, self.pose_direction
+        return min(0.8, 0.4 * self.identity_misses), None
+
+    def reason(self, target: float) -> str:
+        if self.identity_ok:
+            low, high = POSE_RANGE_DEG[self.pose_level]
+            return (
+                f"head turn {self.best['pose_yaw']:.0f}° outside the "
+                f"{self.pose_level} range {low:.0f}–{high:.0f}°"
+            )
+        similarity = self.best["identity_similarity"]
+        shown = "no face detected" if similarity is None else f"{similarity:.3f}"
+        return f"identity {shown} < {target}"
+
+
 def generate_variations(
     base_image: Image.Image,
     variation_requests: List,
@@ -178,6 +311,8 @@ def generate_variations(
     max_retries: Optional[int] = None,
     time_budget: Optional[float] = None,
     subject_gender: Optional[str] = None,
+    deadline: Optional[float] = None,
+    retry_cutoff_fn: Optional[Callable[[], Optional[float]]] = None,
 ) -> List[Dict]:
     """Generate image variations from a base image (see generate_variations.py).
 
@@ -186,16 +321,26 @@ def generate_variations(
     model gets the base image and a prompt built from the request's type,
     intensity, description and detail -> one variation image per request.
 
-    Each result is scored against the base face with AdaFace before it is
-    returned. A variation below ``identity_target`` is regenerated with the
-    edit held back (see ``generate_one(attempt=...)``) and the best-scoring
-    attempt is kept. This is where retrying is cheap: the pipeline is already
-    loaded and the base embedding is already computed, so one retry costs one
-    denoising pass.
+    Two phases. First every slot gets one attempt (screen_replay last), each
+    scored against the base face with AdaFace and, for pose slots, a head-turn
+    estimate. Then whatever time is left goes to retries, one at a time, always
+    on the slot where one more attempt is most likely to pay: a near identity
+    miss before a distant one, any identity miss before a head turn out of
+    range (see _Slot.retry_priority). An identity retry holds the edit back; a
+    head-turn retry re-rolls at full strength. The best attempt per slot wins.
 
-    Retries stop early once ``time_budget`` seconds have gone, because a
-    response that misses the validator's dendrite timeout scores zero for every
-    slot, not just the one being retried.
+    Time limits, all wall-clock (time.time()):
+
+    - ``deadline``: when generation must be finished for the response to
+      reach the validator inside its timeout (the caller has already taken
+      encryption, upload and voice off it). A late response scores zero for
+      every slot, so near it even first attempts are skipped: fewer slots on
+      time beat all slots late.
+    - ``time_budget`` (default GENERATION_BUDGET_SECONDS) from the start of
+      this call caps retries in any case.
+    - ``retry_cutoff_fn()``: a further, changing cap on retries only — the
+      miner returns the latest finish that still lets every queued request
+      meet its own deadline (gpu_scheduler.queue_cutoff).
 
     Args:
         base_image: PIL Image of the base face (decoded from image_request.base_image).
@@ -209,6 +354,8 @@ def generate_variations(
             GENERATION_BUDGET_SECONDS.
         subject_gender: "m" / "f" from the base filename, or None. Picks a
             gender-appropriate religious head covering (see generate_one).
+        deadline: Wall-clock time generation must end by, or None.
+        retry_cutoff_fn: Returns an extra wall-clock cap on retries, or None.
 
     Returns:
         List of dicts, each containing:
@@ -222,6 +369,7 @@ def generate_variations(
               base face, None when no face could be read
             - attempts: int - how many generations this slot took
             - winning_attempt: int - which of them is the one returned
+        A slot skipped because the deadline left no time for it is absent.
     """
     if not variation_requests:
         return []
@@ -229,110 +377,112 @@ def generate_variations(
     target = IDENTITY_TARGET if identity_target is None else identity_target
     retries = IDENTITY_RETRIES if max_retries is None else max_retries
     budget = GENERATION_BUDGET_SECONDS if time_budget is None else time_budget
-    started = time.monotonic()
+    started = time.time()
+    budget_end = started + budget
 
     model_info = get_selected_model_info()
     bt.logging.info(
         f"Using model: {model_info['key']} ({model_info['model_id']}, "
         f"{model_info['params']})"
+        + (f"; generation must end in {deadline - started:.0f}s" if deadline else "")
     )
 
     base_embedding = _base_embedding(base_image)
     # No base embedding means no identity signal for any slot this round, so
     # retrying would only re-roll blind. A *variation* that scores None is a
-    # different matter — see below.
+    # different matter — see _Slot.record.
     attempts_allowed = (retries + 1) if base_embedding is not None else 1
-
-    # Worst observed cost of one generate+score cycle, used to decide whether a
-    # retry can still finish. Checking only elapsed time is not enough: on the
-    # 12B Kontext path a single cycle runs several minutes, so a retry started
-    # just under the budget lands well past it — and past the budget is where
-    # the validator's dendrite timeout is, which scores every slot zero.
-    slowest_cycle = 0.0
     base_yaw = _base_yaw(base_image)
 
-    variations = []
-    for req in variation_requests:
-        best = None
-        best_key = None
-        best_similarity = None
-        generated = 0
-        pose_level = requested_pose_level(req)
-        # Settings for the next attempt. An identity miss holds the edit back
-        # (more with each miss); a head turn outside its range re-rolls at
-        # full strength with a nudge in the right direction.
-        identity_misses = 0
-        identity_bias = 0.0
-        pose_hint = None
+    slots = [_Slot(i, req) for i, req in enumerate(variation_requests)]
+    first_attempt = [True]
 
-        for attempt in range(attempts_allowed):
-            cycle_started = time.monotonic()
-            result = generate_one(
-                base_image, req, model_key=model_info["key"], attempt=attempt,
-                subject_gender=subject_gender, identity_bias=identity_bias,
-                pose_hint=pose_hint,
+    def run_attempt(slot: _Slot, identity_bias: float, pose_hint: Optional[str]) -> None:
+        cycle_started = time.time()
+        result = generate_one(
+            base_image, slot.req, model_key=model_info["key"],
+            attempt=slot.generated, subject_gender=subject_gender,
+            identity_bias=identity_bias, pose_hint=pose_hint,
+        )
+        slot.generated += 1
+        result["identity_similarity"] = _similarity(base_embedding, result["image"])
+        result["pose_yaw"] = (
+            _yaw(base_yaw, result["image"]) if slot.pose_level else None
+        )
+        result["winning_attempt"] = slot.generated
+        # The request's first cycle carries warm-up (pipeline load, offload
+        # hooks) and would overstate every later one.
+        if not first_attempt[0]:
+            _recent_cycles.append(time.time() - cycle_started)
+        first_attempt[0] = False
+        slot.record(result, target)
+
+    # ── phase 1: one attempt per slot ──
+    skipped = []
+    for slot in sorted(slots, key=lambda s: (s.screen_replay, s.index)):
+        if deadline is not None and time.time() + cycle_estimate() > deadline:
+            skipped.append(slot)
+            continue
+        run_attempt(slot, 0.0, None)
+    first_pass_seconds = time.time() - started
+    if skipped:
+        bt.logging.warning(
+            f"Deadline: no time for {len(skipped)} slot(s) "
+            f"({', '.join(str(_req_type(s.req)) for s in skipped)}) "
+            "— submitting the rest on time instead of everything late."
+        )
+
+    # ── phase 2: retries, most valuable first, while time allows ──
+    retries_run = 0
+    stop_reason = "every slot met its targets"
+    while True:
+        candidates = [
+            (priority, slot) for slot in slots
+            if (priority := slot.retry_priority(attempts_allowed)) is not None
+        ]
+        if not candidates:
+            if any(not s.satisfied for s in slots if s.best is not None):
+                stop_reason = "attempts used up"
+            break
+        cutoffs = [budget_end] + ([deadline] if deadline is not None else [])
+        queue_cap = retry_cutoff_fn() if retry_cutoff_fn else None
+        if queue_cap is not None:
+            cutoffs.append(queue_cap)
+        cutoff = min(cutoffs)
+        if time.time() + cycle_estimate() > cutoff:
+            stop_reason = (
+                "a queued request's turn" if queue_cap is not None and cutoff == queue_cap
+                else "the deadline" if deadline is not None and cutoff == deadline
+                else "the time budget"
             )
-            generated += 1
-            similarity = _similarity(base_embedding, result["image"])
-            yaw = _yaw(base_yaw, result["image"]) if pose_level else None
-            slowest_cycle = max(slowest_cycle, time.monotonic() - cycle_started)
-            result["identity_similarity"] = similarity
-            result["pose_yaw"] = yaw
-            result["winning_attempt"] = attempt + 1
-
-            # Rank: clearing the identity target first (under it the grade is
-            # capped whatever the edit), then the head turn's distance from
-            # its range, then similarity. A variation AdaFace cannot read a
-            # face in (None) is the worst outcome there is — the grading API
-            # scores it 0 for identity — so it ranks below every scored one.
-            identity_ok = similarity is not None and similarity >= target
-            miss, direction = _pose_miss(pose_level, yaw)
-            key = (
-                identity_ok,
-                -miss if identity_ok else 0.0,
-                -1.0 if similarity is None else similarity,
-            )
-            if best is None or key > best_key:
-                best, best_key, best_similarity = result, key, similarity
-
-            if identity_ok and miss == 0.0:
-                break
-            if attempt >= attempts_allowed - 1:
-                break
-
-            shown = "no face detected" if similarity is None else f"{similarity:.3f}"
-            if identity_ok:
-                reason = (
-                    f"head turn {yaw:.0f}° outside the {pose_level} range "
-                    f"{POSE_RANGE_DEG[pose_level][0]:.0f}–"
-                    f"{POSE_RANGE_DEG[pose_level][1]:.0f}°"
-                )
-                plan = f"retrying at full strength, turn {direction}."
-                identity_bias, pose_hint = 0.0, direction
-            else:
-                reason = f"identity {shown} < {target}"
-                plan = "retrying with the edit held back."
-                identity_misses += 1
-                identity_bias, pose_hint = min(0.8, 0.4 * identity_misses), None
-            elapsed = time.monotonic() - started
-            # Remaining slots must still get their first attempt, which is
-            # never skipped — a missing slot scores zero. Reserve their time
-            # before spending any of it on a retry.
-            slots_left = len(variation_requests) - len(variations) - 1
-            reserved = slots_left * slowest_cycle
-            if elapsed + slowest_cycle + reserved > budget:
+            for _, slot in candidates:
                 bt.logging.warning(
-                    f"{result['variation_type']}: {reason}, "
-                    f"but a retry needs ~{slowest_cycle:.0f}s and only "
-                    f"{max(0.0, budget - elapsed - reserved):.0f}s of the "
-                    f"{budget:.0f}s budget is free — keeping the best attempt."
+                    f"{slot.best['variation_type']}: {slot.reason(target)}, but a "
+                    f"retry needs ~{cycle_estimate():.0f}s and only "
+                    f"{max(0.0, cutoff - time.time()):.0f}s remain before "
+                    f"{stop_reason} — keeping the best attempt."
                 )
-                break
-            bt.logging.info(f"{result['variation_type']}: {reason} — {plan}")
+            break
+        _, slot = max(candidates, key=lambda c: (c[0], -c[1].index))
+        identity_bias, pose_hint = slot.next_settings()
+        plan = (
+            f"retrying at full strength, turn {pose_hint}." if slot.identity_ok
+            else "retrying with the edit held back."
+        )
+        bt.logging.info(f"{slot.best['variation_type']}: {slot.reason(target)} — {plan}")
+        run_attempt(slot, identity_bias, pose_hint)
+        retries_run += 1
 
+    # ── assemble, in request order ──
+    variations = []
+    for slot in slots:
+        best = slot.best
+        if best is None:
+            continue
         var_type = best["variation_type"]
         image_bytes = encode_image_to_bytes(best["image"])
         image_hash = calculate_image_hash(image_bytes)
+        best_similarity = best["identity_similarity"]
 
         variations.append({
             "image": best["image"],
@@ -342,7 +492,7 @@ def generate_variations(
             "model_key": best.get("model_key") or active_model_key() or model_info["key"],
             "model_id": best.get("model_id") or model_info["model_id"],
             "identity_similarity": best_similarity,
-            "attempts": generated,
+            "attempts": slot.generated,
             "winning_attempt": best["winning_attempt"],
         })
 
@@ -351,16 +501,17 @@ def generate_variations(
             f"(identity="
             f"{'n/a' if best_similarity is None else f'{best_similarity:.3f}'}"
             + (
-                f", head turn {best['pose_yaw']:.0f}° for {pose_level}"
+                f", head turn {best['pose_yaw']:.0f}° for {slot.pose_level}"
                 if best.get("pose_yaw") is not None else ""
             )
-            + f", kept attempt {best['winning_attempt']} of {generated})"
+            + f", kept attempt {best['winning_attempt']} of {slot.generated})"
             f", hash: {image_hash[:16]}..."
         )
 
     bt.logging.info(
-        f"Generated {len(variations)} variations in "
-        f"{time.monotonic() - started:.0f}s"
+        f"Generated {len(variations)} variations in {time.time() - started:.0f}s "
+        f"(first pass {first_pass_seconds:.0f}s, {retries_run} retries, "
+        f"stopped: {stop_reason}; ~{cycle_estimate():.0f}s per attempt)"
     )
     return variations
 

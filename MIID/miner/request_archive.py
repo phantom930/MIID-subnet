@@ -229,6 +229,7 @@ def record_outcome(
     meta: Optional[Dict[str, Any]] = None,
     error: Optional[str] = None,
     screen_replay: Optional[Dict[str, Any]] = None,
+    voice: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Close a record. Safe to call on a partially-filled one."""
     if not isinstance(record, dict):
@@ -252,6 +253,8 @@ def record_outcome(
         record["submission_count"] = len(serialized)
     if screen_replay is not None:
         record["screen_replay"] = screen_replay
+    if voice is not None:
+        record["voice"] = voice
     return record
 
 

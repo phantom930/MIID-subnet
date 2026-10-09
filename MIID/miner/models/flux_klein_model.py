@@ -25,7 +25,11 @@ MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
 # reason), so it converges in single-digit steps. Measured on this pipeline at
 # 1015x1350: ~6.5s/step, and 20 steps produced no visible quality or identity
 # gain over 8 — just 78s more per variation, ~6 min per 5-slot request.
-DEFAULT_STEPS = int(os.environ.get("MIID_INFERENCE_STEPS", "8"))
+# Six, from a 2026-10-08 replay of 8 archived requests (43 slots, first
+# attempts only, RTX 4060 Ti): 31.1 s per attempt vs 35.3 s at 8 steps, mean
+# AdaFace identity 0.672 vs 0.644, 11 vs 14 slots under 0.6, benchmark mean
+# 2.95 vs 2.91, and no visible loss of detail or edit strength.
+DEFAULT_STEPS = int(os.environ.get("MIID_INFERENCE_STEPS", "6"))
 DEFAULT_GUIDANCE = float(os.environ.get("MIID_GUIDANCE_SCALE", "3.5"))
 INTENSITY_GUIDANCE_MULT = {"light": 0.92, "medium": 1.0, "far": 1.12}
 

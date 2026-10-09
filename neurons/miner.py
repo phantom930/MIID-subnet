@@ -39,6 +39,7 @@ The miner pipeline:
 # Uncomment related blocks below and protocol fields to restore.
 """
 
+import asyncio
 import hashlib
 import json
 import time
@@ -72,6 +73,9 @@ from MIID.miner.request_archive import (
     save_request_media,
     write_record,
 )
+
+# One GPU shared by every validator's request: earliest deadline first.
+from MIID.miner.gpu_scheduler import SCHEDULER, queue_cutoff
 
 # # --- PAUSED: real screen-replay paths (restore later) ---
 # # screen_replay.json lives under MIID/miner/real_image_miner_guide/. Miners fill
@@ -144,9 +148,21 @@ try:
         is_valid_image_bytes as _is_valid_image_bytes,
         is_valid_video_bytes as _is_valid_video_bytes,
     )
+    from MIID.miner.image_generator import cycle_estimate
     PHASE4_AVAILABLE = True
 except ImportError as _phase4_err:
     PHASE4_AVAILABLE = False
+
+    def cycle_estimate() -> float:
+        return 40.0
+
+# Time a response needs after generation ends, taken off the validator's
+# deadline before generation is given its share: encrypt + S3 upload per image
+# (~3 s, plus room for upload retries), the voice clone when one is requested
+# (~44 s measured), and a margin for clock skew and the response itself.
+UPLOAD_SECONDS_PER_SLOT = 4.0
+VOICE_RESERVE_SECONDS = 60.0
+DEADLINE_MARGIN_SECONDS = float(os.environ.get("MIID_DEADLINE_MARGIN_SECONDS", "30"))
 
 # Voice challenge (same encrypt/upload stack as Phase 4)
 try:
@@ -154,13 +170,23 @@ try:
         decode_base_voice,
         generate_voice_clone,
         hash_voice_bytes,
+        release_worker as release_voice_worker,
+        voice_env_available,
     )
-    from MIID.miner.speech_brain_compare import validate_voice_identity
+    from MIID.miner import voice_generator as _voice_generator
+    from MIID.miner.speech_brain_compare import (
+        DEFAULT_MIN_SIMILARITY as VOICE_MIN_SIMILARITY,
+        validate_voice_identity,
+    )
     from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
     from MIID.miner.s3_upload import upload_to_s3
     VOICE_AVAILABLE = True
 except ImportError as _voice_err:
     VOICE_AVAILABLE = False
+
+
+def _utc_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class Miner(BaseMinerNeuron):
@@ -217,7 +243,7 @@ class Miner(BaseMinerNeuron):
 
             forced_model = os.environ.get("MIID_MODEL", "").strip() or "(unset -> random base model)"
             random_flag = os.environ.get("MIID_MODEL_RANDOM", "1").strip()
-            inference_steps = os.environ.get("MIID_INFERENCE_STEPS", "20").strip()
+            inference_steps = os.environ.get("MIID_INFERENCE_STEPS", "6").strip()
             guidance_scale = os.environ.get("MIID_GUIDANCE_SCALE", "3.5").strip()
             flux_device = os.environ.get("FLUX_DEVICE", "(auto)").strip()
             enable_offload = os.environ.get("MIID_ENABLE_CPU_OFFLOAD", "(default)").strip()
@@ -248,10 +274,15 @@ class Miner(BaseMinerNeuron):
                     "Missing Hugging Face token. Set HF_TOKEN or HUGGINGFACE_TOKEN in your "
                     'environment, e.g. export HF_TOKEN="hf_..."'
                 )
-        if VOICE_AVAILABLE:
+        if VOICE_AVAILABLE and voice_env_available():
             bt.logging.info(
-                "Voice challenge: enabled — implement generate_voice_clone "
-                "in MIID/miner/voice_generator.py"
+                f"Voice challenge: enabled (worker env {_voice_generator.VOICE_ENV}, "
+                f"identity floor {VOICE_MIN_SIMILARITY})"
+            )
+        elif VOICE_AVAILABLE:
+            bt.logging.warning(
+                "Voice challenge: voice_env not set up — will return no voice "
+                "submissions. Run scripts/miner/setup_voice.sh to enable it."
             )
         else:
             bt.logging.info(
@@ -309,18 +340,103 @@ class Miner(BaseMinerNeuron):
         Generates face image variations and/or a voice-cloned WAV, encrypts
         with drand timelock, uploads to S3, and returns S3 submission refs.
 
+        The work runs in a worker thread and takes its turn on the GPU through
+        gpu_scheduler.SCHEDULER (earliest deadline first). Running it inline,
+        as before, blocked the axon's event loop: the next validator's request
+        was not even read until this one finished, while its timeout ran.
+
         Args:
             synapse: IdentitySynapse containing image_request and/or voice_request
 
         Returns:
             The synapse with s3_submissions and/or voice_s3_submissions populated
         """
+        received = time.time()
+        deadline, sent_at = self._request_deadline(synapse, received)
+        workload = self._workload_estimate(synapse)
+        return await asyncio.to_thread(
+            self._forward_on_gpu, synapse, received, sent_at, deadline, workload,
+        )
+
+    def _request_deadline(
+        self, synapse: IdentitySynapse, now: float,
+    ) -> Tuple[float, Optional[float]]:
+        """(deadline, sent_at) for a request, both wall-clock seconds.
+
+        The validator stamps its send time into the nonce (time.time_ns()) and
+        stops waiting synapse.timeout seconds later. Its clock and ours agreed
+        within ~2 s over a week of logs; a nonce that is missing, from the
+        future or older than two timeouts falls back to "now + timeout".
+        """
+        timeout = float(getattr(synapse, "timeout", None) or 120.0)
+        nonce = getattr(getattr(synapse, "dendrite", None), "nonce", None)
+        try:
+            sent_at = int(nonce) / 1e9
+        except (TypeError, ValueError):
+            sent_at = None
+        if sent_at is None or sent_at > now + 5.0 or sent_at < now - 2 * timeout:
+            return now + timeout, None
+        return sent_at + timeout, sent_at
+
+    def _post_generation_reserve(self, synapse: IdentitySynapse) -> float:
+        """Seconds the response needs after image generation ends."""
+        slots = len(getattr(synapse.image_request, "variation_requests", None) or []) \
+            if synapse.image_request is not None else 0
+        voice = VOICE_RESERVE_SECONDS if synapse.voice_request is not None else 0.0
+        return slots * UPLOAD_SECONDS_PER_SLOT + voice + DEADLINE_MARGIN_SECONDS
+
+    def _workload_estimate(self, synapse: IdentitySynapse) -> float:
+        """Minimum GPU time this request needs: one attempt per slot, plus upload/voice."""
+        slots = len(getattr(synapse.image_request, "variation_requests", None) or []) \
+            if synapse.image_request is not None else 0
+        return slots * cycle_estimate() + self._post_generation_reserve(synapse)
+
+    def _forward_on_gpu(
+        self,
+        synapse: IdentitySynapse,
+        received: float,
+        sent_at: Optional[float],
+        deadline: float,
+        workload: float,
+    ) -> IdentitySynapse:
+        """Wait for the GPU (earliest deadline first), then run the request."""
+        with SCHEDULER.acquire(deadline, workload) as gpu_wait:
+            started = time.time()
+            timing = {
+                "sent_at_utc": _utc_iso(sent_at) if sent_at else None,
+                "received_at_utc": _utc_iso(received),
+                "queue_wait_seconds": round(started - (sent_at or received), 1),
+                "gpu_wait_seconds": round(gpu_wait, 1),
+                "deadline_utc": _utc_iso(deadline),
+            }
+            bt.logging.info(
+                f"Request sent {started - (sent_at or received):.0f}s ago "
+                f"(waited {gpu_wait:.0f}s for the GPU); "
+                f"{deadline - started:.0f}s left before the validator's timeout."
+            )
+            return self._forward_body(synapse, deadline, timing)
+
+    def _forward_body(
+        self, synapse: IdentitySynapse, deadline: float, timing: dict,
+    ) -> IdentitySynapse:
+        """The request itself, run while holding the GPU (see forward)."""
         run_id = int(time.time())
         timeout = getattr(synapse, 'timeout', 120.0)
         start_time = time.time()
         bt.logging.info(f"Starting run {run_id}, timeout={timeout:.1f}s")
 
         record = self._new_archive_record(synapse)
+        if record is not None:
+            record["timing"] = timing
+
+        reserve = self._post_generation_reserve(synapse)
+        image_deadline = deadline - reserve
+
+        def retry_cutoff() -> Optional[float]:
+            # Hand the GPU over in time for every queued request to make its
+            # own deadline; our upload/voice still has to fit before that.
+            cutoff = queue_cutoff(SCHEDULER.waiting())
+            return None if cutoff is None else cutoff - reserve
 
         synapse.s3_submissions = []
         synapse.voice_s3_submissions = []
@@ -340,6 +456,7 @@ class Miner(BaseMinerNeuron):
         meta: dict = {}
         pipeline_error = None
         outcome = None
+        voice_summary = None
 
         # --- Image path (unchanged when image_request present) ---
         if synapse.image_request is not None:
@@ -379,6 +496,8 @@ class Miner(BaseMinerNeuron):
                         report=report,
                         meta=meta,
                         save_images_dir=self._archive_media_dir(record, req),
+                        deadline=image_deadline,
+                        retry_cutoff_fn=retry_cutoff,
                     )
                     bt.logging.info(f"Phase 4: Generated {len(s3_submissions)} S3 submissions")
                 except Exception as e:
@@ -404,27 +523,55 @@ class Miner(BaseMinerNeuron):
                 f"lang={synapse.voice_request.language}, "
                 f"text={synapse.voice_request.target_text!r}"
             )
+            voice_summary = {
+                "voice_filename": synapse.voice_request.voice_filename,
+                "language": synapse.voice_request.language,
+                "target_text": synapse.voice_request.target_text,
+                "challenge_id": synapse.voice_request.challenge_id,
+            }
             if not VOICE_AVAILABLE:
                 bt.logging.info(
                     "Voice: helper modules unavailable — returning no voice submission."
                 )
+                voice_summary["outcome"] = "voice_unavailable"
+            elif time.time() + VOICE_RESERVE_SECONDS > deadline - DEADLINE_MARGIN_SECONDS:
+                # The images are already uploaded; a voice clone now would make
+                # the whole response late, and a late response scores nothing.
+                bt.logging.warning(
+                    f"Voice: skipped, only {deadline - time.time():.0f}s left "
+                    "before the validator's timeout."
+                )
+                voice_summary["outcome"] = "skipped_deadline"
             else:
+                voice_started = time.time()
                 try:
                     voice_subs = self.process_voice_request(synapse)
                     if voice_subs:
                         bt.logging.info(f"Voice: Generated {len(voice_subs)} S3 submissions")
                     else:
-                        bt.logging.info(
-                            "Voice: no submission. "
-                            "Implement MIID/miner/voice_generator.generate_voice_clone."
-                        )
+                        bt.logging.info("Voice: no submission this round.")
                     synapse.voice_s3_submissions = voice_subs
+                    voice_summary["outcome"] = "submitted" if voice_subs else "empty"
                 except Exception as e:
                     bt.logging.error(f"Voice: Failed to process voice request: {e}")
                     synapse.voice_s3_submissions = []
+                    voice_summary["outcome"] = "error"
+                    voice_summary["error"] = f"{type(e).__name__}: {e}"
+                finally:
+                    # Frees the worker's VRAM for the next round's FLUX run
+                    # unless MIID_VOICE_KEEP_LOADED is set.
+                    release_voice_worker()
+                voice_summary["similarity"] = _voice_generator.last_similarity
+                voice_summary["seconds"] = round(time.time() - voice_started, 2)
+                voice_summary["submissions"] = [
+                    s.s3_key for s in synapse.voice_s3_submissions or []
+                ]
 
         total_time = time.time() - start_time
-        bt.logging.info(f"Request completed in {total_time:.2f}s of {timeout:.1f}s allowed.")
+        bt.logging.info(
+            f"Request completed in {total_time:.2f}s of {timeout:.1f}s allowed "
+            f"({deadline - time.time():.0f}s before the validator's timeout)."
+        )
 
         if outcome is None:
             outcome = ("error" if pipeline_error else
@@ -437,6 +584,7 @@ class Miner(BaseMinerNeuron):
             meta=meta,
             error=pipeline_error,
             screen_replay=self._describe_screen_replay(None),
+            voice=voice_summary,
         )
 
         return synapse
@@ -599,6 +747,8 @@ class Miner(BaseMinerNeuron):
         report: Optional[List[dict]] = None,
         meta: Optional[dict] = None,
         save_images_dir: Optional[str] = None,
+        deadline: Optional[float] = None,
+        retry_cutoff_fn=None,
     ) -> List[S3Submission]:
         """
         Process an image variation request end-to-end.
@@ -618,6 +768,8 @@ class Miner(BaseMinerNeuron):
             meta: Optional dict collecting the run's model choice and counts.
             save_images_dir: Optional directory for the unencrypted variations
                 (set only when MIID_ARCHIVE_IMAGES is on).
+            deadline: Wall-clock time image generation must end by.
+            retry_cutoff_fn: Extra cap on retries from the request queue.
 
         Returns:
             List of S3Submission objects
@@ -628,6 +780,8 @@ class Miner(BaseMinerNeuron):
             report=report,
             meta=meta,
             save_images_dir=save_images_dir,
+            deadline=deadline,
+            retry_cutoff_fn=retry_cutoff_fn,
         )
 
     def process_voice_request(self, synapse: IdentitySynapse) -> List[S3Submission]:
@@ -667,7 +821,9 @@ class Miner(BaseMinerNeuron):
                 )
                 return []
 
-            if not validate_voice_identity(base_wav, generated_wav, min_similarity=0.4):
+            if not validate_voice_identity(
+                base_wav, generated_wav, min_similarity=VOICE_MIN_SIMILARITY,
+            ):
                 bt.logging.warning("Voice: Skipping — speaker identity not preserved")
                 return []
 

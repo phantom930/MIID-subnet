@@ -481,8 +481,27 @@ Environment variables:
 |----------|-------------|---------|
 | `HF_TOKEN` or `HUGGINGFACE_TOKEN` | Your Hugging Face API token | none |
 | `FLUX_DEVICE` | Device for image generation (`cuda`, `mps`, or `cpu`) | `cpu` |
-| `MIID_MODEL` | Force `flux_klein`, `flux_kontext`, `pulid`, `pulid_flux2`, or `qwen` | random |
+| `MIID_MODEL` | Force `flux_klein`, `flux_kontext`, `pulid`, `pulid_flux2`, or `qwen` | `flux_klein` (the only model in the random pool) |
 | `MIID_INFERENCE_STEPS`, `MIID_GUIDANCE_SCALE` | Tune generation (see `MIID/miner/generate_variations.py`) | see code |
+| `MIID_IDENTITY_RETRIES` | Extra attempts per slot that misses the 0.6 identity target or its head-turn range | 2 |
+| `MIID_GENERATION_BUDGET_SECONDS` | Upper bound on one request's generation; the request's own deadline usually binds first (see below) | 900 |
+| `MIID_DEADLINE_MARGIN_SECONDS` | Safety margin kept before the validator's timeout | 30 |
+
+**Request timing.** Requests from different validators queue for the one GPU and are served
+earliest-deadline-first (`MIID/miner/gpu_scheduler.py`); `forward` runs the work in a worker thread
+so queued requests are still accepted. Each request's deadline is the validator's send time (its
+nonce) plus its 1200 s timeout, minus upload, voice and the margin above. Every slot gets one
+attempt first; the time left then goes to retries, near identity misses first, and stops early
+when a queued request needs the GPU to make its own deadline. A response that would arrive after
+the timeout scores nothing, so near the deadline slots are skipped rather than submitted late.
+
+To compare a change against what was actually submitted, replay archived requests (miner
+stopped, GPU free) and benchmark the result:
+
+```bash
+python -m MIID.miner.replay_requests --out /tmp/replay miner_requests/<date>/<record>...
+bash scripts/miner/benchmark.sh /tmp/replay/<date>/*
+```
 
 Example with custom configuration:
 ```bash
@@ -517,9 +536,12 @@ python neurons/miner.py --netuid 54 --wallet.name your_wallet_name --wallet.hotk
 Same round as images when the validator attaches a `voice_request`:
 
 1. Validator fetches a reference WAV from the MIID API and draws target speech text (English or Spanish), e.g. `target_text = "three orange six two nine apple table one"` (also sent as `target_words` list).
-2. Implement `MIID/miner/voice_generator.generate_voice_clone` to synthesize a WAV with the same speaker identity speaking `target_text`.
-3. The existing encrypt → S3 → `S3Submission(variation_type="voice")` path runs and fills `voice_s3_submissions`.
-4. Voice is collected for **UAV post-grading only** (no live KAV grade for voice).
+2. `MIID/miner/voice_generator.generate_voice_clone` synthesizes a WAV with the same speaker identity speaking `target_text`, using Chatterbox Multilingual (zero-shot cloning, English + Spanish). It runs in a worker process inside a separate `voice_env/`, because Chatterbox pins an older torch than the image stack. Set it up once with `bash scripts/miner/setup_voice.sh --warmup`. Without `voice_env` the miner simply returns no voice submission.
+3. The worker generates up to `MIID_VOICE_ATTEMPTS` (3) takes and keeps the one closest to the reference by SpeechBrain ECAPA similarity (`speechbrain/spkrec-ecapa-voxceleb`, the validator's identity model). It stops early at `MIID_VOICE_IDENTITY_TARGET` (0.7). A clip below **0.6**, the validator's identity threshold, is dropped.
+4. The existing encrypt → S3 → `S3Submission(variation_type="voice")` path runs and fills `voice_s3_submissions`.
+5. Voice is collected for **UAV post-grading only** (no live KAV grade for voice).
+
+The worker holds roughly 3–4 GB of VRAM while loaded and falls back to CPU if the GPU is full. By default it is shut down after each voice request, so the VRAM is free for the next round's image generation. Set `MIID_VOICE_KEEP_LOADED=1` to keep it warm, or `MIID_VOICE_DEVICE=cpu` to keep voice off the GPU entirely.
 
 **Variation types and intensities (Cycle 2):**
 

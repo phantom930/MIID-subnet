@@ -454,6 +454,68 @@ POSE_HINTS: Dict[str, str] = {
     ),
 }
 
+# The synthetic screen replay (6th slot, P5 C1). The validator names one
+# device and two visual cues (SCREEN_REPLAY_VISUAL_CUES in
+# MIID/validator/image_variations.py); each cue is recognised by a phrase from
+# its description and replaced by a concrete rendering. The passport framing
+# and the "jpeg artifacts / blurry / text" negatives are exactly what this
+# slot must show, so neither applies to it.
+SCREEN_REPLAY_TYPE = "screen_replay"
+SCREEN_REPLAY_CUES: Tuple[Tuple[str, str], ...] = (
+    ("moir", "fine moiré interference ripples and a faintly visible RGB "
+             "subpixel grid across the displayed image"),
+    ("glare", "one or two bright specular glare hotspots reflected on the "
+              "glossy screen surface, kept off the eyes"),
+    ("keystone", "the screen photographed slightly off-axis, so the display "
+                 "appears as a gently converging trapezoid (keystone "
+                 "perspective)"),
+    ("gamma", "the washed-out, slightly blue-tinted, high-contrast look of a "
+              "backlit display, with lifted blacks and clipped highlights"),
+    ("edge", "the device's dark bezel and the screen's edges visible along "
+             "the borders of the photo"),
+)
+_SCREEN_REPLAY_DEVICE = re.compile(r"\bon an? (.+?) screen\b", re.IGNORECASE)
+SCREEN_REPLAY_NEGATIVE_PROMPT = (
+    "different person, face swap, distorted or deformed face, asymmetric "
+    "eyes, cartoon, anime, illustration, painting, 3d render, tiny face, "
+    "face cut off, multiple people, blank screen"
+)
+
+
+def _screen_replay_prompt(
+    description: str, detail: str, identity_bias: float,
+) -> str:
+    """Prompt for the synthetic screen replay: a photo of the face on a screen.
+
+    The face stays the dominant object — the grader detects it and matches it
+    to the seed — while the named device and both requested cues are spelled
+    out concretely. Cues the table does not know are relayed verbatim.
+    """
+    match = _SCREEN_REPLAY_DEVICE.search(f"{description} {detail}")
+    device = match.group(1).strip() if match else "phone"
+
+    blob = detail.lower()
+    cues = [rendering for key, rendering in SCREEN_REPLAY_CUES if key in blob]
+    if len(cues) < 2:
+        cues.append(_strip_requirements(detail))
+
+    parts = [
+        f"A real camera photograph of a {device} screen that is displaying a "
+        "portrait photo of the reference person. The face on the screen is "
+        "large, centred and fills most of the photo, in focus and clearly "
+        "recognisable.",
+        "The photo clearly shows it was taken of a screen: "
+        + "; ".join(cues) + ".",
+        IDENTITY_CLAUSE,
+    ]
+    if identity_bias > 0:
+        parts.append(
+            "Keep the screen effects lighter over the face — it must stay "
+            "clearly recognizable as the reference person."
+        )
+    return " ".join(parts)
+
+
 # =============================================================================
 # Available models
 # =============================================================================
@@ -491,7 +553,12 @@ AVAILABLE_MODELS: Dict[str, Dict[str, Any]] = {
         "type": "pulid_flux2",
         "params": "4B",
         "license": "FLUX.1 dev non-commercial",
-        "base": True,
+        # Out of the random pool: no PuLID adapter is loaded, so this is the
+        # same FLUX.2 Klein weights as flux_klein with slower sequential
+        # offload (~41 s vs ~37 s per attempt), and a random switch between
+        # the two reloaded the pipeline (~13 s) for no difference in output.
+        # MIID_MODEL=pulid_flux2 still selects it.
+        "base": False,
         "notes": (
             "FLUX.2 Klein backbone compatible with Fayens PuLID-FLUX2 adapter "
             "weights (pulid_flux2_klein_v1/v2.safetensors). Strong identity "
@@ -904,6 +971,9 @@ def _get_prompt_from_request(
     description = _req_field(req, "description")
     detail = _req_field(req, "detail")
 
+    if var_type == SCREEN_REPLAY_TYPE:
+        return _screen_replay_prompt(description, detail, identity_bias)
+
     components = _split_components(var_type, _req_field(req, "intensity"))
     written = _edit_clause(components, identity_bias)
     if written is not None and pose_hint in POSE_HINTS:
@@ -956,6 +1026,7 @@ def _get_prompt_from_request(
 
 def _common_generate_kwargs(
     intensity: str, seed: Optional[int], identity_bias: float,
+    negative_prompt: str = NEGATIVE_PROMPT,
 ) -> Dict[str, Any]:
     """The arguments every backend's ``generate()`` takes the same way."""
     return {
@@ -966,7 +1037,7 @@ def _common_generate_kwargs(
         "height": TARGET_HEIGHT,
         "seed": seed,
         "identity_bias": identity_bias,
-        "negative_prompt": NEGATIVE_PROMPT,
+        "negative_prompt": negative_prompt,
     }
 
 
@@ -1083,11 +1154,17 @@ def generate_one(
         pose_hint=pose_hint,
     )
     seed = random.randint(0, 2**31 - 1)
+    negative_prompt = (
+        SCREEN_REPLAY_NEGATIVE_PROMPT if var_type == SCREEN_REPLAY_TYPE
+        else NEGATIVE_PROMPT
+    )
 
     try:
         gen_image = generator(
             pipe, base_image, prompt,
-            **_common_generate_kwargs(intensity, seed, identity_bias),
+            **_common_generate_kwargs(
+                intensity, seed, identity_bias, negative_prompt,
+            ),
         )
     except Exception as e:
         raise RuntimeError(
