@@ -19,6 +19,8 @@ pillow-heif>=0.13.0 # for HEIC image support
 # ships with bittensor>=9). No separate `timelock` package is required.
 
 # Voice cloning (Chatterbox Multilingual) and voice identity (SpeechBrain
-# ECAPA) are NOT installed here: Chatterbox pins torch 2.6, which would break
-# the image stack. They live in a separate voice_env/ — run
-# scripts/miner/setup_voice.sh. See MIID/miner/voice_generator.py.
+# ECAPA) run in the miner process but are NOT listed here: chatterbox-tts
+# pins torch 2.6 / transformers 5.2 / diffusers 0.29, which pip would apply
+# and break the image stack. Run scripts/miner/setup_voice.sh, which installs
+# it without those pins plus requirements-voice.txt into this same env.
+# See MIID/miner/voice_generator.py.

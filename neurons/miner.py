@@ -171,7 +171,7 @@ try:
         generate_voice_clone,
         hash_voice_bytes,
         release_worker as release_voice_worker,
-        voice_env_available,
+        voice_available,
     )
     from MIID.miner import voice_generator as _voice_generator
     from MIID.miner.speech_brain_compare import (
@@ -274,15 +274,19 @@ class Miner(BaseMinerNeuron):
                     "Missing Hugging Face token. Set HF_TOKEN or HUGGINGFACE_TOKEN in your "
                     'environment, e.g. export HF_TOKEN="hf_..."'
                 )
-        if VOICE_AVAILABLE and voice_env_available():
+        if VOICE_AVAILABLE and voice_available():
             bt.logging.info(
-                f"Voice challenge: enabled (worker env {_voice_generator.VOICE_ENV}, "
+                f"Voice challenge: enabled in-process ({_voice_generator.describe()}, "
                 f"identity floor {VOICE_MIN_SIMILARITY})"
             )
+            # Loads the weights into CPU memory in the background so the
+            # first voice request does not pay for it (MIID_VOICE_PRELOAD).
+            _voice_generator.preload_async()
         elif VOICE_AVAILABLE:
             bt.logging.warning(
-                "Voice challenge: voice_env not set up — will return no voice "
-                "submissions. Run scripts/miner/setup_voice.sh to enable it."
+                "Voice challenge: voice packages not installed — will return no "
+                "voice submissions. Run scripts/miner/setup_voice.sh (installs "
+                "into miner_env) to enable it."
             )
         else:
             bt.logging.info(
@@ -558,8 +562,9 @@ class Miner(BaseMinerNeuron):
                     voice_summary["outcome"] = "error"
                     voice_summary["error"] = f"{type(e).__name__}: {e}"
                 finally:
-                    # Frees the worker's VRAM for the next round's FLUX run
-                    # unless MIID_VOICE_KEEP_LOADED is set.
+                    # Parks the voice models in CPU memory so their VRAM is
+                    # free for the next round's FLUX run, unless
+                    # MIID_VOICE_KEEP_LOADED is set.
                     release_voice_worker()
                 voice_summary["similarity"] = _voice_generator.last_similarity
                 voice_summary["seconds"] = round(time.time() - voice_started, 2)

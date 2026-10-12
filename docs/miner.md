@@ -536,12 +536,18 @@ python neurons/miner.py --netuid 54 --wallet.name your_wallet_name --wallet.hotk
 Same round as images when the validator attaches a `voice_request`:
 
 1. Validator fetches a reference WAV from the MIID API and draws target speech text (English or Spanish), e.g. `target_text = "three orange six two nine apple table one"` (also sent as `target_words` list).
-2. `MIID/miner/voice_generator.generate_voice_clone` synthesizes a WAV with the same speaker identity speaking `target_text`, using Chatterbox Multilingual (zero-shot cloning, English + Spanish). It runs in a worker process inside a separate `voice_env/`, because Chatterbox pins an older torch than the image stack. Set it up once with `bash scripts/miner/setup_voice.sh --warmup`. Without `voice_env` the miner simply returns no voice submission.
-3. The worker generates up to `MIID_VOICE_ATTEMPTS` (3) takes and keeps the one closest to the reference by SpeechBrain ECAPA similarity (`speechbrain/spkrec-ecapa-voxceleb`, the validator's identity model). It stops early at `MIID_VOICE_IDENTITY_TARGET` (0.7). A clip below **0.6**, the validator's identity threshold, is dropped.
+2. `MIID/miner/voice_generator.generate_voice_clone` synthesizes a WAV with the same speaker identity speaking `target_text`, using Chatterbox Multilingual (zero-shot cloning, English + Spanish). It runs **inside the miner process**, on the same GPU as the image path. Install it into `miner_env` once with `bash scripts/miner/setup_voice.sh --warmup` (see the note on packages below). Without those packages the miner simply returns no voice submission.
+3. Up to `MIID_VOICE_ATTEMPTS` (3) takes are generated and the one closest to the reference by SpeechBrain ECAPA similarity (`speechbrain/spkrec-ecapa-voxceleb`, the validator's identity model) is kept. It stops early at `MIID_VOICE_IDENTITY_TARGET` (0.7). A clip below **0.6**, the validator's identity threshold, is dropped.
 4. The existing encrypt → S3 → `S3Submission(variation_type="voice")` path runs and fills `voice_s3_submissions`.
 5. Voice is collected for **UAV post-grading only** (no live KAV grade for voice).
 
-The worker holds roughly 3–4 GB of VRAM while loaded and falls back to CPU if the GPU is full. By default it is shut down after each voice request, so the VRAM is free for the next round's image generation. Set `MIID_VOICE_KEEP_LOADED=1` to keep it warm, or `MIID_VOICE_DEVICE=cpu` to keep voice off the GPU entirely.
+The models take roughly 3 GB of VRAM while a voice request is being served. Afterwards they are parked in CPU memory (about 3 GB of RAM) so the VRAM is free for the next round's image generation, and moved back in about a second when the next voice request arrives. At startup the miner loads them into CPU memory in the background (`MIID_VOICE_PRELOAD=0` to load on first use instead). Set `MIID_VOICE_KEEP_LOADED=1` to keep them on the GPU between rounds, or `MIID_VOICE_DEVICE=cpu` to keep voice off the GPU entirely (slower; a CUDA out-of-memory also falls back to the CPU on its own). Smoke-test the stack with:
+
+```bash
+python -m MIID.miner.voice_generator --reference some_voice.wav --text "three orange six two nine" --language en --out clone.wav
+```
+
+**About the packages.** `chatterbox-tts` publishes pins (`torch==2.6`, `transformers==5.2`, `diffusers==0.29`, `numpy<2`) that would downgrade and break the FLUX image stack, so `setup_voice.sh` installs it with `--no-deps` and takes its real runtime dependencies from `requirements-voice.txt`. The combination was verified on torch 2.14 / transformers 5.19 / diffusers 0.41. `pip check` will keep listing those pins as conflicts; that is expected.
 
 **Variation types and intensities (Cycle 2):**
 

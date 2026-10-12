@@ -1,0 +1,30 @@
+# Runtime packages for the in-process voice clone (P5 C1): Chatterbox
+# Multilingual + SpeechBrain ECAPA, installed into miner_env by
+# scripts/miner/setup_voice.sh next to the image stack.
+#
+# chatterbox-tts itself is installed by that script with --no-deps: its
+# published pins (torch==2.6, torchaudio==2.6, transformers==5.2,
+# diffusers==0.29, numpy<2, safetensors==0.5.3) would downgrade and break the
+# FLUX image path. The packages below are what it actually imports at runtime
+# for English/Spanish cloning, left free to resolve against the image stack.
+# Verified together on torch 2.14 / transformers 5.19 / diffusers 0.41.
+
+s3tokenizer
+conformer==0.3.2
+resemble-perth>=1.0.0   # audio watermarker; imports pkg_resources
+setuptools>=68,<81      # keeps pkg_resources available for resemble-perth
+einops
+omegaconf
+librosa>=0.11.0
+scipy
+tokenizers
+huggingface_hub
+safetensors
+pyloudnorm
+pykakasi
+torchaudio>=2.6
+soundfile>=0.12.0
+speechbrain>=1.0.0
+
+# Not needed for en/es: spacy-pkuseg (Chinese segmentation), dicta_onnx
+# (Hebrew), russian_text_stresser, gradio (the demo app).
