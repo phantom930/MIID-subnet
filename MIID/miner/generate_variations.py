@@ -366,21 +366,35 @@ EDIT_PHRASES: Dict[Tuple[str, str], str] = {
         "camera, but the face points to the side."
     ),
     # Generators brighten the face on their own; "a gentle shift in
-    # brightness" on top of that read as a medium change in most rounds.
+    # brightness" on top of that read as a medium change in most rounds, and
+    # "softer light" went further: Klein took it as licence to raise the
+    # exposure of the whole face — washed-out skin, highlights clipped to
+    # white. This pipeline has no negative prompt, so the exposure limit is
+    # stated positively and first, and the edit is expressed as colour
+    # temperature and shadow, never as brightness. The same guard sits on the
+    # medium and far bins: their contrast must come from the shadow side,
+    # not from pushing the lit side past white.
     ("lighting_edit", "light"): (
-        "Change the lighting only subtly: keep the overall exposure close to "
-        "the reference, with slightly softer or slightly warmer light and "
-        "faint, diffuse shadows."
+        "Keep the photograph at the same overall brightness as the reference: "
+        "skin at its natural tone with full detail, the forehead, nose and "
+        "cheeks never washed out or clipped to white, and the background no "
+        "brighter than before. Make the lighting change subtle and specific: "
+        "shift the light to a slightly warmer colour temperature and let "
+        "faint, diffuse shadows form under the chin and along one side of the "
+        "nose. The change must read as warmer light, not as a brighter image."
     ),
     ("lighting_edit", "medium"): (
         "Light the subject from one clear directional source on the {side}: "
-        "that half of the face is bright, the other half falls into a clearly "
-        "visible shadow down the cheek, nose and jaw."
+        "that half of the face is lit and correctly exposed, with skin detail "
+        "kept and no highlights clipped to white, while the other half falls "
+        "into a clearly visible shadow down the cheek, nose and jaw."
     ),
     ("lighting_edit", "far"): (
         "Light the subject with a single hard off-axis source: deep, "
         "high-contrast shadows across the face and a strong warm or cool "
-        "colour cast."
+        "colour cast. The contrast comes from the depth of the shadows, not "
+        "from overexposure — the lit side keeps its skin detail and is never "
+        "blown out to white."
     ),
     # "Faint, barely-there" landed on both sides of light: no change at all
     # on some rounds, a full smile on others. A named, closed-mouth smile is a
