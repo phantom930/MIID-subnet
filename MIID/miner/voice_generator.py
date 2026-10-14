@@ -38,7 +38,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import bittensor as bt
 
@@ -144,6 +144,37 @@ def describe() -> str:
     return f"Chatterbox Multilingual + SpeechBrain ECAPA, device={_requested_device()}"
 
 
+def _swap_module(module: Any, dev: str, parked: Dict[int, Dict[str, Any]]) -> None:
+    """Move ``module`` between the CPU and ``dev`` without allocating CPU memory.
+
+    ``module.to("cpu")`` allocates a fresh CPU tensor for every weight on
+    every call; after a day of voice rounds that churn had fragmented the
+    heap by gigabytes per process. The CPU tensors a module was loaded with
+    are kept in ``parked`` and re-attached on the way back, so a round trip
+    allocates only on the GPU.
+    """
+    tensors = list(module.named_parameters(remove_duplicate=False)) + list(
+        module.named_buffers(remove_duplicate=False)
+    )
+    if dev == "cpu":
+        kept = parked.get(id(module), {})
+        for name, tensor in tensors:
+            if tensor.device.type == "cpu":
+                continue
+            cpu = kept.get(name)
+            if cpu is not None and cpu.shape == tensor.shape and cpu.dtype == tensor.dtype:
+                tensor.data = cpu
+            else:
+                tensor.data = tensor.data.to("cpu")
+    else:
+        kept = parked.setdefault(id(module), {})
+        for name, tensor in tensors:
+            if tensor.device.type != "cpu":
+                continue
+            kept[name] = tensor.data
+            tensor.data = tensor.data.to(dev)
+
+
 class _Models:
     """Chatterbox and ECAPA, loaded once and moved between GPU and CPU."""
 
@@ -153,6 +184,7 @@ class _Models:
         self.ecapa: Any = None
         self.device: Optional[str] = None  # where the models are right now
         self.cpu_fallback = False          # set after a CUDA out-of-memory
+        self._parked: Dict[int, Dict[str, Any]] = {}  # CPU tensors kept across moves
 
     def target_device(self) -> str:
         return "cpu" if self.cpu_fallback else _requested_device()
@@ -217,7 +249,7 @@ class _Models:
     def _move(self, dev: str) -> None:
         if self.tts is not None:
             for module in (self.tts.t3, self.tts.s3gen, self.tts.ve):
-                module.to(dev)
+                _swap_module(module, dev, self._parked)
             self.tts.device = dev
             self.tts.conds = None  # reference conditionals are rebuilt per request
         if self.ecapa is not None:
@@ -237,6 +269,7 @@ class _Models:
         with self.lock:
             self.tts = self.ecapa = None
             self.device = None
+            self._parked.clear()
             import gc
             gc.collect()
             self._empty_cache()

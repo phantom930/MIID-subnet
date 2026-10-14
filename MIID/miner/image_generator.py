@@ -493,6 +493,7 @@ def generate_variations(
     identity_goal: Optional[float] = None,
     polish_attempts: Optional[int] = None,
     sibling: Optional[siblings.Context] = None,
+    yield_fn: Optional[Callable[[float], Optional[float]]] = None,
 ) -> List[Dict]:
     """Generate image variations from a base image (see generate_variations.py).
 
@@ -541,6 +542,11 @@ def generate_variations(
             gender-appropriate religious head covering (see generate_one).
         deadline: Wall-clock time generation must end by, or None.
         retry_cutoff_fn: Returns an extra wall-clock cap on retries, or None.
+        yield_fn: Called with the latest time a retry could still start before
+            each retry. It may hand the GPU to a queued request's first pass
+            and block until this request's turn comes round again, returning
+            the seconds waited — or None when that latest time passed first,
+            in which case the GPU is gone and no further attempt is made.
         identity_goal: AdaFace similarity above which a satisfied slot is left
             alone. Defaults to IDENTITY_GOAL.
         polish_attempts: Full-strength re-rolls allowed per satisfied slot.
@@ -679,6 +685,7 @@ def generate_variations(
     # ── phase 2: retries, most valuable first, while time allows ──
     retries_run = 0
     stop_reason = "every slot met its targets"
+    gpu_lost = False  # set when a hand-over never came back: no more GPU work
     while True:
         candidates = [
             (priority, slot) for slot in slots
@@ -698,6 +705,24 @@ def generate_variations(
                     f"{stop_reason} — keeping the best attempt."
                 )
             break
+        if yield_fn is not None:
+            # Every queued request gets its first pass before anyone's
+            # retries: hand the GPU over and queue again behind them.
+            waited = yield_fn(cutoff - cycle_estimate())
+            if waited is None:
+                gpu_lost = True
+                stop_reason = "the deadline, reached while queued for the GPU"
+                bt.logging.warning(
+                    f"{len(candidates)} slot(s) could use a retry, but the GPU went "
+                    "to queued first passes until no time was left — keeping the best attempts."
+                )
+                break
+            if waited > 0:
+                bt.logging.info(
+                    f"Handed the GPU to queued first passes for {waited:.0f}s; "
+                    "back for retries."
+                )
+                continue
         _, slot = max(candidates, key=lambda c: (c[0], -c[1].index))
         identity_bias, hints = slot.next_settings()
         plan = (
@@ -716,7 +741,7 @@ def generate_variations(
     polish_run = 0
     polish_kept = 0
     polish_stop = "every slot at the goal or polished out"
-    while polish_allowed > 0:
+    while polish_allowed > 0 and not gpu_lost:
         candidates = [
             (headroom, slot) for slot in slots
             if (headroom := slot.polish_priority(goal, polish_allowed)) is not None

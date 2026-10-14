@@ -316,11 +316,13 @@ For running your miner in the background (recommended for production), see the [
 
 **Capacity.** Every validator queries every hotkey (the default `--neuron.sample_size` is 250 against 256 UIDs), so each hotkey receives the same 6–7 requests an hour. One FLUX.2 Klein attempt takes ~25 s on a 16 GB card, so a single GPU serves about 140 attempts an hour: enough for one hotkey with retries and polish, two hotkeys with first passes and some retries, and no more. Ten hotkeys need five or more GPUs for first-pass-only generation and about ten for the current quality.
 
+**Memory.** With the defaults each process keeps about 1.5 GB of private memory for the FLUX.2 Klein pipeline: diffusers memory-maps the safetensors files, and `MIID_OFFLOAD_MODE=mapped` uploads each model to the GPU from those mapped tensors and evicts it without copying back, so the 15 GB of weights live once in the page cache and every process on the machine shares them. (With diffusers' own model offload, every generation copied all three models back into fresh private memory: four miners on one box were measured at 40–55 GB RSS each, growing by several GB an hour.) The voice models are kept on the CPU tensors they were loaded with (~3 GB private) rather than re-allocated each round, `MALLOC_ARENA_MAX=2` stops glibc giving each of the hundreds of threads its own arena, the heap is trimmed after every request, and every CPU thread pool is sized to `MIID_TORCH_THREADS` — set that to the cgroup quota divided by the number of miners (`scripts/miner/start_hotkeys.sh` uses 4). Budget roughly 7 GB private memory per process plus one shared 18 GB of mapped weights, and watch the `process RSS` figure logged with every `Request completed` line.
+
 Three pieces make several hotkeys safe to run from this code:
 
 1. **A style profile per hotkey** (`MIID/miner/diversity.py`, on by default). Derived from the hotkey address: its own four indoor and four outdoor scenes, a preferred side for light and head turns, a warm or cool colour cast, a far-expression flavour and accessory colours, appended to the prompt as a short style clause. Two hotkeys therefore draw from different distributions, not just different seeds. `MIID_DIVERSITY=0` turns it off.
 2. **A shared sibling ledger** (`MIID/miner/sibling_registry.py`, `MIID_SIBLING_DIR`). Every attempt's 256-bit dHash and CLIP embedding are written to `<dir>/<challenge_id>/`; before a take is accepted it is compared with the other hotkeys' takes of the same slot, and one within `MIID_DUP_DHASH_BITS` (16) or at CLIP cosine `MIID_DUP_CLIP_COSINE` (0.99) or above is ranked as a miss and re-rolled with a hint to compose differently. Use a local directory when the hotkeys share a machine and a network mount when they do not. Archived variations sit 68–120 bits from their own seed image, so honest renders with fresh seeds never trip this; it exists to guarantee that.
-3. **GPU sharing between processes** (`MIID_GPU_LOCK_DIR`). Each hotkey runs its own `neurons/miner.py`; with this set they take turns on the GPU through a file lock and see each other's queued requests, so one process's retries and polish yield to another process's waiting validator. The voice models are parked in CPU memory after each request already; the idle GPU footprint per process is the CUDA context, the VAE and the face models, about 1 GB.
+3. **GPU sharing between processes** (`MIID_GPU_LOCK_DIR`). Each hotkey runs its own `neurons/miner.py`; with this set they take turns on the GPU through a file lock in the same order as within one process — a request still waiting for its first pass before any request's retries, earliest deadline first within that — and see each other's queued requests, so one process's retries and polish yield to another process's waiting validator. (Without the phase rule, on 2026-10-14 one hotkey's eleven retries ran for 300 s while another hotkey's request waited 870 s and then had no time for a single attempt.) The voice models are parked in CPU memory after each request already; the idle GPU footprint per process is the CUDA context, the VAE and the face models, about 1 GB.
 
 Example with pm2, one process per hotkey, distinct axon ports:
 
@@ -523,7 +525,9 @@ Environment variables:
 | `MIID_DUP_DHASH_BITS`, `MIID_DUP_CLIP_COSINE` | What counts as near-identical to a sibling's take: dHash within this many of 256 bits, or CLIP cosine at or above this | 16, 0.99 |
 | `MIID_SIBLING_TTL_HOURS` | Challenges older than this are pruned from the ledger | 24 |
 | `MIID_GPU_LOCK_DIR` | Directory through which several miner processes on one machine share the GPU (file lock) and see each other's queued requests | unset |
-| `MIID_TORCH_THREADS` | CPU threads torch may use in the miner process. Containers often advertise every host core while their cgroup quota is far lower, and an oversubscribed pool makes every CPU-side step crawl | the cgroup quota |
+| `MIID_OFFLOAD_MODE` | How the image model's weights move between CPU memory and the GPU: `mapped` keeps them memory-mapped from the safetensors files (one shared copy in the page cache for every process on the machine, ~1.5 GB private memory per process instead of 15 GB, one upload per model per generation, no copy back); `model` is diffusers' model offload (whole models, copied back into fresh private memory after every generation — the process grows by several GB an hour); `sequential` is diffusers' layer-by-layer offload (lowest VRAM, slowest). Cards under 12 GB use `sequential` unless set explicitly. Replaces `MIID_SEQUENTIAL_CPU_OFFLOAD` (`1` → sequential, `0` → model, still honoured) | `mapped` |
+| `MALLOC_ARENA_MAX` | glibc setting, read at process start: how many malloc arenas the process may create. By default every thread that allocates gets its own 64 MB arena, and a miner has hundreds of threads (torch, OpenBLAS, tokenizers, the axon); 2 keeps the heap in one place. Set it in the process environment (pm2 `env`, `scripts/miner/start_hotkeys.sh` sets it) | glibc default (8 × cores) |
+| `MIID_TORCH_THREADS` | CPU threads for this miner process: the torch pool, and (set before anything imports) the `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS` and `MKL_NUM_THREADS` defaults, so OpenBLAS and OpenMP stop spawning a thread per advertised host core (128 here against a 15-core cgroup quota; each thread also costs a malloc arena). With several miners on one machine give each its share of the quota | the cgroup quota |
 | `MIID_GENERATION_BUDGET_SECONDS` | Upper bound on one request's generation; the request's own deadline usually binds first (see below) | 900 |
 | `MIID_DEADLINE_MARGIN_SECONDS` | Safety margin kept before the validator's timeout | 30 |
 
@@ -531,8 +535,11 @@ Environment variables:
 earliest-deadline-first (`MIID/miner/gpu_scheduler.py`); `forward` runs the work in a worker thread
 so queued requests are still accepted. Each request's deadline is the validator's send time (its
 nonce) plus its 1200 s timeout, minus upload, voice and the margin above. Every slot gets one
-attempt first; the time left then goes to retries, near identity misses first, and stops early
-when a queued request needs the GPU to make its own deadline. A response that would arrive after
+attempt first (the request's *first pass*). Before each retry the request hands the GPU to any
+queued request that has not had its first pass yet and queues again behind it, so under a burst
+every request submits a full first pass before anyone's retries run; the retries then use the
+time left, nearest identity misses first, and stop when a queued request needs the GPU to make
+its own deadline. Encryption and upload happen after the GPU has been handed back. A response that would arrive after
 the timeout scores nothing, so near the deadline slots are skipped rather than submitted late.
 
 To compare a change against what was actually submitted, replay archived requests (miner

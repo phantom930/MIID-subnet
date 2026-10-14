@@ -1348,6 +1348,14 @@ def generate_one(
             f"Variation failed for {var_type}({intensity}) "
             f"with {loaded_key} on attempt {attempt}: {e}"
         ) from e
+    finally:
+        # Mapped offload leaves the last model on the GPU; the card is shared
+        # with the identity check and with sibling miner processes.
+        try:
+            from .models._cuda_place import release_offloaded
+            release_offloaded(pipe)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Could not release the offloaded pipeline: %s", e)
 
     return {
         "image": gen_image,

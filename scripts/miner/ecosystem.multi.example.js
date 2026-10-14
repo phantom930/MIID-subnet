@@ -16,6 +16,8 @@ const REPO = __dirname.replace(/\/scripts\/miner$/, "");
 const COLDKEY = "my_coldkey";
 const HOTKEYS = ["hotkey_0", "hotkey_1"];
 const FIRST_AXON_PORT = 8092;
+// CPU threads per process: the cgroup quota divided by the number of miners.
+const THREADS = 4;
 const SHARED = path.join(REPO, "..", "miid_shared");
 
 const common = {
@@ -32,6 +34,18 @@ const common = {
     MIID_GPU_LOCK_DIR: path.join(SHARED, "gpu"),
     // Two processes polishing against each other is wasted time on a shared card.
     MIID_POLISH_ATTEMPTS: "1",
+    // Memory: keep the FLUX weights memory-mapped (one shared copy in the
+    // page cache, ~1.5 GB private per process instead of 15 GB), limit glibc
+    // to two malloc arenas, and size every CPU thread pool to this process's
+    // share of the cgroup quota rather than the host's core count.
+    MIID_OFFLOAD_MODE: "mapped",
+    MALLOC_ARENA_MAX: "2",
+    MIID_TORCH_THREADS: String(THREADS),
+    MIID_BG_CHECK_THREADS: String(THREADS),
+    OMP_NUM_THREADS: String(THREADS),
+    OPENBLAS_NUM_THREADS: String(THREADS),
+    MKL_NUM_THREADS: String(THREADS),
+    TOKENIZERS_PARALLELISM: "false",
   },
 };
 

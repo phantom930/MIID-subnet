@@ -39,6 +39,43 @@ The miner pipeline:
 # Uncomment related blocks below and protocol fields to restore.
 """
 
+import os
+
+
+def _cpu_quota() -> int:
+    """Cores this process may use: the cgroup quota, else the advertised count.
+
+    Same rule as MIID.miner.background_check.cpu_quota, repeated here because
+    it has to run before anything imports numpy or torch.
+    """
+    count = os.cpu_count() or 1
+    try:
+        count = min(count, len(os.sched_getaffinity(0)))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            count = min(count, max(1, int(float(quota) / float(period))))
+    except Exception:  # noqa: BLE001
+        pass
+    return max(1, count)
+
+
+# Every CPU thread pool sizes itself from the host's core count, not the
+# container's cgroup quota (128 advertised against 15.36 allowed here):
+# OpenBLAS spawns 63 threads when numpy loads and torch another 127 at its
+# first op, each thread with its own malloc arena. Those pools read their
+# size from the environment once, before the miner's own torch cap runs, so
+# the default is set here, ahead of every import. MIID_TORCH_THREADS or an
+# explicit OMP_NUM_THREADS etc. wins; several miners on one box should each
+# get a share of the quota (scripts/miner/start_hotkeys.sh sets 4).
+_THREADS = os.environ.get("MIID_TORCH_THREADS", "").strip() or str(_cpu_quota())
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, _THREADS)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import asyncio
 import hashlib
 import json
@@ -75,7 +112,7 @@ from MIID.miner.request_archive import (
 )
 
 # One GPU shared by every validator's request: earliest deadline first.
-from MIID.miner.gpu_scheduler import SCHEDULER, queue_cutoff
+from MIID.miner.gpu_scheduler import SCHEDULER, Turn, queue_cutoff
 from MIID.miner.gpu_scheduler import describe as describe_gpu_sharing
 
 # Running several hotkeys (docs/miner.md, "Running several hotkeys"): a
@@ -161,6 +198,8 @@ try:
     from MIID.miner.s3_upload import upload_to_s3
     from MIID.miner.submission_builder import (
         build_image_submissions,
+        generate_image_variations,
+        upload_image_variations,
         is_valid_image_bytes as _is_valid_image_bytes,
         is_valid_video_bytes as _is_valid_video_bytes,
     )
@@ -178,7 +217,33 @@ except ImportError as _phase4_err:
 # (~44 s measured), and a margin for clock skew and the response itself.
 UPLOAD_SECONDS_PER_SLOT = 4.0
 VOICE_RESERVE_SECONDS = 60.0
+# The clone itself, the only part of the voice work that needs the GPU
+# (~11 s measured on 2026-10-14); the rest of the reserve is upload and margin.
+VOICE_GPU_SECONDS = 15.0
 DEADLINE_MARGIN_SECONDS = float(os.environ.get("MIID_DEADLINE_MARGIN_SECONDS", "30"))
+
+
+def _trim_heap() -> float:
+    """Hand freed heap pages back to the kernel; the process RSS in GB after.
+
+    glibc keeps freed memory in its arenas, and a round's CPU work (CLIP
+    checks, image encoding, the voice models' trips to the GPU) leaves
+    hundreds of MB behind each time. malloc_trim releases what is free in
+    every arena and costs a few milliseconds.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1e6
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
 
 # Voice challenge (same encrypt/upload stack as Phase 4)
 try:
@@ -272,13 +337,17 @@ class Miner(BaseMinerNeuron):
             guidance_scale = os.environ.get("MIID_GUIDANCE_SCALE", "3.5").strip()
             flux_device = os.environ.get("FLUX_DEVICE", "(auto)").strip()
             enable_offload = os.environ.get("MIID_ENABLE_CPU_OFFLOAD", "(default)").strip()
-            seq_offload = os.environ.get("MIID_SEQUENTIAL_CPU_OFFLOAD", "1").strip()
+            try:
+                from MIID.miner.models._cuda_place import offload_mode as _offload_mode
+                offload = _offload_mode()
+            except Exception:  # noqa: BLE001
+                offload = "(unknown)"
             alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "(unset)").strip()
             bt.logging.info(
                 f"Phase 4 env: MIID_MODEL={forced_model} MIID_MODEL_RANDOM={random_flag} "
                 f"MIID_INFERENCE_STEPS={inference_steps} MIID_GUIDANCE_SCALE={guidance_scale} "
                 f"FLUX_DEVICE={flux_device} MIID_ENABLE_CPU_OFFLOAD={enable_offload} "
-                f"MIID_SEQUENTIAL_CPU_OFFLOAD={seq_offload} PYTORCH_CUDA_ALLOC_CONF={alloc_conf}"
+                f"offload mode={offload} PYTORCH_CUDA_ALLOC_CONF={alloc_conf}"
             )
 
             try:
@@ -434,10 +503,15 @@ class Miner(BaseMinerNeuron):
         return slots * UPLOAD_SECONDS_PER_SLOT + voice + DEADLINE_MARGIN_SECONDS
 
     def _workload_estimate(self, synapse: IdentitySynapse) -> float:
-        """Minimum GPU time this request needs: one attempt per slot, plus upload/voice."""
+        """Minimum GPU time this request needs: one attempt per slot, plus the voice clone.
+
+        Encryption and upload run after the GPU has been handed back, so they
+        are not part of what the queue waits for.
+        """
         slots = len(getattr(synapse.image_request, "variation_requests", None) or []) \
             if synapse.image_request is not None else 0
-        return slots * cycle_estimate() + self._post_generation_reserve(synapse)
+        voice = VOICE_GPU_SECONDS if synapse.voice_request is not None else 0.0
+        return slots * cycle_estimate() + voice
 
     def _forward_on_gpu(
         self,
@@ -447,27 +521,37 @@ class Miner(BaseMinerNeuron):
         deadline: float,
         workload: float,
     ) -> IdentitySynapse:
-        """Wait for the GPU (earliest deadline first), then run the request."""
-        with SCHEDULER.acquire(deadline, workload) as gpu_wait:
+        """Wait for the GPU (earliest deadline first), then run the request.
+
+        The turn is held for generation and the voice clone only; the body
+        hands it back before encrypting and uploading.
+        """
+        with SCHEDULER.acquire(deadline, workload) as turn:
             started = time.time()
             timing = {
                 "sent_at_utc": _utc_iso(sent_at) if sent_at else None,
                 "received_at_utc": _utc_iso(received),
                 "queue_wait_seconds": round(started - (sent_at or received), 1),
-                "gpu_wait_seconds": round(gpu_wait, 1),
+                "gpu_wait_seconds": round(turn.waited, 1),
                 "deadline_utc": _utc_iso(deadline),
             }
             bt.logging.info(
                 f"Request sent {started - (sent_at or received):.0f}s ago "
-                f"(waited {gpu_wait:.0f}s for the GPU); "
+                f"(waited {turn.waited:.0f}s for the GPU); "
                 f"{deadline - started:.0f}s left before the validator's timeout."
             )
-            return self._forward_body(synapse, deadline, timing)
+            return self._forward_body(synapse, deadline, timing, turn)
 
     def _forward_body(
         self, synapse: IdentitySynapse, deadline: float, timing: dict,
+        turn: Optional[Turn] = None,
     ) -> IdentitySynapse:
-        """The request itself, run while holding the GPU (see forward)."""
+        """The request itself (see forward).
+
+        Runs with the GPU held (``turn``) through generation and the voice
+        clone, releases it, then encrypts and uploads. During retries the GPU
+        is handed to any request still waiting for its first pass.
+        """
         run_id = int(time.time())
         timeout = getattr(synapse, 'timeout', 120.0)
         start_time = time.time()
@@ -485,6 +569,18 @@ class Miner(BaseMinerNeuron):
             # own deadline; our upload/voice still has to fit before that.
             cutoff = queue_cutoff(SCHEDULER.waiting())
             return None if cutoff is None else cutoff - reserve
+
+        def yield_gpu(latest_restart: float) -> Optional[float]:
+            # Before each retry: a request still waiting for its first pass
+            # goes first; our retries queue again behind it (phase 1) and
+            # give up when they could not start by latest_restart.
+            if turn is None or not SCHEDULER.first_pass_waiting():
+                return 0.0
+            bt.logging.info(
+                "A queued request is waiting for its first pass — handing the "
+                "GPU over before retrying."
+            )
+            return turn.yield_turn(phase=1, until=latest_restart)
 
         synapse.s3_submissions = []
         synapse.voice_s3_submissions = []
@@ -505,6 +601,8 @@ class Miner(BaseMinerNeuron):
         pipeline_error = None
         outcome = None
         voice_summary = None
+        batch = None       # generated variations, uploaded once the GPU is released
+        voice_clip = None  # (base_wav, clone_wav), likewise
 
         # --- Image path (unchanged when image_request present) ---
         if synapse.image_request is not None:
@@ -539,19 +637,21 @@ class Miner(BaseMinerNeuron):
                 pipeline_error = "image-generation packages not installed"
             else:
                 try:
-                    s3_submissions = self.process_image_request(
-                        synapse,
+                    # Generation only; encryption and upload run after the
+                    # GPU has been handed back (below).
+                    batch = generate_image_variations(
+                        req,
+                        self.wallet.hotkey,
                         report=report,
                         meta=meta,
-                        save_images_dir=self._archive_media_dir(record, req),
                         deadline=image_deadline,
                         retry_cutoff_fn=retry_cutoff,
+                        yield_fn=yield_gpu,
                     )
-                    bt.logging.info(f"Phase 4: Generated {len(s3_submissions)} S3 submissions")
                 except Exception as e:
-                    bt.logging.error(f"Phase 4: Failed to process image request: {e}")
+                    bt.logging.error(f"Phase 4: Failed to generate variations: {e}")
                     pipeline_error = f"{type(e).__name__}: {e}"
-                    s3_submissions = []
+                    batch = None
 
                 # # --- PAUSED: real screen-replay submission (restore later) ---
                 # # Try to attach a real screen-replay submission (active slot, or a
@@ -564,7 +664,7 @@ class Miner(BaseMinerNeuron):
         else:
             outcome = "no_image_request"
 
-        # --- Voice path ---
+        # --- Voice clone: the last thing that needs the GPU ---
         if synapse.voice_request is not None:
             bt.logging.info(
                 f"Received voice request: file='{synapse.voice_request.voice_filename}', "
@@ -577,34 +677,47 @@ class Miner(BaseMinerNeuron):
                 "target_text": synapse.voice_request.target_text,
                 "challenge_id": synapse.voice_request.challenge_id,
             }
+            # The image uploads still have to fit in after the clone.
+            upload_reserve = (
+                (len(batch["variations"]) if batch else 0) * UPLOAD_SECONDS_PER_SLOT
+                + DEADLINE_MARGIN_SECONDS
+            )
+            voice_latest_start = deadline - VOICE_RESERVE_SECONDS - upload_reserve
             if not VOICE_AVAILABLE:
                 bt.logging.info(
                     "Voice: helper modules unavailable — returning no voice submission."
                 )
                 voice_summary["outcome"] = "voice_unavailable"
-            elif time.time() + VOICE_RESERVE_SECONDS > deadline - DEADLINE_MARGIN_SECONDS:
-                # The images are already uploaded; a voice clone now would make
-                # the whole response late, and a late response scores nothing.
+            elif time.time() > voice_latest_start:
+                # A voice clone now would make the whole response late, and a
+                # late response scores nothing.
                 bt.logging.warning(
                     f"Voice: skipped, only {deadline - time.time():.0f}s left "
                     "before the validator's timeout."
                 )
                 voice_summary["outcome"] = "skipped_deadline"
+            elif (
+                turn is not None and not turn.held
+                and turn.reacquire(phase=0, until=voice_latest_start) is None
+            ):
+                # The retries handed the GPU over and the queue did not come
+                # back round in time.
+                bt.logging.warning(
+                    "Voice: skipped, the GPU did not come back in time for the clone."
+                )
+                voice_summary["outcome"] = "skipped_deadline"
             else:
                 voice_started = time.time()
                 try:
-                    voice_subs = self.process_voice_request(
+                    voice_clip = self.clone_voice_request(
                         synapse, save_dir=self._archive_voice_dir(record),
                     )
-                    if voice_subs:
-                        bt.logging.info(f"Voice: Generated {len(voice_subs)} S3 submissions")
-                    else:
+                    voice_summary["outcome"] = "generated" if voice_clip else "empty"
+                    if not voice_clip:
                         bt.logging.info("Voice: no submission this round.")
-                    synapse.voice_s3_submissions = voice_subs
-                    voice_summary["outcome"] = "submitted" if voice_subs else "empty"
                 except Exception as e:
-                    bt.logging.error(f"Voice: Failed to process voice request: {e}")
-                    synapse.voice_s3_submissions = []
+                    bt.logging.error(f"Voice: Failed to clone the voice: {e}")
+                    voice_clip = None
                     voice_summary["outcome"] = "error"
                     voice_summary["error"] = f"{type(e).__name__}: {e}"
                 finally:
@@ -614,14 +727,49 @@ class Miner(BaseMinerNeuron):
                     release_voice_worker()
                 voice_summary["similarity"] = _voice_generator.last_similarity
                 voice_summary["seconds"] = round(time.time() - voice_started, 2)
-                voice_summary["submissions"] = [
-                    s.s3_key for s in synapse.voice_s3_submissions or []
-                ]
+
+        # --- Nothing below needs the GPU: hand it to the next request ---
+        if turn is not None:
+            turn.release()
+
+        if batch is not None:
+            try:
+                s3_submissions = upload_image_variations(
+                    batch, synapse.image_request, self.wallet.hotkey,
+                    report=report, meta=meta,
+                    save_images_dir=self._archive_media_dir(record, synapse.image_request),
+                )
+                bt.logging.info(f"Phase 4: Generated {len(s3_submissions)} S3 submissions")
+            except Exception as e:
+                bt.logging.error(f"Phase 4: Failed to upload variations: {e}")
+                pipeline_error = f"{type(e).__name__}: {e}"
+                s3_submissions = []
+            synapse.s3_submissions = s3_submissions
+
+        if voice_clip is not None and voice_summary is not None:
+            try:
+                voice_subs = self.upload_voice_clone(synapse, voice_clip)
+                if voice_subs:
+                    bt.logging.info(f"Voice: Generated {len(voice_subs)} S3 submissions")
+                else:
+                    bt.logging.info("Voice: no submission this round.")
+                synapse.voice_s3_submissions = voice_subs
+                voice_summary["outcome"] = "submitted" if voice_subs else "empty"
+            except Exception as e:
+                bt.logging.error(f"Voice: Failed to upload the clone: {e}")
+                synapse.voice_s3_submissions = []
+                voice_summary["outcome"] = "error"
+                voice_summary["error"] = f"{type(e).__name__}: {e}"
+            voice_summary["submissions"] = [
+                s.s3_key for s in synapse.voice_s3_submissions or []
+            ]
 
         total_time = time.time() - start_time
+        rss_gb = _trim_heap()
         bt.logging.info(
             f"Request completed in {total_time:.2f}s of {timeout:.1f}s allowed "
-            f"({deadline - time.time():.0f}s before the validator's timeout)."
+            f"({deadline - time.time():.0f}s before the validator's timeout); "
+            f"process RSS {rss_gb:.1f} GB."
         )
 
         if outcome is None:
@@ -867,15 +1015,15 @@ class Miner(BaseMinerNeuron):
             retry_cutoff_fn=retry_cutoff_fn,
         )
 
-    def process_voice_request(
+    def clone_voice_request(
         self, synapse: IdentitySynapse, save_dir: Optional[str] = None,
-    ) -> List[S3Submission]:
-        """
-        Process a voice clone request end-to-end.
+    ) -> Optional[Tuple[bytes, bytes]]:
+        """The GPU half of a voice request: decode, clone, check the speaker.
 
-        Decodes the reference WAV, generates a clone speaking target_words,
-        checks speaker identity with SpeechBrain when available,
-        encrypts with drand, uploads to S3, and returns S3Submission refs.
+        Returns ``(base_wav, clone_wav)`` for upload_voice_clone, or None when
+        there is nothing to submit. The clone and the SpeechBrain check are
+        the only parts that need the GPU; the live miner hands it back before
+        encrypting and uploading.
 
         Args:
             synapse: IdentitySynapse with voice_request
@@ -884,16 +1032,13 @@ class Miner(BaseMinerNeuron):
                 is written as soon as it is generated, so a clip that is then
                 dropped by the identity check or fails to upload is still
                 there to listen to.
-
-        Returns:
-            List of S3Submission objects (variation_type="voice")
         """
         voice_request = synapse.voice_request
         if not voice_request:
-            return []
+            return None
 
         if not VOICE_AVAILABLE:
-            return []
+            return None
 
         try:
             bt.logging.info(f"Voice: Decoding base voice: {voice_request.voice_filename}")
@@ -914,15 +1059,34 @@ class Miner(BaseMinerNeuron):
                 bt.logging.info(
                     "Voice: generate_voice_clone returned None — no voice submission"
                 )
-                return []
+                return None
             self._archive_voice_clip(save_dir, "voice_clone.wav", generated_wav)
 
             if not validate_voice_identity(
                 base_wav, generated_wav, min_similarity=VOICE_MIN_SIMILARITY,
             ):
                 bt.logging.warning("Voice: Skipping — speaker identity not preserved")
-                return []
+                return None
+            return base_wav, generated_wav
 
+        except Exception as e:
+            bt.logging.error(f"Voice: Error in clone_voice_request: {e}")
+            return None
+
+    def upload_voice_clone(
+        self, synapse: IdentitySynapse, clip: Optional[Tuple[bytes, bytes]],
+    ) -> List[S3Submission]:
+        """The CPU half: sign, encrypt and upload a clone from clone_voice_request.
+
+        Returns:
+            List of S3Submission objects (variation_type="voice")
+        """
+        voice_request = synapse.voice_request
+        if not voice_request or not clip:
+            return []
+        _, generated_wav = clip
+
+        try:
             voice_hash = hash_voice_bytes(generated_wav)
             challenge_id = voice_request.challenge_id or "sandbox_test"
             target_round = voice_request.target_drand_round
@@ -976,8 +1140,23 @@ class Miner(BaseMinerNeuron):
             return [submission]
 
         except Exception as e:
-            bt.logging.error(f"Voice: Error in process_voice_request: {e}")
+            bt.logging.error(f"Voice: Error in upload_voice_clone: {e}")
             return []
+
+    def process_voice_request(
+        self, synapse: IdentitySynapse, save_dir: Optional[str] = None,
+    ) -> List[S3Submission]:
+        """Process a voice clone request end-to-end.
+
+        Decodes the reference WAV, generates a clone speaking target_words,
+        checks speaker identity with SpeechBrain when available, encrypts with
+        drand, uploads to S3, and returns S3Submission refs. The live miner
+        runs the two halves itself (clone_voice_request while it holds the
+        GPU, upload_voice_clone after); this is the same sequence in one call.
+        """
+        return self.upload_voice_clone(
+            synapse, self.clone_voice_request(synapse, save_dir=save_dir),
+        )
 
     def _screen_replay_is_due(self, data: dict, image_request) -> bool:
         """True if this capture's IOTD is allowed to upload on today's UTC date.

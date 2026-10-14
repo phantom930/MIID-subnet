@@ -11,6 +11,19 @@ from typing import Any
 # on its own — more than such a card has.
 SMALL_VRAM_GIB = float(os.environ.get("MIID_SMALL_VRAM_GIB", "12"))
 
+# How weights move between CPU memory and the GPU when offload is on:
+#   mapped     one model on the GPU at a time, uploaded from the memory-mapped
+#              safetensors and evicted without copying back (default; the
+#              process keeps ~1.5 GB private memory for FLUX.2 klein instead
+#              of 15 GB, and sibling processes share the page cache). Same
+#              peak VRAM as model offload.
+#   model      diffusers' enable_model_cpu_offload: whole models, copied back
+#              to fresh CPU memory after each generation.
+#   sequential diffusers' enable_sequential_cpu_offload: layer by layer, the
+#              lowest VRAM and the slowest (the transformer is re-uploaded
+#              every denoising step).
+OFFLOAD_MODES = ("mapped", "model", "sequential")
+
 
 def _total_vram_gib() -> float:
     """Total VRAM of cuda:0 in GiB, or 0.0 when it cannot be determined."""
@@ -20,6 +33,40 @@ def _total_vram_gib() -> float:
         return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def offload_mode() -> str:
+    """The offload flavour for CUDA: ``MIID_OFFLOAD_MODE``, else the older
+    ``MIID_SEQUENTIAL_CPU_OFFLOAD`` switch (1 → sequential, 0 → model), else mapped."""
+    mode = os.environ.get("MIID_OFFLOAD_MODE", "").strip().lower()
+    if mode in OFFLOAD_MODES:
+        return mode
+    seq_env = os.environ.get("MIID_SEQUENTIAL_CPU_OFFLOAD", "").strip().lower()
+    if seq_env in ("1", "true", "yes"):
+        return "sequential"
+    if seq_env in ("0", "false", "no"):
+        return "model"
+    return "mapped"
+
+
+def offload_wanted(default_offload_on_cuda: bool) -> bool:
+    env = os.environ.get("MIID_ENABLE_CPU_OFFLOAD", "").strip().lower()
+    if default_offload_on_cuda:
+        return env not in ("0", "false", "no")
+    return env in ("1", "true", "yes")
+
+
+def release_offloaded(pipe: Any) -> None:
+    """After a generation: move every mapped-offload model off the GPU.
+
+    No-op for the other modes (their hooks already left the GPU empty) and for
+    pipelines that run fully on one device.
+    """
+    if getattr(pipe, "_miid_mapped_offload", None) is None:
+        return
+    from ._mapped_offload import release_offloaded as _release
+
+    _release(pipe)
 
 
 def place_diffusers_pipeline(
@@ -35,46 +82,54 @@ def place_diffusers_pipeline(
       ``MIID_ENABLE_CPU_OFFLOAD`` is ``0`` / ``false`` / ``no``.
     - If ``default_offload_on_cuda`` is False, offload is used only when
       ``MIID_ENABLE_CPU_OFFLOAD`` is ``1`` / ``true`` / ``yes``.
-    - For huge models (e.g. FLUX Kontext), ``prefer_sequential_offload=True`` tries
-      ``enable_sequential_cpu_offload()`` first (lower peak VRAM than model offload on ~16GB).
-      Sequential offload is also chosen automatically on cards below ``SMALL_VRAM_GIB``,
-      where model offload cannot fit a single transformer submodule.
-      Force with ``MIID_SEQUENTIAL_CPU_OFFLOAD=1``, disable with ``0``.
+    - ``MIID_OFFLOAD_MODE`` picks mapped (default), model or sequential offload; see
+      ``OFFLOAD_MODES``. Huge models (``prefer_sequential_offload=True``) and cards below
+      ``SMALL_VRAM_GIB``, where a whole transformer does not fit, use sequential offload
+      unless the mode was set explicitly.
     """
     if dev != "cuda":
         pipe.to(dev)
         return
 
-    env = os.environ.get("MIID_ENABLE_CPU_OFFLOAD", "").strip().lower()
-    if default_offload_on_cuda:
-        want_offload = env not in ("0", "false", "no")
-    else:
-        want_offload = env in ("1", "true", "yes")
-
-    if not want_offload:
+    if not offload_wanted(default_offload_on_cuda):
         pipe.to(dev)
         return
 
-    seq_env = os.environ.get("MIID_SEQUENTIAL_CPU_OFFLOAD", "").strip().lower()
-    if seq_env in ("0", "false", "no"):
-        use_sequential = False
-    elif seq_env in ("1", "true", "yes"):
-        use_sequential = True
-    else:
+    mode = offload_mode()
+    explicit = bool(os.environ.get("MIID_OFFLOAD_MODE", "").strip()) or bool(
+        os.environ.get("MIID_SEQUENTIAL_CPU_OFFLOAD", "").strip()
+    )
+    if not explicit:
         vram = _total_vram_gib()
         small_card = 0.0 < vram < SMALL_VRAM_GIB
-        if small_card and not prefer_sequential_offload:
+        if small_card:
             print(
                 f"cuda:0 has {vram:.1f} GiB VRAM (< {SMALL_VRAM_GIB:.0f} GiB); using "
                 "sequential CPU offload. Generation will be slower — set "
-                "MIID_SEQUENTIAL_CPU_OFFLOAD=0 to opt out.",
+                "MIID_OFFLOAD_MODE=mapped to opt out.",
                 file=sys.stderr,
             )
-        use_sequential = prefer_sequential_offload or small_card
+        if small_card or prefer_sequential_offload:
+            mode = "sequential"
 
-    if use_sequential:
+    if mode == "mapped":
+        try:
+            from ._mapped_offload import enable_mapped_cpu_offload
+
+            manager = enable_mapped_cpu_offload(pipe, dev)
+            print(f"CPU offload: {manager.describe()}", file=sys.stderr)
+            return
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"mapped CPU offload failed ({exc}); trying sequential CPU offload",
+                file=sys.stderr,
+            )
+            mode = "sequential"
+
+    if mode == "sequential":
         try:
             pipe.enable_sequential_cpu_offload()
+            print("CPU offload: sequential (layer by layer)", file=sys.stderr)
             return
         except Exception as exc:  # noqa: BLE001
             print(
@@ -84,6 +139,7 @@ def place_diffusers_pipeline(
 
     try:
         pipe.enable_model_cpu_offload()
+        print("CPU offload: model (whole models, copied back to the CPU after each run)", file=sys.stderr)
         return
     except Exception as exc:  # noqa: BLE001
         print(f"enable_model_cpu_offload failed ({exc}); falling back to pipe.to(cuda)", file=sys.stderr)

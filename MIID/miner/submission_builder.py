@@ -146,48 +146,25 @@ def _record(
     report.append(entry)
 
 
-def build_image_submissions(
+def generate_image_variations(
     image_request: Any,
     hotkey: Any,
     *,
     min_similarity: float = DEFAULT_MIN_SIMILARITY,
-    encrypt: Optional[bool] = None,
-    save_images_dir: Optional[str] = None,
     report: Optional[List[Dict[str, Any]]] = None,
     meta: Optional[Dict[str, Any]] = None,
     deadline: Optional[float] = None,
     retry_cutoff_fn: Optional[Callable[[], Optional[float]]] = None,
-) -> List[S3Submission]:
-    """Generate, validate, encrypt and upload every requested variation.
+    yield_fn: Optional[Callable[[float], Optional[float]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """The GPU half of build_image_submissions: decode, generate, measure.
 
-    Args:
-        image_request: The validator's ImageRequest (base image + requests).
-        hotkey: Keypair used to sign submissions (``wallet.hotkey`` in the
-            live miner).
-        min_similarity: AdaFace similarity a variation is regenerated to reach.
-            The best attempt is submitted whether or not it gets there, unless
-            MIID_DROP_BELOW_SIMILARITY is set — see DEFAULT_MIN_SIMILARITY.
-        encrypt: ``None`` (default) encrypts whenever drand timelock is
-            available — this is what the live miner does. ``False`` forces
-            raw bytes and is sandbox/dry-run only: real submissions must be
-            timelocked or the validator can read them before reveal.
-        save_images_dir: When set, the unencrypted variation is also written
-            here so it can be inspected. Used by the dry run, and by the live
-            miner when MIID_ARCHIVE_IMAGES is on.
-        report: When a list is passed, one dict per variation is appended
-            describing what happened to it (submitted, or why it was dropped).
-        meta: When a dict is passed, run-level facts are written into it —
-            which model was picked, the identity floor, whether encryption was
-            used, and how many variations were requested vs submitted. The
-            request archive stores this so a past round can be explained.
-        deadline: Wall-clock time (time.time()) by which generation must be
-            done for the response to reach the validator in time; None keeps
-            the fixed GENERATION_BUDGET_SECONDS (dry runs).
-        retry_cutoff_fn: Extra wall-clock cap on optional retries, re-read
-            before each one (the miner's queue of waiting requests).
-
-    Returns:
-        List of S3Submission objects, one per variation that made it through.
+    Returns a batch for upload_image_variations, or None when nothing could be
+    generated (``report`` and ``meta`` then say why). This is the only part of
+    a request that needs the GPU; the live miner hands the GPU to the next
+    queued request before encrypting and uploading. Arguments as for
+    build_image_submissions; ``yield_fn`` is passed through to
+    generate_variations.
     """
     if meta is not None:
         meta.update({
@@ -201,14 +178,11 @@ def build_image_submissions(
         })
 
     if image_request is None:
-        return []
+        return None
 
     free_gpu_memory("before_request")
 
-    base_image = None
-    variations = None
     model_key = None
-    model_id = None
     try:
         bt.logging.info(f"Phase 4: Decoding base image: {image_request.image_filename}")
         base_image = decode_base_image(image_request.base_image)
@@ -233,6 +207,7 @@ def build_image_submissions(
             deadline=deadline,
             retry_cutoff_fn=retry_cutoff_fn,
             sibling=sibling,
+            yield_fn=yield_fn,
         )
         generation_seconds = time.monotonic() - generation_started
 
@@ -250,6 +225,52 @@ def build_image_submissions(
             # against the record's duration_seconds.
             meta["generation_seconds"] = round(generation_seconds, 1)
 
+        return {
+            "base_image": base_image,
+            "variations": variations,
+            "model_key": model_key,
+            "model_id": model_id,
+            "challenge_id": challenge_id,
+            "seed_image_name": seed_image_name,
+            "generation_seconds": generation_seconds,
+        }
+
+    except Exception as e:
+        bt.logging.error(f"Phase 4: Error generating variations: {e}")
+        _record(report, "*", "failed", model=model_key,
+                reason=f"{type(e).__name__}: {e}")
+        if meta is not None:
+            meta["error"] = f"{type(e).__name__}: {e}"
+        return None
+    finally:
+        free_gpu_memory("after_request")
+
+
+def upload_image_variations(
+    batch: Optional[Dict[str, Any]],
+    image_request: Any,
+    hotkey: Any,
+    *,
+    min_similarity: float = DEFAULT_MIN_SIMILARITY,
+    encrypt: Optional[bool] = None,
+    save_images_dir: Optional[str] = None,
+    report: Optional[List[Dict[str, Any]]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> List[S3Submission]:
+    """The CPU half: validate, archive, encrypt and upload a generated batch.
+
+    Needs no GPU. Arguments as for build_image_submissions; ``batch`` is what
+    generate_image_variations returned (None gives an empty list).
+    """
+    if not batch:
+        return []
+
+    base_image = batch["base_image"]
+    variations = batch["variations"]
+    model_key = batch["model_key"]
+    challenge_id = batch["challenge_id"]
+    seed_image_name = batch["seed_image_name"]
+    try:
         s3_submissions: List[S3Submission] = []
         target_round = image_request.target_drand_round
 
@@ -374,13 +395,74 @@ def build_image_submissions(
         return s3_submissions
 
     except Exception as e:
-        bt.logging.error(f"Phase 4: Error in build_image_submissions: {e}")
+        bt.logging.error(f"Phase 4: Error in upload_image_variations: {e}")
         _record(report, "*", "failed", model=model_key,
                 reason=f"{type(e).__name__}: {e}")
         if meta is not None:
             meta["error"] = f"{type(e).__name__}: {e}"
         return []
     finally:
-        base_image = None
-        variations = None
-        free_gpu_memory("after_request")
+        batch["base_image"] = None
+        batch["variations"] = None
+
+
+def build_image_submissions(
+    image_request: Any,
+    hotkey: Any,
+    *,
+    min_similarity: float = DEFAULT_MIN_SIMILARITY,
+    encrypt: Optional[bool] = None,
+    save_images_dir: Optional[str] = None,
+    report: Optional[List[Dict[str, Any]]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    deadline: Optional[float] = None,
+    retry_cutoff_fn: Optional[Callable[[], Optional[float]]] = None,
+    yield_fn: Optional[Callable[[float], Optional[float]]] = None,
+) -> List[S3Submission]:
+    """Generate, validate, encrypt and upload every requested variation.
+
+    The live miner runs the two halves itself — generate_image_variations
+    while it holds the GPU, upload_image_variations after handing it over —
+    this is the same sequence in one call, for the dry run and tests.
+
+    Args:
+        image_request: The validator's ImageRequest (base image + requests).
+        hotkey: Keypair used to sign submissions (``wallet.hotkey`` in the
+            live miner).
+        min_similarity: AdaFace similarity a variation is regenerated to reach.
+            The best attempt is submitted whether or not it gets there, unless
+            MIID_DROP_BELOW_SIMILARITY is set — see DEFAULT_MIN_SIMILARITY.
+        encrypt: ``None`` (default) encrypts whenever drand timelock is
+            available — this is what the live miner does. ``False`` forces
+            raw bytes and is sandbox/dry-run only: real submissions must be
+            timelocked or the validator can read them before reveal.
+        save_images_dir: When set, the unencrypted variation is also written
+            here so it can be inspected. Used by the dry run, and by the live
+            miner when MIID_ARCHIVE_IMAGES is on.
+        report: When a list is passed, one dict per variation is appended
+            describing what happened to it (submitted, or why it was dropped).
+        meta: When a dict is passed, run-level facts are written into it —
+            which model was picked, the identity floor, whether encryption was
+            used, and how many variations were requested vs submitted. The
+            request archive stores this so a past round can be explained.
+        deadline: Wall-clock time (time.time()) by which generation must be
+            done for the response to reach the validator in time; None keeps
+            the fixed GENERATION_BUDGET_SECONDS (dry runs).
+        retry_cutoff_fn: Extra wall-clock cap on optional retries, re-read
+            before each one (the miner's queue of waiting requests).
+        yield_fn: See generate_variations; hands the GPU to queued first
+            passes before each retry.
+
+    Returns:
+        List of S3Submission objects, one per variation that made it through.
+    """
+    batch = generate_image_variations(
+        image_request, hotkey,
+        min_similarity=min_similarity, report=report, meta=meta,
+        deadline=deadline, retry_cutoff_fn=retry_cutoff_fn, yield_fn=yield_fn,
+    )
+    return upload_image_variations(
+        batch, image_request, hotkey,
+        min_similarity=min_similarity, encrypt=encrypt,
+        save_images_dir=save_images_dir, report=report, meta=meta,
+    )

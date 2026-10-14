@@ -29,6 +29,9 @@ NETWORK="${MIID_NETWORK:-finney}"
 ENDPOINT="${MIID_CHAIN_ENDPOINT:-wss://entrypoint-finney.opentensor.ai:443}"
 SHARED="${MIID_SHARED_DIR:-/workspace/miid_shared}"
 EXTERNAL_IP="${MIID_EXTERNAL_IP:-${PUBLIC_IPADDR:-}}"
+# CPU threads per miner process: the cgroup quota divided by the number of
+# miners on the box (15 cores / 4 miners here). MIID_CPU_THREADS overrides.
+THREADS="${MIID_CPU_THREADS:-4}"
 
 DRY_RUN=0
 ARGS=()
@@ -86,12 +89,25 @@ for spec in "${ARGS[@]}"; do
         echo "   replacing existing pm2 process $name"
         pm2 delete "$name" >/dev/null
     fi
+    # Memory: mapped offload keeps the FLUX weights in the shared page cache
+    # (~1.5 GB private per process instead of 15 GB, no copy-back churn);
+    # MALLOC_ARENA_MAX stops glibc giving each of the hundreds of threads its
+    # own 64 MB arena; the thread caps size every CPU pool to this process's
+    # share of the cgroup quota instead of the host's 128 cores.
     HF_TOKEN="$HF_TOKEN" \
     FLUX_DEVICE="${FLUX_DEVICE:-cuda}" \
     MIID_ARCHIVE_IMAGES="${MIID_ARCHIVE_IMAGES:-1}" \
     MIID_SIBLING_DIR="$SHARED/siblings" \
     MIID_GPU_LOCK_DIR="$SHARED/gpu" \
     MIID_POLISH_ATTEMPTS="${MIID_POLISH_ATTEMPTS:-1}" \
+    MIID_OFFLOAD_MODE="${MIID_OFFLOAD_MODE:-mapped}" \
+    MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}" \
+    MIID_TORCH_THREADS="$THREADS" \
+    MIID_BG_CHECK_THREADS="$THREADS" \
+    OMP_NUM_THREADS="$THREADS" \
+    OPENBLAS_NUM_THREADS="$THREADS" \
+    MKL_NUM_THREADS="$THREADS" \
+    TOKENIZERS_PARALLELISM=false \
     PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
     pm2 start "${cmd[0]}" --name "$name" --cwd "$REPO" --interpreter none --time -- "${cmd[@]:1}"
 done
