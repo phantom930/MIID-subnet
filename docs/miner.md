@@ -535,6 +535,8 @@ python neurons/miner.py --netuid 54 --wallet.name your_wallet_name --wallet.hotk
 
 Same round as images when the validator attaches a `voice_request`:
 
+#### Current Approach
+
 1. Validator fetches a reference WAV from the MIID API and draws target speech text (English or Spanish), e.g. `target_text = "three orange six two nine apple table one"` (also sent as `target_words` list).
 2. `MIID/miner/voice_generator.generate_voice_clone` synthesizes a WAV with the same speaker identity speaking `target_text`, using Chatterbox Multilingual (zero-shot cloning, English + Spanish). It runs **inside the miner process**, on the same GPU as the image path. Install it into `miner_env` once with `bash scripts/miner/setup_voice.sh --warmup` (see the note on packages below). Without those packages the miner simply returns no voice submission.
 3. Up to `MIID_VOICE_ATTEMPTS` (3) takes are generated and the one closest to the reference by SpeechBrain ECAPA similarity (`speechbrain/spkrec-ecapa-voxceleb`, the validator's identity model) is kept. It stops early at `MIID_VOICE_IDENTITY_TARGET` (0.7). A clip below **0.6**, the validator's identity threshold, is dropped.
@@ -548,6 +550,13 @@ python -m MIID.miner.voice_generator --reference some_voice.wav --text "three or
 ```
 
 **About the packages.** `chatterbox-tts` publishes pins (`torch==2.6`, `transformers==5.2`, `diffusers==0.29`, `numpy<2`) that would downgrade and break the FLUX image stack, so `setup_voice.sh` installs it with `--no-deps` and takes its real runtime dependencies from `requirements-voice.txt`. The combination was verified on torch 2.14 / transformers 5.19 / diffusers 0.41. `pip check` will keep listing those pins as conflicts; that is expected.
+
+#### Updated Approach from `main` branch
+
+1. Validator fetches a reference WAV from the MIID API and draws target speech text (English or Spanish): **5 digit-words + 10 pool words = 15 tokens**, e.g. `target_text = "three orange six book two nine apple table one door light music phone school"` (also sent as `target_words` list). Clip length is not fixed — speak the prompt naturally.
+2. Implement `MIID/miner/voice_generator.generate_voice_clone` to synthesize a WAV with the same speaker identity speaking `target_text`.
+3. The existing encrypt → S3 → `S3Submission(variation_type="voice")` path runs and fills `voice_s3_submissions`.
+4. Voice is collected for **UAV post-grading only** (no live KAV grade for voice).
 
 **Variation types and intensities (Cycle 2):**
 
