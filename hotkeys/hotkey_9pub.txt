@@ -1,0 +1,1 @@
+{"accountId":"0x5e316a83b1ea04cc5044f3e8018aff48f82c67f97e71c428a4c3b116d8e4625b","cryptoType":1,"ss58Address":"5ECD39xYjRJUhBbMzwStn55m7YqaBB5PZSLEiGuyrwVFsd5L","publicKey":"0x5e316a83b1ea04cc5044f3e8018aff48f82c67f97e71c428a4c3b116d8e4625b"}
