@@ -310,6 +310,31 @@ For detailed information about logging setup and management, see the [Logging Gu
 
 For running your miner in the background (recommended for production), see the [Background Mining Guide](background_mining.md).
 
+## Running several hotkeys
+
+**Read the policy first.** The [Face Variation Reward System](Face%20Variation%20Reward%20System.pdf) ("Duplicate Submissions and Multi-Hotkey Activity") describes a cross-miner duplication analysis run during post-validation. In Cycle 1 one operator ran five hotkeys from the same model; they placed 2nd to 6th on the leaderboard, were found to be "submitting nearly identical images", and all five were moved to the Watch tier with reputation near zero. The document states that "miners are strongly encouraged to operate a single hotkey", that "submitting the same model outputs across multiple hotkeys will be treated as duplication", and that the one-hotkey-keeps-its-score leniency "should not be assumed in future cycles". Hotkeys under one coldkey were grouped together in that analysis. Nothing in this repository changes that policy; what follows only makes sure that hotkeys you do run never submit near-identical images.
+
+**Capacity.** Every validator queries every hotkey (the default `--neuron.sample_size` is 250 against 256 UIDs), so each hotkey receives the same 6–7 requests an hour. One FLUX.2 Klein attempt takes ~25 s on a 16 GB card, so a single GPU serves about 140 attempts an hour: enough for one hotkey with retries and polish, two hotkeys with first passes and some retries, and no more. Ten hotkeys need five or more GPUs for first-pass-only generation and about ten for the current quality.
+
+Three pieces make several hotkeys safe to run from this code:
+
+1. **A style profile per hotkey** (`MIID/miner/diversity.py`, on by default). Derived from the hotkey address: its own four indoor and four outdoor scenes, a preferred side for light and head turns, a warm or cool colour cast, a far-expression flavour and accessory colours, appended to the prompt as a short style clause. Two hotkeys therefore draw from different distributions, not just different seeds. `MIID_DIVERSITY=0` turns it off.
+2. **A shared sibling ledger** (`MIID/miner/sibling_registry.py`, `MIID_SIBLING_DIR`). Every attempt's 256-bit dHash and CLIP embedding are written to `<dir>/<challenge_id>/`; before a take is accepted it is compared with the other hotkeys' takes of the same slot, and one within `MIID_DUP_DHASH_BITS` (16) or at CLIP cosine `MIID_DUP_CLIP_COSINE` (0.99) or above is ranked as a miss and re-rolled with a hint to compose differently. Use a local directory when the hotkeys share a machine and a network mount when they do not. Archived variations sit 68–120 bits from their own seed image, so honest renders with fresh seeds never trip this; it exists to guarantee that.
+3. **GPU sharing between processes** (`MIID_GPU_LOCK_DIR`). Each hotkey runs its own `neurons/miner.py`; with this set they take turns on the GPU through a file lock and see each other's queued requests, so one process's retries and polish yield to another process's waiting validator. The voice models are parked in CPU memory after each request already; the idle GPU footprint per process is the CUDA context, the VAE and the face models, about 1 GB.
+
+Example with pm2, one process per hotkey, distinct axon ports:
+
+```bash
+export MIID_SIBLING_DIR=/workspace/miid_shared/siblings
+export MIID_GPU_LOCK_DIR=/workspace/miid_shared/gpu
+for i in 0 1; do
+  pm2 start bash --name "miid_miner_$i" -- -c "python neurons/miner.py --netuid 54 --subtensor.network finney \
+    --wallet.name my_coldkey --wallet.hotkey hotkey_$i --axon.port $((8092 + i)) --logging.debug"
+done
+```
+
+`scripts/miner/ecosystem.multi.example.js` is the same as a pm2 ecosystem file. Each process logs its profile at start (`diversity profile for 5Hpop...: side left, warm cast, ...`), the ledger path and the GPU sharing mode; a sibling collision shows as `near-identical to sibling 5Abc... attempt 1 (dHash 9 bits, CLIP cosine 0.994) — retrying at full strength with hints (duplicate: vary).`
+
 ---
 
 ## Dry Run: Check Your Miner Can Produce a Submission
@@ -395,7 +420,7 @@ and `pulid_flux2` are actually performing for you across rounds rather than gues
 |----------|-------------|---------|
 | `MIID_REQUEST_ARCHIVE` | Directory for records, used as given | `<repo>/miner_requests` |
 | `MIID_ARCHIVE_ENABLED` | Set to `0` to turn archiving off entirely | on |
-| `MIID_ARCHIVE_IMAGES` | Set to `1` to also keep the base image, both seeds and the generated variations | off |
+| `MIID_ARCHIVE_IMAGES` | Set to `1` to also keep the base image, both seeds, the generated variations, and the voice reference and clone WAVs (`media/voice_reference__<file>` and `media/voice_clone.wav`) | off |
 | `MIID_ARCHIVE_MAX_RECORDS` | Records kept before the oldest are pruned (`0` = unlimited) | 500 |
 | `MIID_ARCHIVE_RETENTION_HOURS` | Records older than this many hours are deleted when a new one is written (`0` = no age limit) | 24 |
 
@@ -483,7 +508,22 @@ Environment variables:
 | `FLUX_DEVICE` | Device for image generation (`cuda`, `mps`, or `cpu`) | `cpu` |
 | `MIID_MODEL` | Force `flux_klein`, `flux_kontext`, `pulid`, `pulid_flux2`, or `qwen` | `flux_klein` (the only model in the random pool) |
 | `MIID_INFERENCE_STEPS`, `MIID_GUIDANCE_SCALE` | Tune generation (see `MIID/miner/generate_variations.py`) | see code |
-| `MIID_IDENTITY_RETRIES` | Extra attempts per slot that misses the 0.6 identity target or its head-turn range | 2 |
+| `MIID_IDENTITY_RETRIES` | Extra attempts per slot that misses the 0.6 identity target or its head-turn range | 3 |
+| `MIID_IDENTITY_GOAL` | Identity a slot that already meets its targets is polished toward: while no other request is queued, it is re-rolled at full edit strength and a higher-identity take is kept **only if every measured edit (head turn, lighting, expression, scene, accessory) is at least as strong as the incumbent's** — a higher-identity take is usually a weaker edit, and the validator ranks on the edit first, identity second | 0.85 |
+| `MIID_POLISH_ATTEMPTS` | Full-strength re-rolls allowed per satisfied slot (lowest identity first, after every rescue retry, never for `screen_replay`, never while another validator's request waits for the GPU); `0` disables polishing | 2 |
+| `MIID_EDIT_CHECK` | Measure every attempt's edit in-round — lighting magnitude on the face (the benchmark's formula), expression and accessory with CLIP on the head crop — rank takes on those measurements before identity, and re-roll gross misses with a hint (no lighting change, a far lighting request that reads light, a medium/far expression that reads neutral, a missing or wrong accessory). `0` disables the lighting, expression and accessory measurements | on |
+| `MIID_EXPR_NEUTRAL_PROB` | CLIP "neutral" probability above which a medium or far expression request counts as a miss | 0.6 |
+| `MIID_BG_CHECK` | Check every background attempt's scene with CLIP (the benchmark's own environment prompts) and re-roll it with a hint when it reads as the wrong kind of scene. `0` disables the check. (The earlier "plain studio backdrop" rule is gone: it fired on passport framing, not on blank backdrops, and only burned retries) | on |
+| `MIID_BG_CHECK_DEVICE` | Device for every CLIP check; CPU takes ~0.4 s per call and leaves the GPU to the image pipeline | `cpu` |
+| `MIID_BG_CLIP` | CLIP checkpoint for the checks (cached on first use, ~1.7 GB) | `openai/clip-vit-large-patch14` |
+| `MIID_BG_MISMATCH_PROB` | Probability at which the other kind of scene fails a background attempt | 0.5 |
+| `MIID_BG_CHECK_THREADS` | CPU threads for the CLIP forward | min(16, CPU quota) |
+| `MIID_DIVERSITY` | Give this hotkey its own style profile (scenes, side, colour cast, far-expression flavour, accessory colours) derived from its address, so several hotkeys do not draw from one distribution. See "Running several hotkeys" | on |
+| `MIID_SIBLING_DIR` | Directory shared by the hotkeys of one operator: every attempt's dHash and CLIP embedding are recorded per challenge, and a take near-identical to another hotkey's is re-rolled. Unset disables the ledger | unset |
+| `MIID_DUP_DHASH_BITS`, `MIID_DUP_CLIP_COSINE` | What counts as near-identical to a sibling's take: dHash within this many of 256 bits, or CLIP cosine at or above this | 16, 0.99 |
+| `MIID_SIBLING_TTL_HOURS` | Challenges older than this are pruned from the ledger | 24 |
+| `MIID_GPU_LOCK_DIR` | Directory through which several miner processes on one machine share the GPU (file lock) and see each other's queued requests | unset |
+| `MIID_TORCH_THREADS` | CPU threads torch may use in the miner process. Containers often advertise every host core while their cgroup quota is far lower, and an oversubscribed pool makes every CPU-side step crawl | the cgroup quota |
 | `MIID_GENERATION_BUDGET_SECONDS` | Upper bound on one request's generation; the request's own deadline usually binds first (see below) | 900 |
 | `MIID_DEADLINE_MARGIN_SECONDS` | Safety margin kept before the validator's timeout | 30 |
 

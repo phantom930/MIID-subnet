@@ -13,7 +13,8 @@
 #
 # Image bytes are NOT stored by default — a round's variations run to tens of
 # megabytes and the miner answers a validator roughly hourly. Set
-# MIID_ARCHIVE_IMAGES=1 to keep them too.
+# MIID_ARCHIVE_IMAGES=1 to keep them too, along with the voice reference and
+# clone WAVs when a round carried a voice request.
 #
 # Records older than 24 hours are deleted whenever a new one is written
 # (MIID_ARCHIVE_RETENTION_HOURS; 0 keeps them until the record cap).

@@ -18,9 +18,11 @@ from PIL import Image
 from MIID.miner.generate_variations import (
     SCREEN_REPLAY_TYPE,
     active_model_key,
+    canonical_variation_type,
     generate_one,
     get_selected_model_info,
-    requested_pose_level,
+    requested_accessory,
+    requested_levels,
 )
 from MIID.miner.ada_face_compare import (
     embed_image,
@@ -29,6 +31,20 @@ from MIID.miner.ada_face_compare import (
     similarity_to_embedding,
     validate_single_variation,
 )
+from MIID.miner.background_check import (
+    background_miss,
+    describe as describe_environment,
+    environment_probs,
+    wanted_environment,
+)
+from MIID.miner.edit_check import (
+    base_context as edit_base_context,
+    describe as describe_edit,
+    measure as measure_edit,
+    misses as edit_misses,
+    preserved as edit_preserved,
+)
+from MIID.miner import sibling_registry as siblings
 
 
 # AdaFace similarity a variation should reach before it is accepted as-is.
@@ -38,10 +54,31 @@ from MIID.miner.ada_face_compare import (
 IDENTITY_TARGET = float(os.environ.get("MIID_IDENTITY_TARGET", "0.6"))
 
 # Extra attempts per variation when the first one misses IDENTITY_TARGET.
-# Two, because ~14% of archived slots still landed under 0.6 after one retry,
-# and such a slot scores 0 whenever it is the one the validator samples.
-# Whether they run is a question of time: see generate_variations.
-IDENTITY_RETRIES = int(os.environ.get("MIID_IDENTITY_RETRIES", "2"))
+# Three: over 128 archived rounds (2026-10-12/13) the retry loop stopped on
+# "attempts used up" more often than on "every slot met its targets" (76 vs
+# 67) while the deadline never bound once, and a tenth of the
+# pose+expression slots still shipped under 0.6 — a slot that scores 0
+# whenever it is the one the validator samples. Whether they run is a
+# question of time: see generate_variations.
+IDENTITY_RETRIES = int(os.environ.get("MIID_IDENTITY_RETRIES", "3"))
+
+# Identity worth polishing toward once a slot already clears the target.
+# The validator ranks miners by validation score and breaks ties on identity
+# preservation, so between two miners whose edits both grade 5 the higher
+# AdaFace similarity ranks higher. The first-attempt identity of a slot
+# scatters with sd ≈ 0.05 (128 archived rounds), so re-rolling a satisfied
+# slot at full edit strength can lift its identity — but the higher-identity
+# take of two is usually the weaker edit, and choosing on identity alone
+# (2026-10-13 19:49 to 2026-10-14) pulled the validation score down while
+# winning only 2 of 22 polish attempts. A polish take is therefore kept only
+# if every measured edit — head turn, lighting, expression, scene, accessory
+# (edit_check.preserved) — is at least as strong as the incumbent's, and
+# polishing runs only while no other validator's request waits for the GPU
+# (one waited 204 s behind eight polish attempts). Lowest-identity slot
+# first, after every rescue retry, stopping at the goal.
+# MIID_POLISH_ATTEMPTS=0 switches it off.
+IDENTITY_GOAL = float(os.environ.get("MIID_IDENTITY_GOAL", "0.85"))
+POLISH_ATTEMPTS = int(os.environ.get("MIID_POLISH_ATTEMPTS", "2"))
 
 # Upper bound on one request's generation, retries included, counted from the
 # start of generation. The binding limit is usually the request's own
@@ -61,7 +98,14 @@ GENERATION_BUDGET_SECONDS = float(
 # identity. An attempt outside its range is retried at full edit strength
 # (the face held; the turn did not), budget permitting, and the closest
 # attempt that clears the identity target wins.
-POSE_RANGE_DEG = {"light": (6.0, 30.0), "medium": (15.0, 45.0), "far": (24.0, 180.0)}
+#
+# Light and medium floors raised from 6° / 15° on 2026-10-13: with those,
+# the offline benchmark (MediaPipe head pose) still measured 13 of 32 "light"
+# slots and 5 of 33 "medium" slots under 7°, i.e. no visible turn at all —
+# and two of that day's four real -1 grades fell on combined slots with a
+# "light" pose component. The far floor stays: the same grader gave 5 to
+# ~30° "far" turns, and pushing further costs identity.
+POSE_RANGE_DEG = {"light": (10.0, 30.0), "medium": (20.0, 45.0), "far": (24.0, 180.0)}
 
 
 def decode_base_image(base64_image: str) -> Image.Image:
@@ -187,13 +231,32 @@ _IDENTITY_RETRY_ODDS = (
     (0.00, 0.33, 0.22),
 )
 # Retry priority, part 2: what a successful retry is worth relative to an
-# identity rescue. A head turn outside its range costs at most a partial
-# match, and the grader has been lenient on angle; the screen_replay slot is
-# ignored by the grading API (validator image_variations.py) and has never
-# missed the identity target anyway.
+# identity rescue. A head turn, lighting change or expression outside its
+# level costs at most a partial match, and the grader has been lenient on
+# angle; the screen_replay slot is ignored by the grading API (validator
+# image_variations.py) and has never missed the identity target anyway.
 POSE_RETRY_ODDS = 0.5
 POSE_RETRY_WEIGHT = 0.3
 SCREEN_REPLAY_RETRY_WEIGHT = 0.25
+# A background slot whose scene read as the wrong kind, or whose accessory
+# is missing or something else, is a -1 or 0 against a possible 5 — a bigger
+# swing than a partial match — so it outranks a pose retry and sits level
+# with a near identity miss. The hint names the failure to avoid.
+BACKGROUND_RETRY_ODDS = 0.6
+BACKGROUND_RETRY_WEIGHT = 0.8
+
+# Estimated validation-score cost of each kind of measured miss, used to rank
+# the takes of one slot against each other (see _Slot.record): a wrong scene
+# or accessory on a background slot is the difference between a 5 and a -1
+# or 0; a head turn, lighting change or expression outside its level is a
+# partial match, a 3 against a 5. Any miss outranks any identity margin: the
+# validator scores the edit first and breaks ties on identity.
+MISS_PENALTY: Dict[str, float] = {
+    "scene": 6.0, "accessory": 5.0, "pose": 2.0, "lighting": 2.0, "expression": 2.0,
+    # Near-identical to another hotkey's take (sibling_registry): the grader's
+    # duplicate penalty is -3 to -5 and can watchlist every hotkey involved.
+    "duplicate": 6.0,
+}
 
 # Seconds one generate + score cycle takes, until this process has measured
 # its own (median of recent non-first attempts; FLUX.2 Klein on the 16 GB card
@@ -225,37 +288,101 @@ class _Slot:
     def __init__(self, index: int, req: Any):
         self.index = index
         self.req = req
-        self.pose_level = requested_pose_level(req)
+        self.levels = requested_levels(req)
+        self.pose_level = self.levels.get("pose_edit")
         self.screen_replay = _is_screen_replay(req)
+        # Keyed on the canonical type: a generic "background_edit" request is
+        # still a background slot, resolved to in/out from its description.
+        self.scene = wanted_environment(canonical_variation_type(req))
+        self.background = self.scene is not None
+        self.accessory = requested_accessory(req) if self.background else None
         self.best: Optional[Dict] = None
         self.best_key: Optional[Tuple] = None
         self.generated = 0
+        self.polished = 0
         self.identity_misses = 0
         self.identity_ok = False
         self.pose_miss = 0.0
         self.pose_direction: Optional[str] = None
+        self.bg_miss: Optional[str] = None
+        self.edit_misses: List[Tuple[str, str]] = []
+        # The sibling take this one is near-identical to, when it is.
+        self.dup: Optional[Dict] = None
 
     @property
     def satisfied(self) -> bool:
-        return self.best is not None and self.identity_ok and self.pose_miss == 0.0
+        return (
+            self.best is not None and self.identity_ok
+            and self.pose_miss == 0.0 and self.bg_miss is None
+            and not self.edit_misses and self.dup is None
+        )
+
+    def snapshot(self) -> Tuple:
+        """The current best take and its judgement, for restore()."""
+        return (
+            self.best, self.best_key, self.identity_ok, self.pose_miss,
+            self.pose_direction, self.bg_miss, list(self.edit_misses), self.dup,
+        )
+
+    def restore(self, snapshot: Tuple) -> None:
+        """Put a snapshot() back as the best take (a polish take that lost an edit)."""
+        (
+            self.best, self.best_key, self.identity_ok, self.pose_miss,
+            self.pose_direction, self.bg_miss, self.edit_misses, self.dup,
+        ) = snapshot
+
+    def polish_priority(self, goal: float, polish_allowed: int) -> Optional[float]:
+        """Identity headroom a full-strength re-roll could still close, or None.
+
+        Only a slot that already meets its targets is polished — an unsatisfied
+        one is the rescue loop's business — and only while it is short of the
+        goal. screen_replay is skipped: the grading API ignores that slot.
+        """
+        if self.best is None or not self.satisfied or self.screen_replay:
+            return None
+        if self.polished >= polish_allowed:
+            return None
+        similarity = self.best["identity_similarity"]
+        if similarity is None or similarity >= goal:
+            return None
+        return goal - similarity
 
     def record(self, result: Dict, target: float) -> None:
         """Score one attempt and keep it if it is the best so far.
 
         Rank: clearing the identity target first (under it the grade is capped
-        whatever the edit), then the head turn's distance from its range, then
-        similarity. A variation AdaFace cannot read a face in (None) is the
-        worst outcome there is — the grading API scores it 0 for identity — so
-        it ranks below every scored one.
+        whatever the edit), then the estimated validation-score cost of every
+        measured miss — a head turn outside its range, a background slot
+        showing the wrong kind of scene or missing its accessory, a lighting
+        change or expression that reads a level short (MISS_PENALTY) — and
+        only then similarity. A variation AdaFace cannot read a face in
+        (None) is the worst outcome there is — the grading API scores it 0
+        for identity — so it ranks below every scored one.
         """
         similarity = result["identity_similarity"]
         identity_ok = similarity is not None and similarity >= target
         miss, direction = _pose_miss(self.pose_level, result.get("pose_yaw"))
+        bg_miss = (
+            background_miss(result["variation_type"], result.get("environment"))
+            if self.background else None
+        )
+        misses = edit_misses(self.levels, result.get("edit"))
+        sibling = result.get("sibling")
+        dup = sibling if sibling and sibling.get("too_close") else None
+        penalty = 0.0
+        if miss:
+            penalty += MISS_PENALTY["pose"] + miss / 45.0
+        if bg_miss:
+            penalty += MISS_PENALTY["scene"]
+        for component, _ in misses:
+            penalty += MISS_PENALTY[component]
+        if dup:
+            penalty += MISS_PENALTY["duplicate"]
         if not identity_ok:
             self.identity_misses += 1
         key = (
             identity_ok,
-            -miss if identity_ok else 0.0,
+            -penalty if identity_ok else 0.0,
             -1.0 if similarity is None else similarity,
         )
         if self.best is None or key > self.best_key:
@@ -263,12 +390,20 @@ class _Slot:
             self.identity_ok, self.pose_miss, self.pose_direction = (
                 identity_ok, miss, direction,
             )
+            self.bg_miss = bg_miss
+            self.edit_misses = misses
+            self.dup = dup
 
     def retry_priority(self, attempts_allowed: int) -> Optional[float]:
         """Expected value of one more attempt, or None if it needs none."""
         if self.best is None or self.satisfied or self.generated >= attempts_allowed:
             return None
-        if self.identity_ok:
+        if self.identity_ok and (
+            self.bg_miss is not None or self.dup is not None
+            or any(component == "accessory" for component, _ in self.edit_misses)
+        ):
+            value = BACKGROUND_RETRY_ODDS * BACKGROUND_RETRY_WEIGHT
+        elif self.identity_ok:
             value = POSE_RETRY_ODDS * POSE_RETRY_WEIGHT
         else:
             similarity = self.best["identity_similarity"]
@@ -281,27 +416,69 @@ class _Slot:
             value *= SCREEN_REPLAY_RETRY_WEIGHT
         return value
 
-    def next_settings(self) -> Tuple[float, Optional[str]]:
-        """(identity_bias, pose_hint) for the next attempt.
+    def next_settings(self) -> Tuple[float, Dict[str, str]]:
+        """(identity_bias, hints by component) for the next attempt.
 
-        An identity miss holds the edit back, more with each miss; a head turn
-        outside its range re-rolls at full strength with a nudge in the right
-        direction (the face held; the turn did not).
+        An identity miss holds the edit back, more with each miss; a measured
+        miss of the edit — head turn, scene, lighting, expression, accessory
+        — re-rolls at full strength with a hint naming it (the face held; the
+        edit did not).
         """
-        if self.identity_ok:
-            return 0.0, self.pose_direction
-        return min(0.8, 0.4 * self.identity_misses), None
+        if not self.identity_ok:
+            return min(0.8, 0.4 * self.identity_misses), {}
+        hints: Dict[str, str] = {}
+        if self.pose_direction:
+            hints["pose"] = self.pose_direction
+        if self.bg_miss:
+            hints["background"] = self.bg_miss
+        for component, hint in self.edit_misses:
+            hints[component] = hint
+        if self.dup:
+            hints["duplicate"] = "vary"
+        return 0.0, hints
 
     def reason(self, target: float) -> str:
-        if self.identity_ok:
+        if not self.identity_ok:
+            similarity = self.best["identity_similarity"]
+            shown = "no face detected" if similarity is None else f"{similarity:.3f}"
+            return f"identity {shown} < {target}"
+        parts = []
+        if self.dup:
+            parts.append(
+                f"near-identical to {siblings.Match(**{k: self.dup[k] for k in ('hotkey', 'variation_type', 'attempt', 'bits', 'cosine')}).describe()}"
+            )
+        if self.bg_miss is not None:
+            parts.append(
+                f"background reads as an {self.bg_miss} scene, {self.scene} scene requested "
+                f"({describe_environment(self.best['variation_type'], self.best.get('environment'))})"
+            )
+        if self.pose_miss:
             low, high = POSE_RANGE_DEG[self.pose_level]
-            return (
+            parts.append(
                 f"head turn {self.best['pose_yaw']:.0f}° outside the "
                 f"{self.pose_level} range {low:.0f}–{high:.0f}°"
             )
-        similarity = self.best["identity_similarity"]
-        shown = "no face detected" if similarity is None else f"{similarity:.3f}"
-        return f"identity {shown} < {target}"
+        edit = self.best.get("edit") or {}
+        for component, hint in self.edit_misses:
+            if component == "lighting":
+                m = edit["lighting"]
+                parts.append(
+                    f"lighting change reads {m['level']} ({m['magnitude']:.2f}), "
+                    f"{self.levels.get('lighting_edit')} requested"
+                )
+            elif component == "expression":
+                m = edit["expression"]
+                parts.append(
+                    f"expression still reads neutral ({m['neutral']:.2f}), "
+                    f"{self.levels.get('expression_edit')} requested"
+                )
+            elif component == "accessory":
+                m = edit["accessory"]
+                parts.append(
+                    f"accessory {m['requested']} {hint} (read as {m['top']} "
+                    f"{m['top_confidence']:.2f})"
+                )
+        return "; ".join(parts) or "edit measured short"
 
 
 def generate_variations(
@@ -313,6 +490,9 @@ def generate_variations(
     subject_gender: Optional[str] = None,
     deadline: Optional[float] = None,
     retry_cutoff_fn: Optional[Callable[[], Optional[float]]] = None,
+    identity_goal: Optional[float] = None,
+    polish_attempts: Optional[int] = None,
+    sibling: Optional[siblings.Context] = None,
 ) -> List[Dict]:
     """Generate image variations from a base image (see generate_variations.py).
 
@@ -321,13 +501,18 @@ def generate_variations(
     model gets the base image and a prompt built from the request's type,
     intensity, description and detail -> one variation image per request.
 
-    Two phases. First every slot gets one attempt (screen_replay last), each
+    Three phases. First every slot gets one attempt (screen_replay last), each
     scored against the base face with AdaFace and, for pose slots, a head-turn
     estimate. Then whatever time is left goes to retries, one at a time, always
     on the slot where one more attempt is most likely to pay: a near identity
     miss before a distant one, any identity miss before a head turn out of
     range (see _Slot.retry_priority). An identity retry holds the edit back; a
-    head-turn retry re-rolls at full strength. The best attempt per slot wins.
+    head-turn retry re-rolls at full strength. Last, time permitting, slots
+    that already meet their targets but sit under ``identity_goal`` are
+    re-rolled at full strength, lowest identity first, up to
+    ``polish_attempts`` times each (see _Slot.polish_priority) — the ranking
+    tiebreaker is identity preservation, so a higher-identity take of the same
+    edit is worth the time. The best attempt per slot wins throughout.
 
     Time limits, all wall-clock (time.time()):
 
@@ -356,6 +541,15 @@ def generate_variations(
             gender-appropriate religious head covering (see generate_one).
         deadline: Wall-clock time generation must end by, or None.
         retry_cutoff_fn: Returns an extra wall-clock cap on retries, or None.
+        identity_goal: AdaFace similarity above which a satisfied slot is left
+            alone. Defaults to IDENTITY_GOAL.
+        polish_attempts: Full-strength re-rolls allowed per satisfied slot.
+            Defaults to POLISH_ATTEMPTS; 0 disables polishing.
+        sibling: This hotkey's view of the challenge in the sibling ledger
+            (sibling_registry.context), or None. With it, every attempt is
+            compared with the other hotkeys' takes of the same slot, a
+            near-identical one is re-rolled, and each attempt is recorded for
+            the siblings to steer away from.
 
     Returns:
         List of dicts, each containing:
@@ -377,6 +571,8 @@ def generate_variations(
     target = IDENTITY_TARGET if identity_target is None else identity_target
     retries = IDENTITY_RETRIES if max_retries is None else max_retries
     budget = GENERATION_BUDGET_SECONDS if time_budget is None else time_budget
+    goal = IDENTITY_GOAL if identity_goal is None else identity_goal
+    polish_allowed = POLISH_ATTEMPTS if polish_attempts is None else polish_attempts
     started = time.time()
     budget_end = started + budget
 
@@ -393,29 +589,63 @@ def generate_variations(
     # different matter — see _Slot.record.
     attempts_allowed = (retries + 1) if base_embedding is not None else 1
     base_yaw = _base_yaw(base_image)
+    try:
+        edit_context = edit_base_context(base_image)
+    except Exception as e:
+        bt.logging.warning(f"Edit measurements unavailable ({e}); takes are ranked on identity and pose only.")
+        edit_context = {}
 
     slots = [_Slot(i, req) for i, req in enumerate(variation_requests)]
     first_attempt = [True]
 
-    def run_attempt(slot: _Slot, identity_bias: float, pose_hint: Optional[str]) -> None:
+    def run_attempt(
+        slot: _Slot, identity_bias: float, hints: Optional[Dict[str, str]] = None,
+    ) -> None:
         cycle_started = time.time()
         result = generate_one(
             base_image, slot.req, model_key=model_info["key"],
             attempt=slot.generated, subject_gender=subject_gender,
-            identity_bias=identity_bias, pose_hint=pose_hint,
+            identity_bias=identity_bias, hints=hints,
         )
+        generated_at = time.time()
         slot.generated += 1
         result["identity_similarity"] = _similarity(base_embedding, result["image"])
+        identity_at = time.time()
         result["pose_yaw"] = (
             _yaw(base_yaw, result["image"]) if slot.pose_level else None
         )
+        result["environment"] = (
+            environment_probs(result["image"]) if slot.background else None
+        )
+        try:
+            result["edit"] = measure_edit(edit_context, result["image"], slot.levels, slot.accessory)
+        except Exception as e:
+            bt.logging.warning(f"Edit measurement failed: {e}")
+            result["edit"] = None
+        result["sibling"] = None
+        if sibling is not None and not slot.screen_replay:
+            try:
+                fingerprint = siblings.fingerprint(result["image"])
+                match = sibling.closest(result["variation_type"], fingerprint)
+                result["sibling"] = match.as_dict() if match else None
+                sibling.register(result["variation_type"], slot.generated, fingerprint)
+            except Exception as e:
+                bt.logging.warning(f"Sibling ledger failed: {e}")
+        checked_at = time.time()
         result["winning_attempt"] = slot.generated
         # The request's first cycle carries warm-up (pipeline load, offload
         # hooks) and would overstate every later one.
         if not first_attempt[0]:
-            _recent_cycles.append(time.time() - cycle_started)
+            _recent_cycles.append(checked_at - cycle_started)
         first_attempt[0] = False
         slot.record(result, target)
+        measured = describe_edit(result.get("edit"))
+        bt.logging.debug(
+            f"{result['variation_type']}: attempt {slot.generated} — generate "
+            f"{generated_at - cycle_started:.1f}s, identity {identity_at - generated_at:.1f}s, "
+            f"checks {checked_at - identity_at:.1f}s"
+            + (f"; {measured}" if measured else "")
+        )
 
     # ── phase 1: one attempt per slot ──
     skipped = []
@@ -432,6 +662,20 @@ def generate_variations(
             "— submitting the rest on time instead of everything late."
         )
 
+    def next_cutoff() -> Tuple[float, str]:
+        """(wall-clock cap on the next attempt, what imposes it)."""
+        cutoffs = [budget_end] + ([deadline] if deadline is not None else [])
+        queue_cap = retry_cutoff_fn() if retry_cutoff_fn else None
+        if queue_cap is not None:
+            cutoffs.append(queue_cap)
+        cutoff = min(cutoffs)
+        reason = (
+            "a queued request's turn" if queue_cap is not None and cutoff == queue_cap
+            else "the deadline" if deadline is not None and cutoff == deadline
+            else "the time budget"
+        )
+        return cutoff, reason
+
     # ── phase 2: retries, most valuable first, while time allows ──
     retries_run = 0
     stop_reason = "every slot met its targets"
@@ -444,17 +688,8 @@ def generate_variations(
             if any(not s.satisfied for s in slots if s.best is not None):
                 stop_reason = "attempts used up"
             break
-        cutoffs = [budget_end] + ([deadline] if deadline is not None else [])
-        queue_cap = retry_cutoff_fn() if retry_cutoff_fn else None
-        if queue_cap is not None:
-            cutoffs.append(queue_cap)
-        cutoff = min(cutoffs)
+        cutoff, stop_reason = next_cutoff()
         if time.time() + cycle_estimate() > cutoff:
-            stop_reason = (
-                "a queued request's turn" if queue_cap is not None and cutoff == queue_cap
-                else "the deadline" if deadline is not None and cutoff == deadline
-                else "the time budget"
-            )
             for _, slot in candidates:
                 bt.logging.warning(
                     f"{slot.best['variation_type']}: {slot.reason(target)}, but a "
@@ -464,14 +699,74 @@ def generate_variations(
                 )
             break
         _, slot = max(candidates, key=lambda c: (c[0], -c[1].index))
-        identity_bias, pose_hint = slot.next_settings()
+        identity_bias, hints = slot.next_settings()
         plan = (
-            f"retrying at full strength, turn {pose_hint}." if slot.identity_ok
+            "retrying at full strength with hints ("
+            + ", ".join(f"{component}: {hint}" for component, hint in hints.items())
+            + ")."
+            if slot.identity_ok and hints
+            else "retrying at full strength." if slot.identity_ok
             else "retrying with the edit held back."
         )
         bt.logging.info(f"{slot.best['variation_type']}: {slot.reason(target)} — {plan}")
-        run_attempt(slot, identity_bias, pose_hint)
+        run_attempt(slot, identity_bias, hints)
         retries_run += 1
+
+    # ── phase 3: polish — full-strength re-rolls of satisfied slots, while time allows ──
+    polish_run = 0
+    polish_kept = 0
+    polish_stop = "every slot at the goal or polished out"
+    while polish_allowed > 0:
+        candidates = [
+            (headroom, slot) for slot in slots
+            if (headroom := slot.polish_priority(goal, polish_allowed)) is not None
+        ]
+        if not candidates:
+            polish_stop = "every slot at the goal or polished out"
+            break
+        # Polish is surplus work: another validator's queued request is worth
+        # more than a tiebreak here, so hand the GPU over as soon as one waits.
+        if retry_cutoff_fn is not None and retry_cutoff_fn() is not None:
+            polish_stop = "a queued request"
+            bt.logging.info(
+                f"Polish: {len(candidates)} slot(s) under identity {goal:.2f}, but "
+                "another request is waiting for the GPU — keeping the best attempts."
+            )
+            break
+        cutoff, polish_stop = next_cutoff()
+        if time.time() + cycle_estimate() > cutoff:
+            bt.logging.info(
+                f"Polish: {len(candidates)} slot(s) under identity {goal:.2f}, but an "
+                f"attempt needs ~{cycle_estimate():.0f}s and only "
+                f"{max(0.0, cutoff - time.time()):.0f}s remain before {polish_stop} "
+                "— keeping the best attempts."
+            )
+            break
+        _, slot = max(candidates, key=lambda c: (c[0], -c[1].index))
+        incumbent = slot.snapshot()
+        before = incumbent[0]["identity_similarity"]
+        slot.polished += 1
+        # Full strength, no hints: the edit landed, only the face is being
+        # re-rolled. _Slot.record adopts the new take if it ranks higher —
+        # and then it stays only if it kept every measured edit of the one it
+        # replaced, because a higher-identity take is usually a weaker edit.
+        run_attempt(slot, 0.0, None)
+        polish_run += 1
+        if slot.best is incumbent[0]:
+            verdict = "kept the earlier take"
+        else:
+            kept, lost = edit_preserved(slot.levels, incumbent[0], slot.best, slot.scene)
+            if kept:
+                polish_kept += 1
+                verdict = "kept the new take"
+            else:
+                slot.restore(incumbent)
+                verdict = f"kept the earlier take: the new one weakened the {lost}"
+        after = slot.best["identity_similarity"]
+        bt.logging.info(
+            f"{slot.best['variation_type']}: polish {slot.polished}/{polish_allowed} — "
+            f"identity {before:.3f} → {after:.3f} ({verdict})"
+        )
 
     # ── assemble, in request order ──
     variations = []
@@ -494,8 +789,14 @@ def generate_variations(
             "identity_similarity": best_similarity,
             "attempts": slot.generated,
             "winning_attempt": best["winning_attempt"],
+            "environment": best.get("environment"),
+            "pose_yaw": best.get("pose_yaw"),
+            "edit": best.get("edit"),
+            "sibling": best.get("sibling"),
         })
 
+        environment = describe_environment(var_type, best.get("environment"))
+        measured = describe_edit(best.get("edit"))
         bt.logging.info(
             f"Generated {var_type} variation "
             f"(identity="
@@ -504,6 +805,9 @@ def generate_variations(
                 f", head turn {best['pose_yaw']:.0f}° for {slot.pose_level}"
                 if best.get("pose_yaw") is not None else ""
             )
+            + (f", background {environment}" if environment else "")
+            + (f", {measured}" if measured else "")
+            + (f", {slot.reason(target)}" if not slot.satisfied and slot.identity_ok else "")
             + f", kept attempt {best['winning_attempt']} of {slot.generated})"
             f", hash: {image_hash[:16]}..."
         )
@@ -511,7 +815,8 @@ def generate_variations(
     bt.logging.info(
         f"Generated {len(variations)} variations in {time.time() - started:.0f}s "
         f"(first pass {first_pass_seconds:.0f}s, {retries_run} retries, "
-        f"stopped: {stop_reason}; ~{cycle_estimate():.0f}s per attempt)"
+        f"stopped: {stop_reason}; {polish_run} polish attempts, {polish_kept} kept, "
+        f"stopped: {polish_stop}; ~{cycle_estimate():.0f}s per attempt)"
     )
     return variations
 

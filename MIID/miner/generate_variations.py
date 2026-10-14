@@ -345,19 +345,26 @@ def _resolve_accessory(accessory: str, subject_gender: Optional[str]) -> str:
 # guidance_scale (it is step-distilled), so wording is the only lever, and the
 # reference image pulls the head back toward frontal: across 145 archived
 # variations the measured yaw medians were 4° for "light" (asked ±15°), 19° for
-# "medium" (±30°) and 22° for "far" (>45°). Asking past the target lands in it.
+# "medium" (±30°) and 22° for "far" (>45°). Asking past the target lands in it
+# — but only about half-way: with "20 / 40 / 70 degrees" (2026-10-13, 100
+# slots) the medians were 11° / 21° / 30°, and 13 of 32 light slots turned
+# under 7°, which the benchmark bins as no pose change at all. Light and
+# medium now ask for roughly twice their target; far stays at 70°, since a
+# profile costs identity and its 30° already reads as a clear turn.
 # {side} is filled with left/right per generation.
 EDIT_PHRASES: Dict[Tuple[str, str], str] = {
     ("pose_edit", "light"): (
-        "Rotate the head about 20 degrees to the {side}: the nose points "
-        "clearly off-centre and one cheek shows more than the other, while "
-        "both eyes stay fully visible. The head must not face the camera "
-        "straight on."
+        "Rotate the head about 30 degrees to the {side}: the nose points "
+        "clearly off-centre, one cheek shows much more than the other and "
+        "the far ear disappears, while both eyes stay fully visible. The "
+        "head must not face the camera straight on — the turn has to be "
+        "obvious at a glance."
     ),
     ("pose_edit", "medium"): (
-        "Rotate the head about 40 degrees to the {side} into a clear "
-        "three-quarter view: the far cheek recedes, the far ear is hidden and "
-        "the nose overlaps the far cheek."
+        "Rotate the head about 50 degrees to the {side} into a strong "
+        "three-quarter view: the far cheek recedes, the far ear is hidden, "
+        "the nose overlaps the far cheek and the far eye sits close to the "
+        "edge of the face."
     ),
     ("pose_edit", "far"): (
         "Rotate the head 70 degrees to the {side} into a near-profile view: "
@@ -383,18 +390,24 @@ EDIT_PHRASES: Dict[Tuple[str, str], str] = {
         "faint, diffuse shadows form under the chin and along one side of the "
         "nose. The change must read as warmer light, not as a brighter image."
     ),
+    # Measured on 2026-10-13 (benchmark lighting magnitude, 71 slots): medium
+    # read as light on 19 of 34 and far as light or medium on 22 of 37, with
+    # left/right asymmetry the term that decides both. The shadow side is
+    # what has to deepen, so both phrases now say how dark it gets.
     ("lighting_edit", "medium"): (
         "Light the subject from one clear directional source on the {side}: "
         "that half of the face is lit and correctly exposed, with skin detail "
         "kept and no highlights clipped to white, while the other half falls "
-        "into a clearly visible shadow down the cheek, nose and jaw."
+        "into a distinctly darker shadow down the cheek, nose and jaw — the "
+        "two halves of the face must differ in brightness at a glance."
     ),
     ("lighting_edit", "far"): (
-        "Light the subject with a single hard off-axis source: deep, "
-        "high-contrast shadows across the face and a strong warm or cool "
-        "colour cast. The contrast comes from the depth of the shadows, not "
-        "from overexposure — the lit side keeps its skin detail and is never "
-        "blown out to white."
+        "Light the subject with a single hard off-axis source from the "
+        "{side}: the shadow side of the face goes nearly black, with a sharp "
+        "edge along the nose and cheek, and the whole image carries a strong "
+        "warm or cool colour cast. The contrast comes from the depth of the "
+        "shadows, not from overexposure — the lit side keeps its skin detail "
+        "and is never blown out to white."
     ),
     # "Faint, barely-there" landed on both sides of light: no change at all
     # on some rounds, a full smile on others. A named, closed-mouth smile is a
@@ -403,9 +416,15 @@ EDIT_PHRASES: Dict[Tuple[str, str], str] = {
         "Give the subject a small closed-mouth smile: the corners of the lips "
         "lifted, lips together with no teeth showing, and a relaxed brow."
     ),
+    # The validator's medium is "smile" between a slight smile and laughing,
+    # and the benchmark grades a smile by what the mouth does: teeth showing
+    # = medium. Offering "a serious set to the mouth" as an alternative read
+    # as no change — on 2026-10-14 four of eight single expression_edit
+    # (medium) slots graded "got light" and two "no variation detected".
     ("expression_edit", "medium"): (
-        "Give the subject a clearly changed expression — an open smile, a "
-        "serious set to the mouth, or mild surprise."
+        "Give the subject a clear, open smile with the teeth showing and the "
+        "cheeks lifted — unmistakably smiling, well beyond a slight "
+        "closed-mouth smile, but not laughing."
     ),
     ("expression_edit", "far"): (
         "Give the subject a pronounced expression — laughing with the mouth "
@@ -465,6 +484,81 @@ POSE_HINTS: Dict[str, str] = {
     "less": (
         "Keep the head turn modest — no more than the angle described, with "
         "the face still mostly toward the camera."
+    ),
+}
+
+# Appended on a retry after the background check (MIID/miner/background_check.py)
+# read an attempt's environment as the wrong kind of scene; keyed by what the
+# check saw, so the hint names the failure the model just produced.
+BACKGROUND_HINTS: Dict[str, str] = {
+    "indoor": (
+        "The previous attempt placed the subject indoors. This time the scene "
+        "behind the subject must be unmistakably outdoors: open sky or "
+        "daylight, trees, streets, buildings or landscape, with no walls, "
+        "ceilings or interior furniture anywhere in view."
+    ),
+    "outdoor": (
+        "The previous attempt placed the subject outdoors. This time the scene "
+        "behind the subject must be unmistakably indoors: a room with walls, "
+        "interior furniture or shelving and indoor lighting, with no sky, "
+        "trees or street anywhere in view."
+    ),
+}
+
+# Appended on a retry after edit_check measured the lighting change outside
+# the requested level (no measurable change, or a far request that read
+# light). The exposure guard of the lighting phrases still applies: more
+# contrast comes from the shadow side, never from a brighter lit side.
+LIGHT_HINTS: Dict[str, str] = {
+    "more": (
+        "The previous attempt's lighting change was too weak to notice: this "
+        "time the change must be obvious at a glance — a clearly directional "
+        "light with one side of the face in visibly deeper shadow and a "
+        "distinct warm or cool colour cast, while the lit side keeps its skin "
+        "detail and is never blown out."
+    ),
+    "less": (
+        "The previous attempt changed the lighting far too much: this time "
+        "keep the change subtle — the same overall exposure, only a gentle "
+        "shift in colour temperature and faint, soft shadows."
+    ),
+}
+
+# Appended on a retry after edit_check read a medium or far expression
+# request as still neutral.
+EXPRESSION_HINTS: Dict[str, str] = {
+    "more": (
+        "The previous attempt left the face neutral: this time the expression "
+        "must be unmistakable at a glance, with the mouth, cheeks, eyes and "
+        "brow all clearly engaged in it."
+    ),
+}
+
+# Appended on a retry after edit_check found the requested accessory missing
+# or read it as something else.
+ACCESSORY_HINTS: Dict[str, str] = {
+    "missing": (
+        "The previous attempt showed a bare head: this time the named item "
+        "must be clearly worn on the head and plainly visible, in a colour "
+        "that contrasts with the hair and background."
+    ),
+    "other": (
+        "The previous attempt showed a different kind of headwear: this time "
+        "draw exactly the named item, with its defining shape unmistakable, "
+        "and nothing else on the head."
+    ),
+}
+
+# Appended on a retry after the sibling ledger (MIID/miner/sibling_registry.py)
+# found the attempt near-identical to what another hotkey of the same
+# operator already produced for this slot. The edit stays; the composition
+# must not.
+DUPLICATE_HINTS: Dict[str, str] = {
+    "vary": (
+        "Compose this take differently from any previous one: a different "
+        "arrangement of the scene and its objects, a different colour palette "
+        "and light direction, and different clothing colours — while the "
+        "requested edit and the subject's identity stay exactly as described."
     ),
 }
 
@@ -838,13 +932,23 @@ def _split_components(var_type: str, raw_intensity: str) -> List[Tuple[str, str]
     ]
 
 
+def requested_levels(req: Any) -> Dict[str, str]:
+    """Component type -> intensity for a slot, e.g. {"lighting_edit": "far",
+    "pose_edit": "light"}. A background slot maps its canonical type."""
+    var_type = _req_field(req, "type")
+    canonical = _canonical_background_type(req, var_type) if var_type else var_type
+    return dict(_split_components(canonical, _req_field(req, "intensity")))
+
+
 def requested_pose_level(req: Any) -> Optional[str]:
     """The intensity a slot asks of its pose_edit component, or None."""
-    var_type = _req_field(req, "type")
-    for comp_type, level in _split_components(var_type, _req_field(req, "intensity")):
-        if comp_type == "pose_edit":
-            return level
-    return None
+    return requested_levels(req).get("pose_edit")
+
+
+def requested_accessory(req: Any) -> Optional[str]:
+    """The accessory key a background slot asks for (see edit_check), or None."""
+    from MIID.miner.edit_check import accessory_key
+    return accessory_key(_req_field(req, "detail"))
 
 
 def _effective_intensity(components: List[Tuple[str, str]]) -> str:
@@ -924,6 +1028,19 @@ def _soften(level: str) -> str:
     return _RANK_TO_INTENSITY[max(0, INTENSITY_RANK[level] - 1)]
 
 
+from MIID.miner.diversity import preferred_side, style_clause  # noqa: E402
+
+# The running hotkey's style profile (MIID/miner/diversity.py), installed by
+# the miner at startup. None leaves every choice to chance, which is what a
+# single hotkey wants.
+_PROFILE: Optional[Dict[str, Any]] = None
+
+
+def set_diversity_profile(profile: Optional[Dict[str, Any]]) -> None:
+    global _PROFILE
+    _PROFILE = profile
+
+
 def _edit_clause(
     components: List[Tuple[str, str]], identity_bias: float,
 ) -> Optional[str]:
@@ -935,8 +1052,9 @@ def _edit_clause(
     generates something rather than raising.
     """
     phrases = []
-    # One side per slot, so a pose turn and a directional light agree.
-    side = random.choice(("left", "right"))
+    # One side per slot, so a pose turn and a directional light agree; a
+    # hotkey with a profile leans to its own side (diversity.preferred_side).
+    side = preferred_side(_PROFILE)
     for comp_type, level in components:
         # A retry means the face already drifted past the identity floor, and
         # pose is what moves an embedding furthest — so give that component a
@@ -953,10 +1071,23 @@ def _edit_clause(
     return " ".join(phrases) if phrases else None
 
 
+def canonical_variation_type(req: Any) -> str:
+    """The slot type as the grader will see it (see _get_type_and_intensity).
+
+    A validator's generic ``background_edit`` becomes ``background_in`` or
+    ``background_out`` from its description, so a caller that keys behaviour
+    on the type — the background check in image_generator — sees the same
+    name the S3 key and the submission carry.
+    """
+    return _get_type_and_intensity(req)[0]
+
+
 def _get_prompt_from_request(
     req: Any, var_type: str, intensity: str, identity_bias: float = 0.0,
     subject_gender: Optional[str] = None,
     pose_hint: Optional[str] = None,
+    background_hint: Optional[str] = None,
+    hints: Optional[Dict[str, str]] = None,
 ) -> str:
     """Build the generation prompt from the protocol fields.
 
@@ -981,6 +1112,14 @@ def _get_prompt_from_request(
 
     ``pose_hint`` ("more" / "less") follows a measured head turn that missed
     the requested range, and pushes the next attempt the other way.
+
+    ``background_hint`` ("indoor" / "outdoor") follows a background attempt
+    whose environment read wrong, and names the failure to avoid.
+
+    ``hints`` carries any of these and more by component — ``pose``,
+    ``background``, ``lighting``, ``expression``, ``accessory`` — each a key
+    into the matching *_HINTS table (image_generator._Slot.next_settings).
+    The two named arguments are the older spelling of the first two.
     """
     description = _req_field(req, "description")
     detail = _req_field(req, "detail")
@@ -988,10 +1127,23 @@ def _get_prompt_from_request(
     if var_type == SCREEN_REPLAY_TYPE:
         return _screen_replay_prompt(description, detail, identity_bias)
 
+    merged = dict(hints or {})
+    if pose_hint:
+        merged.setdefault("pose", pose_hint)
+    if background_hint:
+        merged.setdefault("background", background_hint)
+
     components = _split_components(var_type, _req_field(req, "intensity"))
     written = _edit_clause(components, identity_bias)
-    if written is not None and pose_hint in POSE_HINTS:
-        written = f"{written} {POSE_HINTS[pose_hint]}"
+    if written is not None:
+        for component, table in (
+            ("pose", POSE_HINTS), ("background", BACKGROUND_HINTS),
+            ("lighting", LIGHT_HINTS), ("expression", EXPRESSION_HINTS),
+            ("accessory", ACCESSORY_HINTS), ("duplicate", DUPLICATE_HINTS),
+        ):
+            hint = merged.get(component)
+            if hint in table:
+                written = f"{written} {table[hint]}"
 
     parts = [
         FRAMING_CLAUSE,
@@ -1012,6 +1164,11 @@ def _get_prompt_from_request(
                 "This is the only accessory added — no other hat, scarf or "
                 "head covering — and the subject keeps their own clothing."
             )
+        # This hotkey's own scenes, cast and colours (diversity.py): after the
+        # edit, so it colours the choices without changing the instruction.
+        style = style_clause(_PROFILE, dict(components), accessory=bool(accessory))
+        if style:
+            parts.append(style)
     else:
         edit = ". ".join(
             _strip_requirements(p).rstrip(".")
@@ -1121,6 +1278,8 @@ def generate_one(
     subject_gender: Optional[str] = None,
     identity_bias: Optional[float] = None,
     pose_hint: Optional[str] = None,
+    background_hint: Optional[str] = None,
+    hints: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Generate a single variation for one validator request.
 
@@ -1140,6 +1299,10 @@ def generate_one(
             turn that fell short passes 0: the face held, the edit did not.
         pose_hint: "more" / "less" when an earlier attempt's measured head
             turn missed the requested range (see POSE_HINTS).
+        background_hint: "indoor" / "outdoor" when an earlier background
+            attempt's environment read wrong (see BACKGROUND_HINTS).
+        hints: Hints by component (pose, background, lighting, expression,
+            accessory) after measured misses; see _get_prompt_from_request.
 
     Returns:
         Dict with ``image``, ``variation_type``, ``model_key``, ``model_id``
@@ -1165,7 +1328,7 @@ def generate_one(
         identity_bias = min(0.8, 0.4 * attempt)
     prompt = _get_prompt_from_request(
         req, var_type, intensity, identity_bias, subject_gender=subject_gender,
-        pose_hint=pose_hint,
+        pose_hint=pose_hint, background_hint=background_hint, hints=hints,
     )
     seed = random.randint(0, 2**31 - 1)
     negative_prompt = (

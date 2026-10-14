@@ -376,13 +376,14 @@ _YAW_PER_EYE_SHIFT = 45.0
 _YAW_PER_MOUTH_SHIFT = 30.2
 
 
-def face_yaw_signature(image):
-    """A yaw signature for the largest face in ``image``, or None if no face.
+def face_geometry(image):
+    """(box, landmarks) of the largest face in ``image``, or None if no face.
 
-    Uses the five MTCNN landmarks the aligner already computes: where the nose
-    projects along the eye line (0 at one eye, 1 at the other) and along the
-    mouth line (relative to its centre). Only meaningful as a difference
-    between two images of the same face, which is how face_yaw_delta uses it.
+    ``box`` is (x0, y0, x1, y1) in pixels; ``landmarks`` a 5x2 array of
+    left eye, right eye, nose, left mouth corner, right mouth corner — the
+    five points MTCNN computes for the aligner anyway. Shared by the yaw
+    estimate below and the edit measurements in edit_check.py, so one
+    detection serves both.
     """
     if not isinstance(image, Image.Image):
         image = Image.open(image)
@@ -399,9 +400,29 @@ def face_yaw_signature(image):
     if len(landmarks) == 0:
         return None
     i = int(np.argmax([(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]))
-    xs, ys = landmarks[i][0:5], landmarks[i][5:10]
+    box = tuple(float(v) for v in boxes[i][:4])
+    points = np.stack([landmarks[i][0:5], landmarks[i][5:10]], axis=1).astype(np.float64)
+    return box, points
+
+
+def face_yaw_signature(image):
+    """A yaw signature for the largest face in ``image``, or None if no face.
+
+    Uses the five MTCNN landmarks the aligner already computes: where the nose
+    projects along the eye line (0 at one eye, 1 at the other) and along the
+    mouth line (relative to its centre). Only meaningful as a difference
+    between two images of the same face, which is how face_yaw_delta uses it.
+    """
+    geometry = face_geometry(image)
+    if geometry is None:
+        return None
+    return yaw_signature_from_landmarks(geometry[1])
+
+
+def yaw_signature_from_landmarks(points):
+    """The yaw signature of face_yaw_signature from a 5x2 landmark array."""
     left_eye, right_eye, nose, mouth_l, mouth_r = (
-        np.array([xs[j], ys[j]]) for j in range(5)
+        np.asarray(points[j], dtype=np.float64) for j in range(5)
     )
     eye_line = right_eye - left_eye
     mouth_line = mouth_r - mouth_l

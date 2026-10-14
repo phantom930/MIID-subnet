@@ -76,6 +76,22 @@ from MIID.miner.request_archive import (
 
 # One GPU shared by every validator's request: earliest deadline first.
 from MIID.miner.gpu_scheduler import SCHEDULER, queue_cutoff
+from MIID.miner.gpu_scheduler import describe as describe_gpu_sharing
+
+# Running several hotkeys (docs/miner.md, "Running several hotkeys"): a
+# per-hotkey style profile and a shared ledger that keeps sibling hotkeys
+# from submitting near-identical takes. Needs the image stack.
+try:
+    from MIID.miner import sibling_registry as _siblings
+    from MIID.miner.diversity import (
+        ENABLED as DIVERSITY_ENABLED,
+        describe as describe_profile,
+        profile_for,
+    )
+    from MIID.miner.generate_variations import set_diversity_profile
+    MULTI_HOTKEY_HELPERS = True
+except Exception:  # noqa: BLE001 — without the image stack there is nothing to profile
+    MULTI_HOTKEY_HELPERS = False
 
 # # --- PAUSED: real screen-replay paths (restore later) ---
 # # screen_replay.json lives under MIID/miner/real_image_miner_guide/. Miners fill
@@ -238,6 +254,15 @@ class Miner(BaseMinerNeuron):
 
         self.axon.verify_fns[IdentitySynapse.__name__] = self._verify_validator_request
 
+        # Several hotkeys of one operator: each gets its own style profile and
+        # they share a ledger of their takes, so no two submit near-duplicates.
+        if MULTI_HOTKEY_HELPERS:
+            profile = profile_for(self.wallet.hotkey.ss58_address) if DIVERSITY_ENABLED else None
+            set_diversity_profile(profile)
+            bt.logging.info(describe_profile(profile))
+            bt.logging.info(_siblings.describe())
+        bt.logging.info(describe_gpu_sharing())
+
         if PHASE4_AVAILABLE:
             bt.logging.info("Phase 4 image generation: ENABLED")
 
@@ -268,6 +293,25 @@ class Miner(BaseMinerNeuron):
                     bt.logging.info("CUDA device: (not available - using CPU/MPS)")
             except Exception as _e:
                 bt.logging.debug(f"Could not query CUDA device info: {_e}")
+
+            # torch sizes its CPU thread pool from the host's core count, but a
+            # container's cgroup quota can be far lower (128 advertised vs a
+            # 15.36-core quota here on 2026-10-13). Oversubscribed CPU work then
+            # crawls: a 0.4 s CLIP background check took 62 s. Cap the pool to
+            # the quota; MIID_TORCH_THREADS overrides.
+            try:
+                import torch as _torch
+                from MIID.miner.background_check import cpu_quota as _cpu_quota
+                _quota = _cpu_quota()
+                _want = int(os.environ.get("MIID_TORCH_THREADS", "0")) or _quota
+                if _torch.get_num_threads() > _want:
+                    _torch.set_num_threads(_want)
+                    bt.logging.info(
+                        f"CPU threads for torch: {_want} (host advertises "
+                        f"{os.cpu_count()}, cgroup quota {_quota})"
+                    )
+            except Exception as _e:
+                bt.logging.debug(f"Could not cap torch threads: {_e}")
 
             if not (os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")):
                 bt.logging.warning(
@@ -549,7 +593,9 @@ class Miner(BaseMinerNeuron):
             else:
                 voice_started = time.time()
                 try:
-                    voice_subs = self.process_voice_request(synapse)
+                    voice_subs = self.process_voice_request(
+                        synapse, save_dir=self._archive_voice_dir(record),
+                    )
                     if voice_subs:
                         bt.logging.info(f"Voice: Generated {len(voice_subs)} S3 submissions")
                     else:
@@ -633,6 +679,38 @@ class Miner(BaseMinerNeuron):
         except Exception as e:
             bt.logging.debug(f"request_archive: could not prepare media dir: {e}")
             return None
+
+    def _archive_voice_dir(self, record: Optional[dict]) -> Optional[str]:
+        """Media directory for this record's voice clips, or None.
+
+        Same MIID_ARCHIVE_IMAGES switch as the images: when it is on, the
+        reference WAV the validator sent and the clone that was generated are
+        written next to the variations by process_voice_request. The seeds
+        are not rewritten here — _archive_media_dir already did that.
+        """
+        if record is None or not archive_images_enabled():
+            return None
+        try:
+            target = media_dir(record, self.request_archive_dir)
+            return str(target) if target else None
+        except Exception as e:
+            bt.logging.debug(f"request_archive: could not prepare voice media dir: {e}")
+            return None
+
+    @staticmethod
+    def _archive_voice_clip(save_dir: Optional[str], name: str, data: bytes) -> None:
+        """Write one voice clip into the archive.
+
+        Never raises: archiving is bookkeeping and must not cost a submission.
+        """
+        if not save_dir or not data:
+            return
+        try:
+            safe = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in name)[:96]
+            with open(os.path.join(save_dir, safe), "wb") as f:
+                f.write(data)
+        except Exception as e:
+            bt.logging.debug(f"request_archive: could not save voice clip {name}: {e}")
 
     @staticmethod
     def _describe_screen_replay(submission: Optional[S3Submission]) -> dict:
@@ -789,7 +867,9 @@ class Miner(BaseMinerNeuron):
             retry_cutoff_fn=retry_cutoff_fn,
         )
 
-    def process_voice_request(self, synapse: IdentitySynapse) -> List[S3Submission]:
+    def process_voice_request(
+        self, synapse: IdentitySynapse, save_dir: Optional[str] = None,
+    ) -> List[S3Submission]:
         """
         Process a voice clone request end-to-end.
 
@@ -799,6 +879,11 @@ class Miner(BaseMinerNeuron):
 
         Args:
             synapse: IdentitySynapse with voice_request
+            save_dir: Optional directory for the unencrypted reference and
+                clone WAVs (set only when MIID_ARCHIVE_IMAGES is on). The clone
+                is written as soon as it is generated, so a clip that is then
+                dropped by the identity check or fails to upload is still
+                there to listen to.
 
         Returns:
             List of S3Submission objects (variation_type="voice")
@@ -813,6 +898,11 @@ class Miner(BaseMinerNeuron):
         try:
             bt.logging.info(f"Voice: Decoding base voice: {voice_request.voice_filename}")
             base_wav = decode_base_voice(voice_request.base_voice)
+            self._archive_voice_clip(
+                save_dir,
+                f"voice_reference__{voice_request.voice_filename or 'reference.wav'}",
+                base_wav,
+            )
 
             generated_wav = generate_voice_clone(
                 base_wav_bytes=base_wav,
@@ -825,6 +915,7 @@ class Miner(BaseMinerNeuron):
                     "Voice: generate_voice_clone returned None — no voice submission"
                 )
                 return []
+            self._archive_voice_clip(save_dir, "voice_clone.wav", generated_wav)
 
             if not validate_voice_identity(
                 base_wav, generated_wav, min_similarity=VOICE_MIN_SIMILARITY,

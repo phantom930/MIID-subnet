@@ -24,6 +24,7 @@ from MIID.miner.image_generator import (
     validate_face_variation,
 )
 from MIID.miner.generate_variations import subject_gender_from_filename
+from MIID.miner import sibling_registry
 from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
 from MIID.miner.s3_upload import upload_to_s3
 
@@ -218,6 +219,11 @@ def build_image_submissions(
             f"Phase 4: Generating {image_request.requested_variations} variations "
             f"(from validator: {[f'{v.type}({v.intensity})' for v in image_request.variation_requests]})"
         )
+        challenge_id = image_request.challenge_id or "sandbox_test"
+        # Sibling hotkeys of one operator share a ledger of their takes so none
+        # of them submits a near-duplicate of another (MIID_SIBLING_DIR).
+        sibling = sibling_registry.context(challenge_id, hotkey.ss58_address)
+
         generation_started = time.monotonic()
         variations = generate_variations(
             base_image,
@@ -226,6 +232,7 @@ def build_image_submissions(
             subject_gender=subject_gender_from_filename(image_request.image_filename),
             deadline=deadline,
             retry_cutoff_fn=retry_cutoff_fn,
+            sibling=sibling,
         )
         generation_seconds = time.monotonic() - generation_started
 
@@ -245,7 +252,6 @@ def build_image_submissions(
 
         s3_submissions: List[S3Submission] = []
         target_round = image_request.target_drand_round
-        challenge_id = image_request.challenge_id or "sandbox_test"
 
         # Generate path_signature once per challenge (prevents path hijacking)
         path_signature = build_path_signature(hotkey, challenge_id)
@@ -344,6 +350,10 @@ def build_image_submissions(
                             identity_similarity=similarity,
                             attempts=var.get("attempts"),
                             winning_attempt=var.get("winning_attempt"),
+                            environment=var.get("environment"),
+                            head_turn_deg=var.get("pose_yaw"),
+                            edit=var.get("edit"),
+                            sibling=var.get("sibling"),
                             bytes=len(encrypted_data))
                 else:
                     bt.logging.warning(
