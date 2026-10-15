@@ -11,6 +11,7 @@ import os
 import statistics
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import bittensor as bt
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 from PIL import Image
@@ -49,10 +50,17 @@ from MIID.miner import sibling_registry as siblings
 
 
 # AdaFace similarity a variation should reach before it is accepted as-is.
-# Matched to the validator's own identity gate (--neuron.quality_threshold,
-# default 0.6): a miner whose average identity preservation lands under that
-# is filtered out of the KAV ranking entirely, however good the images look.
-IDENTITY_TARGET = float(os.environ.get("MIID_IDENTITY_TARGET", "0.6"))
+# The validator's own identity gate is 0.6 (--neuron.quality_threshold): a
+# miner whose identity preservation lands under that is filtered out of the
+# KAV ranking entirely, however good the images look. But the gate is not
+# where the money is: only the top 50 of a graded round are paid, most
+# miners grade 5/5, and the 50th place was decided by identity at 0.79–0.93
+# on 2026-10-15 (see docs/miner.md, "Face blend"). 0.7 therefore: a slot
+# between 0.6 and 0.7 is rescued too (an attempt with the edit held back),
+# and between two takes of a slot the one over 0.7 wins before edit
+# strength is compared. Raised from 0.6 on 2026-10-15 at the user's request
+# to put identity first.
+IDENTITY_TARGET = float(os.environ.get("MIID_IDENTITY_TARGET", "0.7"))
 
 # Extra attempts per variation when the first one misses IDENTITY_TARGET.
 # Three: over 128 archived rounds (2026-10-12/13) the retry loop stopped on
@@ -395,6 +403,19 @@ class _Slot:
             self.edit_misses = misses
             self.dup = dup
 
+    def rerecord(self, result: Dict, target: float) -> None:
+        """Re-judge a take whose measurements changed after it was recorded
+        (a face blend that finished in the background raised its identity
+        and re-measured its edit). The best take is re-keyed in place; any
+        other take is simply recorded again and wins if it now ranks higher."""
+        if self.best is not result:
+            self.record(result, target)
+            return
+        self.best, self.best_key = None, None
+        misses_before = self.identity_misses
+        self.record(result, target)
+        self.identity_misses = misses_before
+
     def retry_priority(self, attempts_allowed: int) -> Optional[float]:
         """Expected value of one more attempt, or None if it needs none."""
         if self.best is None or self.satisfied or self.generated >= attempts_allowed:
@@ -611,9 +632,51 @@ def generate_variations(
     slots = [_Slot(i, req) for i, req in enumerate(variation_requests)]
     first_attempt = [True]
 
+    # Face blends are CPU work (a few seconds each) and the GPU would sit
+    # idle for them, so during the first pass they run in one worker thread
+    # while the next slot generates; each is settled — identity and edit
+    # re-measured, the take re-judged — before anything depends on it.
+    blend_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="face-blend")
+    pending: Dict[int, Tuple[Future, Dict]] = {}
+
+    def blend_job(slot: _Slot, result: Dict) -> Optional[Dict]:
+        try:
+            return face_blend.apply(
+                base_image, base_embedding, base_geometry, result,
+                edit_context=edit_context, levels=slot.levels,
+                accessory=slot.accessory, scene=slot.scene,
+            )
+        except Exception as e:
+            bt.logging.warning(f"Face blend failed: {e}")
+            return None
+
+    def log_blend(result: Dict) -> None:
+        blend = result.get("blend")
+        if blend and blend.get("applied"):
+            bt.logging.info(f"{result['variation_type']}: {face_blend.describe(blend)}, {blend['seconds']:.1f}s")
+        elif blend and blend.get("reason"):
+            bt.logging.debug(f"{result['variation_type']}: face blend skipped — {blend['reason']}")
+
+    def settle(slot: _Slot) -> None:
+        """Wait for the slot's deferred blend, if any, and re-judge the take."""
+        entry = pending.pop(slot.index, None)
+        if entry is None:
+            return
+        future, result = entry
+        result["blend"] = future.result()
+        if result["blend"] and result["blend"].get("applied"):
+            slot.rerecord(result, target)
+        log_blend(result)
+
+    def settle_all() -> None:
+        for slot in slots:
+            settle(slot)
+
     def run_attempt(
         slot: _Slot, identity_bias: float, hints: Optional[Dict[str, str]] = None,
+        defer_blend: bool = False,
     ) -> None:
+        settle(slot)
         cycle_started = time.time()
         result = generate_one(
             base_image, slot.req, model_key=model_info["key"],
@@ -635,19 +698,18 @@ def generate_variations(
         except Exception as e:
             bt.logging.warning(f"Edit measurement failed: {e}")
             result["edit"] = None
-        # A background take short of the blend goal gets the base face blended
-        # back in (face_blend): identity rises, the scene and accessory stay,
-        # and the take is re-measured so the ranking below sees the final image.
+        # A take short of the blend goal on a blendable slot gets the base
+        # face blended back in (face_blend): identity rises, the edit stays,
+        # and the take is re-measured so the ranking sees the final image.
+        # In the first pass this happens in the background (see settle).
         result["blend"] = None
+        deferred = False
         if face_blend.wanted(slot.background, result):
-            try:
-                result["blend"] = face_blend.apply(
-                    base_image, base_embedding, base_geometry, result,
-                    edit_context=edit_context, levels=slot.levels,
-                    accessory=slot.accessory, scene=slot.scene,
-                )
-            except Exception as e:
-                bt.logging.warning(f"Face blend failed: {e}")
+            if defer_blend:
+                pending[slot.index] = (blend_pool.submit(blend_job, slot, result), result)
+                deferred = True
+            else:
+                result["blend"] = blend_job(slot, result)
         result["sibling"] = None
         if sibling is not None and not slot.screen_replay:
             try:
@@ -673,12 +735,10 @@ def generate_variations(
             f"checks {checked_at - identity_at:.1f}s"
             + (f"; {measured}" if measured else "")
             + (f"; {blended}" if blended else "")
+            + ("; face blend running in the background" if deferred else "")
         )
-        blend = result.get("blend")
-        if blend and blend.get("applied"):
-            bt.logging.info(f"{result['variation_type']}: {blended}, {blend['seconds']:.1f}s")
-        elif blend and blend.get("reason"):
-            bt.logging.debug(f"{result['variation_type']}: face blend skipped — {blend['reason']}")
+        if not deferred:
+            log_blend(result)
 
     # ── phase 1: one attempt per slot ──
     skipped = []
@@ -686,7 +746,9 @@ def generate_variations(
         if deadline is not None and time.time() + cycle_estimate() > deadline:
             skipped.append(slot)
             continue
-        run_attempt(slot, 0.0, None)
+        run_attempt(slot, 0.0, None, defer_blend=True)
+    settle_all()
+    blend_pool.shutdown(wait=True)
     first_pass_seconds = time.time() - started
     if skipped:
         bt.logging.warning(

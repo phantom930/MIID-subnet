@@ -308,11 +308,14 @@ def measure(
     image: Image.Image,
     levels: Dict[str, str],
     accessory: Optional[str],
+    geometry: Optional[Tuple] = None,
 ) -> Dict[str, Any]:
     """Measure the edits a slot asks for on one attempt.
 
     Returns a dict with "lighting", "expression" and "accessory" entries (each
     None when not requested or not measurable) and the seconds each took.
+    ``geometry`` is the image's (box, landmarks) when the caller already has
+    it (a blended take keeps the landmarks of the take it came from).
     """
     out: Dict[str, Any] = {"lighting": None, "expression": None, "accessory": None, "seconds": {}}
     if not ENABLED or not context:
@@ -322,7 +325,8 @@ def measure(
     if not (wants_lighting or wants_expression or accessory):
         return out
     started = time.time()
-    geometry = face_geometry(image)
+    if geometry is None:
+        geometry = face_geometry(image)
     out["seconds"]["detect"] = round(time.time() - started, 2)
     if geometry is None:
         return out

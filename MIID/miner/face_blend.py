@@ -44,6 +44,13 @@ from PIL import Image
 
 from MIID.miner.ada_face_compare import face_geometry, similarity_to_embedding
 
+try:  # OpenCV grabs every advertised core by default; the miner shares a quota.
+    import cv2 as _cv2
+
+    _cv2.setNumThreads(int(os.environ.get("MIID_TORCH_THREADS", "4")))
+except Exception:
+    pass
+
 
 ENABLED = os.environ.get("MIID_FACE_BLEND", "1").strip().lower() not in ("0", "false", "no")
 # Identity a background take is blended toward; a take already there is left alone.
@@ -58,20 +65,47 @@ MAX_ALPHA = float(os.environ.get("MIID_FACE_BLEND_MAX", "0.8"))
 # only the face changes, so this catches the real cases (0.96 → 0.11), not
 # the noise.
 SCENE_DROP_MAX = 0.25
+# Slot types the blend applies to, and how. Background slots keep the whole
+# visible face skin. A lighting slot keeps it too, but the colour match is
+# local (a Gaussian window of LOCAL_MATCH_SIGMA eye distances), so the
+# take's lighting direction, cast and contrast stay on the restored face. An
+# expression slot restores only the upper face — brows, eyes, nose — and
+# leaves the mouth, cheeks and chin, which carry the expression, as
+# generated. Pose slots are never blended: the face has turned, so the
+# landmarks do not fit. The lighting+expression combo is not blended either:
+# on 10 archived takes every mask/match variant lost identity (−0.05 to
+# −0.07), the relit, re-expressed face being too far from the base for a
+# landmark-aligned paste.
+BLEND_MODES: Dict[str, Tuple[str, str]] = {
+    "background_in": ("skin", "global"),
+    "background_out": ("skin", "global"),
+    "lighting_edit": ("skin", "local"),
+    "expression_edit": ("upper", "global"),
+}
 SLOTS = frozenset(
     s.strip() for s in os.environ.get(
-        "MIID_FACE_BLEND_SLOTS", "background_in,background_out"
+        "MIID_FACE_BLEND_SLOTS", ",".join(BLEND_MODES)
     ).split(",") if s.strip()
 )
 # Blend strengths tried in order; the first one at GOAL wins. Identity gain
-# saturates early (alpha 0.5 already gave +0.09 of the +0.12 that 0.9 gave
-# on 80 archived takes), so the ladder is short.
-_LADDER = (0.6, 0.8, 0.9)
-# Which region the base face is blended into: "skin" follows the take's
-# visible face skin (forehead below a brim, cheeks beside a hijab, the jaw),
-# "ellipse" is the fixed inner-face superellipse only. On 40 archived
-# background takes (raw identity 0.70) the skin mask at alpha 0.8 reached
-# 0.88 mean identity (85% of takes at 0.85 or better); the ellipse 0.82.
+# saturates early (0.6 gave +0.103, 0.8 +0.116, 0.9 +0.113 on 80 archived
+# takes), and every step costs a composite and an AdaFace pass, so one step.
+_LADDER = (0.8,)
+# Window of the local colour match, in eye distances. The benchmark's
+# lighting delta on a lighting slot is nearly always the left/right
+# asymmetry, a step at the nose line; a wide window turns that step into a
+# ramp and the measured lighting falls. On 19 archived lighting takes
+# (raw identity 0.76): window 0.5 kept 69% of the lighting magnitude and
+# passed the 85% rule on 2 of 18; 0.2 kept 88% (min 83%), passed on 17 of
+# 18, and still reached identity 0.85 (56% of takes at 0.85 or better);
+# 0.1 kept 95% but gave only 0.82.
+LOCAL_MATCH_SIGMA = 0.2
+# Which region the base face is blended into when BLEND_MODES does not say:
+# "skin" follows the take's visible face skin (forehead below a brim, cheeks
+# beside a hijab, the jaw), "ellipse" is the fixed inner-face superellipse
+# only, "upper" the brows, eyes and nose. On 80 archived background takes
+# (raw identity 0.71) the skin mask at alpha 0.8 reached 0.84 (49% of takes
+# at 0.85 or better).
 MASK = os.environ.get("MIID_FACE_BLEND_MASK", "skin").strip().lower()
 # Poisson (seamless) cloning before the mix hides the boundary but re-shades
 # the face from the take's gradients, which AdaFace reads as a different
@@ -251,6 +285,39 @@ def skin_mask(
     return cv2.GaussianBlur(mask, (0, 0), max(1.0, feather * d))
 
 
+def upper_mask(shape: Tuple[int, int], points: np.ndarray, feather: float = 0.07) -> np.ndarray:
+    """A soft mask over the upper face only: brows, eyes and nose, from just
+    above the eyebrows (0.4 of the eye-to-mouth distance above the eyes) to
+    just under the nose tip (0.6 of it below), one eye distance to each side.
+    The mouth, cheeks and chin — where an expression lives — stay out."""
+    import cv2
+
+    h, w = shape
+    pts = np.asarray(points, dtype=np.float64)
+    left_eye, right_eye, _nose, mouth_l, mouth_r = pts
+    eye_c = (left_eye + right_eye) / 2.0
+    mouth_c = (mouth_l + mouth_r) / 2.0
+    d = float(np.linalg.norm(right_eye - left_eye))
+    if d < 2.0:
+        return np.zeros((h, w), dtype=np.float32)
+    ax = (right_eye - left_eye) / d
+    ay = np.array([-ax[1], ax[0]])
+    if np.dot(mouth_c - eye_c, ay) < 0:
+        ay = -ay
+    m = max(float(np.dot(mouth_c - eye_c, ay)), 0.8 * d)
+    centre = eye_c + 0.1 * m * ay
+    rx, ry = 1.0 * d, 0.5 * m
+    ys, xs = np.mgrid[:h, :w]
+    px, py = xs - centre[0], ys - centre[1]
+    u = px * ax[0] + py * ax[1]
+    v = px * ay[0] + py * ay[1]
+    radius = (np.abs(u) / rx) ** MASK_EXPONENT + (np.abs(v) / ry) ** MASK_EXPONENT
+    mask = (radius <= 1.0).astype(np.float32)
+    sigma = max(1.0, feather * d)
+    k = int(2 * round(3 * sigma) + 1)
+    return cv2.GaussianBlur(mask, (k, k), sigma)
+
+
 def match_colour(src: np.ndarray, ref: np.ndarray, weight: np.ndarray) -> np.ndarray:
     """``src`` (RGB uint8) with the Lab mean and spread of ``ref`` inside
     ``weight`` (Reinhard colour transfer), so the base face takes the take's
@@ -266,6 +333,32 @@ def match_colour(src: np.ndarray, ref: np.ndarray, weight: np.ndarray) -> np.nda
     sd_s = np.sqrt((((lab_s - mu_s) ** 2) * w).sum(axis=(0, 1)) / total)
     sd_r = np.sqrt((((lab_r - mu_r) ** 2) * w).sum(axis=(0, 1)) / total)
     ratio = np.clip(sd_r / np.maximum(sd_s, 1e-3), 0.7, 1.4)
+    out = (lab_s - mu_s) * ratio + mu_r
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(out, cv2.COLOR_LAB2RGB)
+
+
+def match_colour_local(src: np.ndarray, ref: np.ndarray, weight: np.ndarray, sigma: float) -> np.ndarray:
+    """Like match_colour, but with the mean and spread taken in a Gaussian
+    window of ``sigma`` pixels around each point, so the take's shading —
+    which side is lit, how hard the shadows fall, where the cast sits — is
+    carried onto the base face's detail. Statistics are weighted by the mask
+    so pixels outside it (hair, fabric, scene) do not pull the face."""
+    import cv2
+
+    lab_s = cv2.cvtColor(src, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab_r = cv2.cvtColor(ref, cv2.COLOR_RGB2LAB).astype(np.float32)
+    w = np.clip(weight, 0.0, 1.0).astype(np.float32)
+    if w.max() <= 0.0:
+        return src
+    blur = lambda a: cv2.GaussianBlur(a, (0, 0), sigma)  # noqa: E731
+    norm = np.maximum(blur(w), 1e-3)[..., None]
+    w3 = w[..., None]
+    mu_s = blur(lab_s * w3) / norm
+    mu_r = blur(lab_r * w3) / norm
+    var_s = np.maximum(blur(((lab_s - mu_s) ** 2) * w3) / norm, 1e-3)
+    var_r = np.maximum(blur(((lab_r - mu_r) ** 2) * w3) / norm, 1e-3)
+    ratio = np.clip(np.sqrt(var_r / var_s), 0.7, 1.4)
     out = (lab_s - mu_s) * ratio + mu_r
     out = np.clip(out, 0, 255).astype(np.uint8)
     return cv2.cvtColor(out, cv2.COLOR_LAB2RGB)
@@ -307,18 +400,21 @@ def seamless(src: np.ndarray, dst: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 def composite(
     base_rgb: np.ndarray, take_rgb: np.ndarray, matrix: np.ndarray, mask: np.ndarray, alpha: float,
-    poisson: bool = False,
+    poisson: bool = False, match: str = "global", eye_distance: Optional[float] = None,
 ) -> np.ndarray:
     """The take with the base face warped in by ``matrix`` and blended under
-    ``mask`` at strength ``alpha``. With ``poisson`` the warped face is first
-    cloned in seamlessly (its gradients, the take's illumination), then mixed
-    with the take at ``alpha``; without it the face is colour-matched and
-    alpha-blended directly."""
+    ``mask`` at strength ``alpha``. The warped face is colour-matched to the
+    take first — globally, or locally (``match="local"``) so the take's
+    shading survives — and with ``poisson`` cloned in seamlessly before the
+    mix."""
     warped = warp_base(base_rgb, matrix, take_rgb.shape[:2])
-    if poisson:
-        face = seamless(match_colour(warped, take_rgb, mask), take_rgb, mask)
+    if match == "local":
+        sigma = max(2.0, LOCAL_MATCH_SIGMA * (eye_distance or 40.0))
+        face = match_colour_local(warped, take_rgb, mask, sigma)
     else:
         face = match_colour(warped, take_rgb, mask)
+    if poisson:
+        face = seamless(face, take_rgb, mask)
     weight = (alpha * mask)[..., None]
     out = take_rgb.astype(np.float32) + weight * (face.astype(np.float32) - take_rgb.astype(np.float32))
     return np.clip(out + 0.5, 0, 255).astype(np.uint8)
@@ -353,10 +449,15 @@ def base_geometry(base_image: Image.Image, edit_context: Optional[Dict[str, Any]
 
 
 def wanted(background: bool, result: Dict[str, Any], goal: Optional[float] = None) -> bool:
-    """Is this take one to blend: a background slot still short of the goal?"""
-    if not ENABLED or not background:
+    """Is this take one to blend: a blendable slot type still short of the goal?
+
+    ``background`` is kept for the caller's convenience; the slot type in
+    ``result`` decides (BLEND_MODES / MIID_FACE_BLEND_SLOTS).
+    """
+    if not ENABLED:
         return False
-    if result.get("variation_type") not in SLOTS or result.get("image") is None:
+    vtype = result.get("variation_type")
+    if vtype not in SLOTS or vtype not in BLEND_MODES or result.get("image") is None:
         return False
     similarity = result.get("identity_similarity")
     return similarity is not None and similarity < (GOAL if goal is None else goal)
@@ -395,16 +496,24 @@ def build_mask(
     base_rgb: Optional[np.ndarray] = None, matrix: Optional[np.ndarray] = None,
     mode: Optional[str] = None,
 ) -> np.ndarray:
-    """The blend region for a take: the fixed inner-face superellipse, or
-    (default) the take's visible face skin judged against the warped base."""
+    """The blend region for a take: ``ellipse`` (the inner-face superellipse),
+    ``upper`` (brows, eyes and nose only) or ``skin`` (default: the take's
+    visible face skin judged against the warped base)."""
     mode = MASK if mode is None else mode
     if mode == "ellipse":
         return face_ellipse(take_rgb.shape[:2], take_points)
+    if mode == "upper":
+        return upper_mask(take_rgb.shape[:2], take_points)
     reference = None
     if base_rgb is not None and matrix is not None:
         core = face_ellipse(take_rgb.shape[:2], take_points)
         reference = match_colour(warp_base(base_rgb, matrix, take_rgb.shape[:2]), take_rgb, core)
     return skin_mask(take_rgb, take_points, reference)
+
+
+def eye_distance(points: np.ndarray) -> float:
+    pts = np.asarray(points, dtype=np.float64)
+    return float(np.linalg.norm(pts[1] - pts[0]))
 
 
 def apply(
@@ -418,20 +527,24 @@ def apply(
     accessory: Optional[str],
     scene: Optional[str],
     goal: Optional[float] = None,
+    take_geometry: Optional[Tuple] = None,
 ) -> Dict[str, Any]:
     """Blend the base face into ``result["image"]`` if that raises identity
     without weakening the measured edits; on success ``result`` is updated
     in place (image, identity_similarity, environment, edit). Returns a
-    JSON-safe account of what happened either way."""
+    JSON-safe account of what happened either way. ``take_geometry`` is the
+    take's (box, landmarks) when the caller already detected it."""
     from MIID.miner.background_check import background_miss, environment_probs
-    from MIID.miner.edit_check import measure as measure_edit, preserved as edit_preserved
+    from MIID.miner.edit_check import measure as measure_edit, misses as edit_misses, preserved as edit_preserved
 
     started = time.time()
     goal = GOAL if goal is None else goal
     raw_identity = result.get("identity_similarity")
+    vtype = result.get("variation_type")
+    mask_mode, match_mode = BLEND_MODES.get(vtype, ("skin", "global"))
     info: Dict[str, Any] = {
         "applied": False, "reason": None, "raw_identity": raw_identity,
-        "identity": None, "alpha": None, "seconds": 0.0,
+        "identity": None, "alpha": None, "seconds": 0.0, "mask": mask_mode, "match": match_mode,
     }
 
     def done(reason: Optional[str] = None) -> Dict[str, Any]:
@@ -443,7 +556,8 @@ def apply(
         return done("no identity signal")
     if base_geom is None:
         return done("no face in the base image")
-    take_geometry = face_geometry(result["image"])
+    if take_geometry is None:
+        take_geometry = face_geometry(result["image"])
     if take_geometry is None:
         return done("no face in the take")
     base_points, take_points = base_geom[1], take_geometry[1]
@@ -459,13 +573,16 @@ def apply(
         return done(f"face scale {scale:.2f} outside {SCALE_RANGE[0]}–{SCALE_RANGE[1]}")
     if residual > RESIDUAL_MAX:
         return done(f"the take's face sits differently (landmark residual {residual:.2f} > {RESIDUAL_MAX})")
-    mask = build_mask(take_rgb, take_points, base_rgb, matrix)
+    mask = build_mask(take_rgb, take_points, base_rgb, matrix, mode=mask_mode)
     info["mask_share"] = round(float((mask > 0.5).mean()), 4)
+    d = eye_distance(take_points)
 
     best: Optional[Tuple[float, float, Image.Image]] = None
     tried: List[Tuple[float, Optional[float]]] = []
     for alpha in ALPHAS:
-        candidate = Image.fromarray(composite(base_rgb, take_rgb, matrix, mask, alpha, poisson=POISSON))
+        candidate = Image.fromarray(composite(
+            base_rgb, take_rgb, matrix, mask, alpha, poisson=POISSON, match=match_mode, eye_distance=d,
+        ))
         identity = similarity_to_embedding(base_embedding, candidate)
         tried.append((alpha, None if identity is None else round(identity, 4)))
         if identity is None:
@@ -502,13 +619,32 @@ def apply(
         if after < before - SCENE_DROP_MAX:
             return done(f"the face no longer sits in the scene ({scene} {before:.2f} → {after:.2f})")
     try:
-        edit = measure_edit(edit_context or {}, image, levels, accessory)
+        # The blended take keeps the take's landmarks, so no second detection.
+        edit = measure_edit(edit_context or {}, image, levels, accessory, geometry=take_geometry)
     except Exception as e:  # measured on the raw take; unmeasurable here is not a pass
         return done(f"edit measurement failed after the blend ({e})")
     candidate = {"pose_yaw": result.get("pose_yaw"), "environment": result.get("environment"), "edit": edit}
     kept, lost = edit_preserved(levels, result, candidate, scene)
     if not kept:
         return done(f"the blend weakened the {lost}")
+    # Nor may the blend turn a landed edit into a gross miss (a lighting
+    # change that now reads as none, an expression that now reads neutral).
+    new_misses = set(edit_misses(levels, edit)) - set(edit_misses(levels, result.get("edit")))
+    if new_misses:
+        return done("the blend undid the " + ", ".join(sorted(c for c, _ in new_misses)))
+    lighting_raw, lighting_new = (result.get("edit") or {}).get("lighting"), (edit or {}).get("lighting")
+    if lighting_raw and lighting_new:
+        info["lighting_before"], info["lighting_after"] = lighting_raw["magnitude"], lighting_new["magnitude"]
+        # The 85% rule above allows a small loss; it must not be the loss
+        # that takes the lighting down an intensity level (a far read that
+        # becomes medium), which is what the grader bins on.
+        order = ("none", "light", "medium", "far")
+        if (lighting_raw.get("level") in order and lighting_new.get("level") in order
+                and order.index(lighting_new["level"]) < order.index(lighting_raw["level"])):
+            return done(f"the blend took the lighting from {lighting_raw['level']} to {lighting_new['level']}")
+    expr_raw, expr_new = (result.get("edit") or {}).get("expression"), (edit or {}).get("expression")
+    if expr_raw and expr_new:
+        info["expression_before"], info["expression_after"] = expr_raw["change"], expr_new["change"]
 
     result["image"] = image
     result["identity_similarity"] = identity
