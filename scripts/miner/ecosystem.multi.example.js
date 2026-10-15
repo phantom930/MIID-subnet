@@ -32,8 +32,9 @@ const common = {
     MIID_ARCHIVE_IMAGES: "1",
     MIID_SIBLING_DIR: path.join(SHARED, "siblings"),
     MIID_GPU_LOCK_DIR: path.join(SHARED, "gpu"),
-    // Two processes polishing against each other is wasted time on a shared card.
-    MIID_POLISH_ATTEMPTS: "1",
+    // Polish runs at the lowest GPU priority (after every first pass and
+    // identity rescue), so it only ever uses idle time on the shared card.
+    MIID_POLISH_ATTEMPTS: "2",
     // Memory: keep the FLUX weights memory-mapped (one shared copy in the
     // page cache, ~1.5 GB private per process instead of 15 GB), limit glibc
     // to two malloc arenas, and size every CPU thread pool to this process's

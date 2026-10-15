@@ -155,7 +155,7 @@ def generate_image_variations(
     meta: Optional[Dict[str, Any]] = None,
     deadline: Optional[float] = None,
     retry_cutoff_fn: Optional[Callable[[], Optional[float]]] = None,
-    yield_fn: Optional[Callable[[float], Optional[float]]] = None,
+    yield_fn: Optional[Callable[[float, int], Optional[float]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """The GPU half of build_image_submissions: decode, generate, measure.
 
@@ -375,6 +375,7 @@ def upload_image_variations(
                             head_turn_deg=var.get("pose_yaw"),
                             edit=var.get("edit"),
                             sibling=var.get("sibling"),
+                            blend=var.get("blend"),
                             bytes=len(encrypted_data))
                 else:
                     bt.logging.warning(
@@ -417,7 +418,7 @@ def build_image_submissions(
     meta: Optional[Dict[str, Any]] = None,
     deadline: Optional[float] = None,
     retry_cutoff_fn: Optional[Callable[[], Optional[float]]] = None,
-    yield_fn: Optional[Callable[[float], Optional[float]]] = None,
+    yield_fn: Optional[Callable[[float, int], Optional[float]]] = None,
 ) -> List[S3Submission]:
     """Generate, validate, encrypt and upload every requested variation.
 

@@ -666,6 +666,18 @@ AVAILABLE_MODELS: Dict[str, Dict[str, Any]] = {
         # offload (~41 s vs ~37 s per attempt), and a random switch between
         # the two reloaded the pipeline (~13 s) for no difference in output.
         # MIID_MODEL=pulid_flux2 still selects it.
+        #
+        # Checked 2026-10-15: the only published adapter weights
+        # (Fayens/Pulid-Flux2, pulid_flux2_klein_v1/v2.safetensors, 341M
+        # params F32) are 4096 wide — the Klein 9B width; this 4B model is
+        # 3072 wide (24 heads × 128), and the reference ComfyUI node then
+        # substitutes a randomly initialised projection and injector. The
+        # checkpoint's cross-attention keys (pulid_ca_double.*,
+        # pulid_ca_single.*) also do not match the node's module names
+        # (double_ca.*, single_ca.*), so they are skipped by its non-strict
+        # load. No standalone inference code and no reported identity
+        # numbers exist. Not a usable identity lever for the 4B on a 16 GB
+        # card; the 9B transformer (~18 GB bf16) would not fit either.
         "base": False,
         "notes": (
             "FLUX.2 Klein backbone compatible with Fayens PuLID-FLUX2 adapter "

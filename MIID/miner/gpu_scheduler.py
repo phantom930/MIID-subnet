@@ -23,11 +23,15 @@
 #
 # Phases: a request queues at phase 0 for its first pass — one attempt per
 # slot, the part that decides whether it submits at all. Once that is done it
-# hands the GPU back whenever another first pass is waiting (Turn.yield_turn)
-# and queues again at phase 1 for its retries and polish, which only ever run
-# on time no first pass needs. Four hotkeys on one card used to let one
-# request's eleven retries run for 300 s while another hotkey's request waited
-# 870 s and then had no time left for even one attempt.
+# hands the GPU back whenever more urgent work is waiting (Turn.yield_turn)
+# and queues again for the rest: phase 1 for identity rescues (a slot under
+# the 0.6 identity gate, which caps the whole challenge's grade), phase 2 for
+# edit retries and polish. Within a phase the earliest deadline goes first,
+# so a request's polish yields to another request's identity rescue and to
+# an earlier-deadline request's polish, and nothing but a first pass delays
+# a first pass. Four hotkeys on one card used to let one request's eleven
+# retries run for 300 s while another hotkey's request waited 870 s and then
+# had no time left for even one attempt.
 
 import fcntl
 import heapq
@@ -164,74 +168,62 @@ class GpuScheduler:
     def _others_ahead(self, key: Tuple[int, float, int, int]) -> bool:
         return any((p, d, pid, s) < key for p, d, pid, s, _ in self._others_waiting())
 
-    def _lock_gpu(self, key: Tuple[int, float, int, int], until: Optional[float]) -> Optional[int]:
-        """Take <dir>/gpu.lock once no other process's request is ahead of ``key``.
-
-        Returns the lock's fd, or None when ``until`` passed first.
-        """
-        if not self.lock_dir:
-            return -1
-        fd = os.open(os.path.join(self.lock_dir, "gpu.lock"), os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            while True:
-                if not self._others_ahead(key):
-                    try:
-                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        return fd
-                    except BlockingIOError:
-                        pass
-                if until is not None and time.time() >= until:
-                    os.close(fd)
-                    return None
-                time.sleep(POLL_SECONDS)
-        except BaseException:
-            os.close(fd)
-            raise
-
     # ── the scheduler ──
 
     def _take(self, turn: Turn, phase: int, until: Optional[float] = None) -> Optional[float]:
-        """Wait for the GPU; seconds waited, or None when ``until`` passed first."""
+        """Wait for the GPU; seconds waited, or None when ``until`` passed first.
+
+        One decision for every waiter, local or in another process: the
+        request with the smallest (phase, deadline, pid, seq) key takes the
+        GPU as soon as it is free. Nothing is reserved before that — a
+        process must never hold a "local turn" while it defers to another
+        process, because that other process's request may itself be queued
+        behind this one's turn. (That circular wait idled the GPU for 13
+        minutes on 2026-10-14 while four requests sat ready.)
+        """
         seq = next(self._seq)
         entry = (phase, turn.deadline, seq, turn.workload)
+        key = (phase, turn.deadline, os.getpid(), seq)
         started = time.time()
         announced = self._announce(seq, turn.deadline, turn.workload, phase)
+        fd: Optional[int] = None
+        if self.lock_dir:
+            fd = os.open(os.path.join(self.lock_dir, "gpu.lock"), os.O_RDWR | os.O_CREAT, 0o644)
         with self._cond:
             heapq.heappush(self._waiting, entry)
             try:
-                while self._busy or self._waiting[0] is not entry:
+                while True:
+                    if not self._busy and self._waiting[0] is entry and not self._others_ahead(key):
+                        if fd is None:
+                            break
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            pass
+                    if until is not None and time.time() >= until:
+                        raise TimeoutError
+                    # Other processes release the lock without waking us, so
+                    # poll; a local release notifies the condition directly.
+                    timeout = POLL_SECONDS if fd is not None else None
                     if until is not None:
                         remaining = until - time.time()
-                        if remaining <= 0:
-                            raise TimeoutError
-                        self._cond.wait(timeout=remaining)
-                    else:
-                        self._cond.wait()
+                        timeout = remaining if timeout is None else min(timeout, remaining)
+                    self._cond.wait(timeout=timeout)
+                heapq.heappop(self._waiting)
+                self._busy = True
             except BaseException as exc:
                 self._waiting.remove(entry)
                 heapq.heapify(self._waiting)
                 self._cond.notify_all()
                 self._withdraw(announced)
+                if fd is not None:
+                    os.close(fd)
                 if isinstance(exc, TimeoutError):
                     return None
                 raise
-            heapq.heappop(self._waiting)
-            self._busy = True
-        try:
-            fd = self._lock_gpu((phase, turn.deadline, os.getpid(), seq), until)
-        except BaseException:
-            self._withdraw(announced)
-            with self._cond:
-                self._busy = False
-                self._cond.notify_all()
-            raise
         self._withdraw(announced)
-        if fd is None:
-            with self._cond:
-                self._busy = False
-                self._cond.notify_all()
-            return None
-        turn._fd = None if fd == -1 else fd
+        turn._fd = fd
         turn.held = True
         waited = time.time() - started
         turn.waited += waited
@@ -277,12 +269,19 @@ class GpuScheduler:
             local = [(d, w) for _, d, _, w in self._waiting]
         return sorted(local + [(d, w) for _, d, _, _, w in self._others_waiting()])
 
+    def waiting_ahead(self, phase: int, deadline: float) -> bool:
+        """True when a queued request — here or in another process — would be
+        served before work at ``phase`` for a request due at ``deadline``: a
+        lower phase, or the same phase with an earlier deadline."""
+        key = (phase, deadline)
+        with self._cond:
+            if any((p, d) < key for p, d, _, _ in self._waiting):
+                return True
+        return any((p, d) < key for p, d, _, _, _ in self._others_waiting())
+
     def first_pass_waiting(self) -> bool:
         """True when a request that has not had its first pass yet is queued."""
-        with self._cond:
-            if any(p == 0 for p, _, _, _ in self._waiting):
-                return True
-        return any(p == 0 for p, _, _, _, _ in self._others_waiting())
+        return self.waiting_ahead(1, float("-inf"))
 
 
 def queue_cutoff(

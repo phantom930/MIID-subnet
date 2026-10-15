@@ -220,6 +220,10 @@ VOICE_RESERVE_SECONDS = 60.0
 # The clone itself, the only part of the voice work that needs the GPU
 # (~11 s measured on 2026-10-14); the rest of the reserve is upload and margin.
 VOICE_GPU_SECONDS = 15.0
+# Latest the clone may start: it plus its own upload have to end before the
+# image uploads and the margin. VOICE_RESERVE_SECONDS keeps room for it while
+# generation runs; this is the tighter figure the clone itself is held to.
+VOICE_LATE_SECONDS = 35.0
 DEADLINE_MARGIN_SECONDS = float(os.environ.get("MIID_DEADLINE_MARGIN_SECONDS", "30"))
 
 
@@ -470,6 +474,19 @@ class Miner(BaseMinerNeuron):
         """
         received = time.time()
         deadline, sent_at = self._request_deadline(synapse, received)
+        if synapse.image_request is None and synapse.voice_request is None:
+            # Nothing to generate: answer without queueing for the GPU. Such
+            # probes (RoundTable21 sends them) sat 967 s in the queue on
+            # 2026-10-14 and, as phase-0 waiters, made every running request
+            # hand its retries over to them.
+            timing = {
+                "sent_at_utc": _utc_iso(sent_at) if sent_at else None,
+                "received_at_utc": _utc_iso(received),
+                "queue_wait_seconds": 0.0,
+                "gpu_wait_seconds": 0.0,
+                "deadline_utc": _utc_iso(deadline),
+            }
+            return await asyncio.to_thread(self._forward_body, synapse, deadline, timing, None)
         workload = self._workload_estimate(synapse)
         return await asyncio.to_thread(
             self._forward_on_gpu, synapse, received, sent_at, deadline, workload,
@@ -570,17 +587,19 @@ class Miner(BaseMinerNeuron):
             cutoff = queue_cutoff(SCHEDULER.waiting())
             return None if cutoff is None else cutoff - reserve
 
-        def yield_gpu(latest_restart: float) -> Optional[float]:
-            # Before each retry: a request still waiting for its first pass
-            # goes first; our retries queue again behind it (phase 1) and
-            # give up when they could not start by latest_restart.
-            if turn is None or not SCHEDULER.first_pass_waiting():
+        def yield_gpu(latest_restart: float, phase: int = 1) -> Optional[float]:
+            # Before each retry or polish attempt: queued work that is more
+            # urgent — any first pass, an identity rescue when this is an edit
+            # retry or polish, an earlier-deadline request at the same phase
+            # — goes first; this request queues again at ``phase`` and gives
+            # up when it could not restart by latest_restart.
+            if turn is None or not SCHEDULER.waiting_ahead(phase, deadline):
                 return 0.0
             bt.logging.info(
-                "A queued request is waiting for its first pass — handing the "
-                "GPU over before retrying."
+                "More urgent work is queued for the GPU — handing it over before "
+                f"{'an identity rescue' if phase == 1 else 'a retry or polish'}."
             )
-            return turn.yield_turn(phase=1, until=latest_restart)
+            return turn.yield_turn(phase=phase, until=latest_restart)
 
         synapse.s3_submissions = []
         synapse.voice_s3_submissions = []
@@ -682,7 +701,7 @@ class Miner(BaseMinerNeuron):
                 (len(batch["variations"]) if batch else 0) * UPLOAD_SECONDS_PER_SLOT
                 + DEADLINE_MARGIN_SECONDS
             )
-            voice_latest_start = deadline - VOICE_RESERVE_SECONDS - upload_reserve
+            voice_latest_start = deadline - VOICE_LATE_SECONDS - upload_reserve
             if not VOICE_AVAILABLE:
                 bt.logging.info(
                     "Voice: helper modules unavailable — returning no voice submission."

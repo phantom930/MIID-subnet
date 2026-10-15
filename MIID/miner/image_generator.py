@@ -44,6 +44,7 @@ from MIID.miner.edit_check import (
     misses as edit_misses,
     preserved as edit_preserved,
 )
+from MIID.miner import face_blend
 from MIID.miner import sibling_registry as siblings
 
 
@@ -493,7 +494,7 @@ def generate_variations(
     identity_goal: Optional[float] = None,
     polish_attempts: Optional[int] = None,
     sibling: Optional[siblings.Context] = None,
-    yield_fn: Optional[Callable[[float], Optional[float]]] = None,
+    yield_fn: Optional[Callable[[float, int], Optional[float]]] = None,
 ) -> List[Dict]:
     """Generate image variations from a base image (see generate_variations.py).
 
@@ -542,11 +543,15 @@ def generate_variations(
             gender-appropriate religious head covering (see generate_one).
         deadline: Wall-clock time generation must end by, or None.
         retry_cutoff_fn: Returns an extra wall-clock cap on retries, or None.
-        yield_fn: Called with the latest time a retry could still start before
-            each retry. It may hand the GPU to a queued request's first pass
-            and block until this request's turn comes round again, returning
-            the seconds waited — or None when that latest time passed first,
-            in which case the GPU is gone and no further attempt is made.
+        yield_fn: Called before each retry and polish attempt with the latest
+            time it could still start and its phase — 1 for an identity
+            rescue (the slot is under the identity target), 2 for an edit
+            retry or polish. It may hand the GPU to more urgent queued work
+            (a first pass, a rescue, an earlier-deadline request at the same
+            phase) and block until this request's turn comes round again,
+            returning the seconds waited — or None when that latest time
+            passed first, in which case the GPU is gone and no further
+            attempt is made.
         identity_goal: AdaFace similarity above which a satisfied slot is left
             alone. Defaults to IDENTITY_GOAL.
         polish_attempts: Full-strength re-rolls allowed per satisfied slot.
@@ -600,6 +605,8 @@ def generate_variations(
     except Exception as e:
         bt.logging.warning(f"Edit measurements unavailable ({e}); takes are ranked on identity and pose only.")
         edit_context = {}
+    # The base face's landmarks, for blending it back into background takes.
+    base_geometry = face_blend.base_geometry(base_image, edit_context)
 
     slots = [_Slot(i, req) for i, req in enumerate(variation_requests)]
     first_attempt = [True]
@@ -628,6 +635,19 @@ def generate_variations(
         except Exception as e:
             bt.logging.warning(f"Edit measurement failed: {e}")
             result["edit"] = None
+        # A background take short of the blend goal gets the base face blended
+        # back in (face_blend): identity rises, the scene and accessory stay,
+        # and the take is re-measured so the ranking below sees the final image.
+        result["blend"] = None
+        if face_blend.wanted(slot.background, result):
+            try:
+                result["blend"] = face_blend.apply(
+                    base_image, base_embedding, base_geometry, result,
+                    edit_context=edit_context, levels=slot.levels,
+                    accessory=slot.accessory, scene=slot.scene,
+                )
+            except Exception as e:
+                bt.logging.warning(f"Face blend failed: {e}")
         result["sibling"] = None
         if sibling is not None and not slot.screen_replay:
             try:
@@ -646,12 +666,19 @@ def generate_variations(
         first_attempt[0] = False
         slot.record(result, target)
         measured = describe_edit(result.get("edit"))
+        blended = face_blend.describe(result.get("blend"))
         bt.logging.debug(
             f"{result['variation_type']}: attempt {slot.generated} — generate "
             f"{generated_at - cycle_started:.1f}s, identity {identity_at - generated_at:.1f}s, "
             f"checks {checked_at - identity_at:.1f}s"
             + (f"; {measured}" if measured else "")
+            + (f"; {blended}" if blended else "")
         )
+        blend = result.get("blend")
+        if blend and blend.get("applied"):
+            bt.logging.info(f"{result['variation_type']}: {blended}, {blend['seconds']:.1f}s")
+        elif blend and blend.get("reason"):
+            bt.logging.debug(f"{result['variation_type']}: face blend skipped — {blend['reason']}")
 
     # ── phase 1: one attempt per slot ──
     skipped = []
@@ -705,25 +732,27 @@ def generate_variations(
                     f"{stop_reason} — keeping the best attempt."
                 )
             break
+        _, slot = max(candidates, key=lambda c: (c[0], -c[1].index))
         if yield_fn is not None:
-            # Every queued request gets its first pass before anyone's
-            # retries: hand the GPU over and queue again behind them.
-            waited = yield_fn(cutoff - cycle_estimate())
+            # More urgent queued work goes first — every first pass, then
+            # identity rescues, then edit retries by deadline: hand the GPU
+            # over and queue again behind it.
+            phase = 1 if not slot.identity_ok else 2
+            waited = yield_fn(cutoff - cycle_estimate(), phase)
             if waited is None:
                 gpu_lost = True
                 stop_reason = "the deadline, reached while queued for the GPU"
                 bt.logging.warning(
                     f"{len(candidates)} slot(s) could use a retry, but the GPU went "
-                    "to queued first passes until no time was left — keeping the best attempts."
+                    "to more urgent queued work until no time was left — keeping the best attempts."
                 )
                 break
             if waited > 0:
                 bt.logging.info(
-                    f"Handed the GPU to queued first passes for {waited:.0f}s; "
-                    "back for retries."
+                    f"Handed the GPU to more urgent queued work for {waited:.0f}s; "
+                    f"back for {'identity rescues' if phase == 1 else 'retries'}."
                 )
                 continue
-        _, slot = max(candidates, key=lambda c: (c[0], -c[1].index))
         identity_bias, hints = slot.next_settings()
         plan = (
             "retrying at full strength with hints ("
@@ -749,9 +778,11 @@ def generate_variations(
         if not candidates:
             polish_stop = "every slot at the goal or polished out"
             break
-        # Polish is surplus work: another validator's queued request is worth
-        # more than a tiebreak here, so hand the GPU over as soon as one waits.
-        if retry_cutoff_fn is not None and retry_cutoff_fn() is not None:
+        # Polish is surplus work: any queued first pass, identity rescue or
+        # earlier-deadline request goes first. With a scheduler the GPU is
+        # handed over and taken back (phase 2); without one, polish simply
+        # stops as soon as another request waits.
+        if yield_fn is None and retry_cutoff_fn is not None and retry_cutoff_fn() is not None:
             polish_stop = "a queued request"
             bt.logging.info(
                 f"Polish: {len(candidates)} slot(s) under identity {goal:.2f}, but "
@@ -767,6 +798,21 @@ def generate_variations(
                 "— keeping the best attempts."
             )
             break
+        if yield_fn is not None:
+            waited = yield_fn(cutoff - cycle_estimate(), 2)
+            if waited is None:
+                gpu_lost = True
+                polish_stop = "the deadline, reached while queued for the GPU"
+                bt.logging.info(
+                    f"Polish: {len(candidates)} slot(s) under identity {goal:.2f}, but the "
+                    "GPU went to more urgent queued work until no time was left — keeping the best attempts."
+                )
+                break
+            if waited > 0:
+                bt.logging.info(
+                    f"Handed the GPU to more urgent queued work for {waited:.0f}s; back for polish."
+                )
+                continue
         _, slot = max(candidates, key=lambda c: (c[0], -c[1].index))
         incumbent = slot.snapshot()
         before = incumbent[0]["identity_similarity"]
@@ -818,10 +864,12 @@ def generate_variations(
             "pose_yaw": best.get("pose_yaw"),
             "edit": best.get("edit"),
             "sibling": best.get("sibling"),
+            "blend": best.get("blend"),
         })
 
         environment = describe_environment(var_type, best.get("environment"))
         measured = describe_edit(best.get("edit"))
+        blended = face_blend.describe(best.get("blend"))
         bt.logging.info(
             f"Generated {var_type} variation "
             f"(identity="
@@ -832,6 +880,7 @@ def generate_variations(
             )
             + (f", background {environment}" if environment else "")
             + (f", {measured}" if measured else "")
+            + (f", {blended}" if blended else "")
             + (f", {slot.reason(target)}" if not slot.satisfied and slot.identity_ok else "")
             + f", kept attempt {best['winning_attempt']} of {slot.generated})"
             f", hash: {image_hash[:16]}..."

@@ -322,7 +322,7 @@ Three pieces make several hotkeys safe to run from this code:
 
 1. **A style profile per hotkey** (`MIID/miner/diversity.py`, on by default). Derived from the hotkey address: its own four indoor and four outdoor scenes, a preferred side for light and head turns, a warm or cool colour cast, a far-expression flavour and accessory colours, appended to the prompt as a short style clause. Two hotkeys therefore draw from different distributions, not just different seeds. `MIID_DIVERSITY=0` turns it off.
 2. **A shared sibling ledger** (`MIID/miner/sibling_registry.py`, `MIID_SIBLING_DIR`). Every attempt's 256-bit dHash and CLIP embedding are written to `<dir>/<challenge_id>/`; before a take is accepted it is compared with the other hotkeys' takes of the same slot, and one within `MIID_DUP_DHASH_BITS` (16) or at CLIP cosine `MIID_DUP_CLIP_COSINE` (0.99) or above is ranked as a miss and re-rolled with a hint to compose differently. Use a local directory when the hotkeys share a machine and a network mount when they do not. Archived variations sit 68–120 bits from their own seed image, so honest renders with fresh seeds never trip this; it exists to guarantee that.
-3. **GPU sharing between processes** (`MIID_GPU_LOCK_DIR`). Each hotkey runs its own `neurons/miner.py`; with this set they take turns on the GPU through a file lock in the same order as within one process — a request still waiting for its first pass before any request's retries, earliest deadline first within that — and see each other's queued requests, so one process's retries and polish yield to another process's waiting validator. (Without the phase rule, on 2026-10-14 one hotkey's eleven retries ran for 300 s while another hotkey's request waited 870 s and then had no time for a single attempt.) The voice models are parked in CPU memory after each request already; the idle GPU footprint per process is the CUDA context, the VAE and the face models, about 1 GB.
+3. **GPU sharing between processes** (`MIID_GPU_LOCK_DIR`). Each hotkey runs its own `neurons/miner.py`; with this set they take turns on the GPU through a file lock in the same order as within one process — every first pass, then identity rescues, then edit retries and polish, earliest deadline first within each level — and see each other's queued requests, so one process's retries and polish yield to another process's waiting validator. (Without the phase rule, on 2026-10-14 one hotkey's eleven retries ran for 300 s while another hotkey's request waited 870 s and then had no time for a single attempt.) The voice models are parked in CPU memory after each request already; the idle GPU footprint per process is the CUDA context, the VAE and the face models, about 1 GB.
 
 Example with pm2, one process per hotkey, distinct axon ports:
 
@@ -512,7 +512,13 @@ Environment variables:
 | `MIID_INFERENCE_STEPS`, `MIID_GUIDANCE_SCALE` | Tune generation (see `MIID/miner/generate_variations.py`) | see code |
 | `MIID_IDENTITY_RETRIES` | Extra attempts per slot that misses the 0.6 identity target or its head-turn range | 3 |
 | `MIID_IDENTITY_GOAL` | Identity a slot that already meets its targets is polished toward: while no other request is queued, it is re-rolled at full edit strength and a higher-identity take is kept **only if every measured edit (head turn, lighting, expression, scene, accessory) is at least as strong as the incumbent's** — a higher-identity take is usually a weaker edit, and the validator ranks on the edit first, identity second | 0.85 |
-| `MIID_POLISH_ATTEMPTS` | Full-strength re-rolls allowed per satisfied slot (lowest identity first, after every rescue retry, never for `screen_replay`, never while another validator's request waits for the GPU); `0` disables polishing | 2 |
+| `MIID_POLISH_ATTEMPTS` | Full-strength re-rolls allowed per satisfied slot (lowest identity first, after every rescue retry, never for `screen_replay`, only on GPU time no first pass or identity rescue needs); `0` disables polishing | 2 |
+| `MIID_FACE_BLEND` | On a background slot (the request says "keeping the subject unchanged"), blend the base image's face back into the take when its identity is under `MIID_FACE_BLEND_GOAL`: the base face is warped onto the take's five MTCNN landmarks, colour-matched to the take, and blended over the take's visible face skin — the scene, hair, ears and any requested headwear stay the take's own. The weakest strength that reaches the goal is used, and the result is kept only if identity rose, the scene still reads right, the accessory check is no weaker, and the image is not a copy of the seed (dHash). A moved or turned face is left alone. `0` disables it. See "Face blend" below | on |
+| `MIID_FACE_BLEND_GOAL` | Identity the blend aims for; a background take already at it is left alone | 0.88 |
+| `MIID_FACE_BLEND_MAX` | Strongest blend allowed (1.0 would paste the base face). 0.9 gained no identity over 0.8 on 80 archived takes but pulled the CLIP scene reading down twice as far; a blend that drops the wanted-scene probability by more than 0.25 is refused in any case | 0.8 |
+| `MIID_FACE_BLEND_SLOTS` | Slot types the blend applies to | `background_in,background_out` |
+| `MIID_FACE_BLEND_MASK` | Region the base face is blended into: `skin` — the inner face (just above the brows to the chin, cheek to cheek) plus the connected skin around it that still resembles the base there (forehead below a brim, cheeks beside a hijab, jaw and chin), so fabric or a hat worn over the base's hair is never painted over; `ellipse` — the inner face only | `skin` |
+| `MIID_FACE_BLEND_POISSON` | Seamless (Poisson) cloning before the mix. Hides the boundary but re-shades the face from the take's gradients, which AdaFace reads as a different face (0.84 against 0.88 identity on 40 archived takes), so it is off | off |
 | `MIID_EDIT_CHECK` | Measure every attempt's edit in-round — lighting magnitude on the face (the benchmark's formula), expression and accessory with CLIP on the head crop — rank takes on those measurements before identity, and re-roll gross misses with a hint (no lighting change, a far lighting request that reads light, a medium/far expression that reads neutral, a missing or wrong accessory). `0` disables the lighting, expression and accessory measurements | on |
 | `MIID_EXPR_NEUTRAL_PROB` | CLIP "neutral" probability above which a medium or far expression request counts as a miss | 0.6 |
 | `MIID_BG_CHECK` | Check every background attempt's scene with CLIP (the benchmark's own environment prompts) and re-roll it with a hint when it reads as the wrong kind of scene. `0` disables the check. (The earlier "plain studio backdrop" rule is gone: it fired on passport framing, not on blank backdrops, and only burned retries) | on |
@@ -535,12 +541,39 @@ Environment variables:
 earliest-deadline-first (`MIID/miner/gpu_scheduler.py`); `forward` runs the work in a worker thread
 so queued requests are still accepted. Each request's deadline is the validator's send time (its
 nonce) plus its 1200 s timeout, minus upload, voice and the margin above. Every slot gets one
-attempt first (the request's *first pass*). Before each retry the request hands the GPU to any
-queued request that has not had its first pass yet and queues again behind it, so under a burst
-every request submits a full first pass before anyone's retries run; the retries then use the
-time left, nearest identity misses first, and stop when a queued request needs the GPU to make
-its own deadline. Encryption and upload happen after the GPU has been handed back. A response that would arrive after
+attempt first (the request's *first pass*). Everything after that runs at a lower GPU priority:
+before each retry or polish attempt the request hands the GPU to any more urgent queued work and
+queues again behind it — every first pass goes first, then identity rescues (a slot under the
+0.6 identity target, which caps the whole challenge's grade), then edit retries and polish, and
+within a level the earliest deadline wins. Under a burst every request therefore submits a full
+first pass before anyone's retries run, the rescues that protect the identity gate come next,
+and polish (full-strength re-rolls that raise identity without weakening the edit) uses whatever
+idle time is left. Retries stop when a queued request needs the GPU to make its own deadline.
+Encryption and upload happen after the GPU has been handed back. A response that would arrive after
 the timeout scores nothing, so near the deadline slots are skipped rather than submitted late.
+
+**Face blend.** Only the top 50 miners of a graded round are paid, ranked on validation score with
+identity as the tie-break, and most miners now grade 5/5 on most slots, so the 50th place is in
+practice decided by identity preservation (0.79–0.93 on the rounds of 2026-10-15). The grader's
+identity score is the same AdaFace comparison the miner runs (identical to three decimals on 40
+graded slots). FLUX.2 Klein regenerates the whole image, so even a background slot — where the
+request says the subject stays unchanged — drifts to 0.68–0.74. `MIID/miner/face_blend.py`
+therefore blends the base image's face back into every background take that is short of
+`MIID_FACE_BLEND_GOAL`, re-measures the take (identity, scene, accessory) and keeps the blend only
+if identity rose without weakening a measured edit. The region is the take's own visible face
+skin, found from the inner face outward and limited to where the take still resembles the base
+(`MIID_FACE_BLEND_MASK`): a head covering, hat or band worn over the base's hair or forehead is
+left exactly as generated, because restoring the base there would erase the requested accessory
+while still reading as "a head covering" to the CLIP check. It never pastes: the strongest blend
+leaves a tenth of the take's own texture in the face, and a result within 20 dHash bits of the
+seed is refused, since the grader scores a copy of the seed -1. Pose and expression slots are not
+blended (the face itself has to change there); for those the levers are the identity rescues and
+polish above. The archive records each blend under `variation_report[].blend` (raw and final
+identity, strength, mask share, or why it was declined). Measured offline on 80 archived
+background takes (2026-10-15, strengths 0.6 and 0.8): 71 blended, identity 0.71 → 0.84 on average
+(median 0.85), takes at 0.85 or better from 3% to 49%, every accessory verdict unchanged, the
+wanted-scene probability down only 0.03 on average, nothing within 93 dHash bits of its seed, about
+4 s per take on the CPU (less live, where AdaFace runs on the GPU).
 
 To compare a change against what was actually submitted, replay archived requests (miner
 stopped, GPU free) and benchmark the result:
