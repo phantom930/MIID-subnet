@@ -145,7 +145,8 @@ import os
 import random
 import re
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -887,6 +888,125 @@ def _get_pipeline(model_key: str) -> Any:
     return _cached_pipeline
 
 
+def free_gpu() -> None:
+    """Move the cached pipeline's weights off the GPU.
+
+    Mapped offload keeps the models it used resident between attempts (one
+    upload per request instead of one per attempt). They go when this
+    process hands the GPU to another request or process — the GPU
+    scheduler calls this from its release hook — and before the voice
+    models need the room. Safe to call at any time.
+    """
+    pipe = _cached_pipeline
+    if pipe is None:
+        return
+    try:
+        from .models._cuda_place import release_offloaded
+        release_offloaded(pipe)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not release the offloaded pipeline: %s", e)
+
+
+try:
+    from .gpu_scheduler import SCHEDULER as _GPU_SCHEDULER
+    _GPU_SCHEDULER.on_release(free_gpu)
+except Exception:  # noqa: BLE001 — standalone use without the scheduler
+    pass
+
+
+class PromptCache:
+    """Prompt embeddings for one request.
+
+    FLUX.2 klein takes ``prompt_embeds`` in place of ``prompt``. Its text
+    encoder is 8.0 GB, uploaded to the GPU whenever it runs and, on a 16 GB
+    card, displacing the transformer each time; encoding every first-pass
+    prompt in one pass (``warm``) and re-using the embeddings for a polish
+    re-roll of the same prompt turns six uploads a request into one. The
+    embeddings live on the CPU (12.6 MB each) for the life of the request.
+    """
+
+    def __init__(self, pipe: Any, encode: Callable[[Any, List[str]], List[Any]]):
+        self.pipe = pipe
+        self._encode = encode
+        self.store: Dict[str, Any] = {}
+        self.hits = 0
+        self.misses = 0
+        self.seconds = 0.0
+
+    def warm(self, prompts: List[str]) -> int:
+        """Encode every prompt not yet known, in one pass; how many that was."""
+        missing = [p for p in dict.fromkeys(prompts) if p not in self.store]
+        if missing:
+            self._add(missing)
+        return len(missing)
+
+    def get(self, prompt: str) -> Any:
+        """The embeddings for ``prompt``, encoding it on demand."""
+        if prompt in self.store:
+            self.hits += 1
+        else:
+            self.misses += 1
+            self._add([prompt])
+        return self.store[prompt]
+
+    def _add(self, prompts: List[str]) -> None:
+        started = time.time()
+        for prompt, embeds in zip(prompts, self._encode(self.pipe, prompts)):
+            self.store[prompt] = embeds
+        self.seconds += time.time() - started
+
+    def describe(self) -> str:
+        return (
+            f"prompt embeddings: {len(self.store)} encoded in {self.seconds:.1f}s, "
+            f"{self.hits} re-used, {self.misses} encoded on demand"
+        )
+
+
+def prepare_prompt_cache(model_key: Optional[str]) -> Optional[PromptCache]:
+    """A PromptCache for a request on ``model_key``, or None when that model
+    does not take prompt embeddings. Loads the pipeline, as generate_one would."""
+    if model_key not in AVAILABLE_MODELS or AVAILABLE_MODELS[model_key]["type"] != "flux_klein":
+        return None
+    try:
+        pipe = _get_pipeline(model_key)
+        if AVAILABLE_MODELS[_cached_model_key or model_key]["type"] != "flux_klein":
+            return None
+        from .models.flux_klein_model import encode_prompts, supports_prompt_embeds
+        if not supports_prompt_embeds(pipe):
+            return None
+        return PromptCache(pipe, encode_prompts)
+    except Exception as e:  # noqa: BLE001 — the text prompt path still works
+        logger.warning("Prompt embeddings unavailable (%s); encoding per attempt.", e)
+        return None
+
+
+def build_prompt(
+    req: Any,
+    attempt: int = 0,
+    identity_bias: Optional[float] = None,
+    subject_gender: Optional[str] = None,
+    hints: Optional[Dict[str, str]] = None,
+    pose_hint: Optional[str] = None,
+    background_hint: Optional[str] = None,
+) -> str:
+    """The prompt generate_one would build for these arguments.
+
+    Built ahead of the first pass so the request's prompts can be encoded
+    together (PromptCache) and the same text re-used for a polish re-roll.
+    The scene, colour and accessory choices inside are random per call, so
+    the text is passed back to generate_one rather than rebuilt.
+    """
+    var_type, intensity = _get_type_and_intensity(req)
+    if identity_bias is None:
+        # Each attempt steps 40% further toward "hold the face, soften the
+        # edit", capped at 0.8 so a variation never collapses into a copy.
+        identity_bias = min(0.8, 0.4 * attempt)
+    return _get_prompt_from_request(
+        req, var_type, intensity, identity_bias, subject_gender=subject_gender,
+        pose_hint=pose_hint, background_hint=background_hint, hints=hints,
+    )
+
+
 # =============================================================================
 # Helper functions for reading the request and building the prompt.
 # =============================================================================
@@ -1292,13 +1412,16 @@ def generate_one(
     pose_hint: Optional[str] = None,
     background_hint: Optional[str] = None,
     hints: Optional[Dict[str, str]] = None,
+    prompt: Optional[str] = None,
+    prompt_cache: Optional[PromptCache] = None,
 ) -> Dict[str, Any]:
     """Generate a single variation for one validator request.
 
     Separate from :func:`generate_variations` so a caller that measured the
     result — the identity check in ``image_generator`` — can re-roll one slot
     without regenerating the others. The pipeline is cached, so a retry costs
-    one denoising pass, not another model load.
+    one denoising pass, not another model load; its weights stay on the GPU
+    between attempts until free_gpu() (the GPU scheduler's release hook).
 
     Args:
         base_image: PIL Image of the base face.
@@ -1315,10 +1438,15 @@ def generate_one(
             attempt's environment read wrong (see BACKGROUND_HINTS).
         hints: Hints by component (pose, background, lighting, expression,
             accessory) after measured misses; see _get_prompt_from_request.
+        prompt: The prompt text to use instead of building one (build_prompt),
+            so a caller can encode it ahead or re-use it exactly.
+        prompt_cache: This request's PromptCache; with it a FLUX.2 klein
+            attempt runs on prompt embeddings and leaves the text encoder
+            off the GPU.
 
     Returns:
-        Dict with ``image``, ``variation_type``, ``model_key``, ``model_id``
-        and ``attempt``.
+        Dict with ``image``, ``variation_type``, ``model_key``, ``model_id``,
+        ``attempt`` and ``prompt``.
     """
     model_key = model_key or _select_model()
     pipe = _get_pipeline(model_key)
@@ -1334,42 +1462,35 @@ def generate_one(
         )
 
     var_type, intensity = _get_type_and_intensity(req)
-    # Each attempt steps 40% further toward "hold the face, soften the edit",
-    # capped at 0.8 so a variation never collapses into a copy of the input.
     if identity_bias is None:
         identity_bias = min(0.8, 0.4 * attempt)
-    prompt = _get_prompt_from_request(
-        req, var_type, intensity, identity_bias, subject_gender=subject_gender,
-        pose_hint=pose_hint, background_hint=background_hint, hints=hints,
-    )
+    if prompt is None:
+        prompt = build_prompt(
+            req, attempt, identity_bias, subject_gender=subject_gender,
+            hints=hints, pose_hint=pose_hint, background_hint=background_hint,
+        )
     seed = random.randint(0, 2**31 - 1)
     negative_prompt = (
         SCREEN_REPLAY_NEGATIVE_PROMPT if var_type == SCREEN_REPLAY_TYPE
         else NEGATIVE_PROMPT
     )
+    kwargs = _common_generate_kwargs(intensity, seed, identity_bias, negative_prompt)
+    if prompt_cache is not None and model_type == "flux_klein" and prompt_cache.pipe is pipe:
+        try:
+            kwargs["prompt_embeds"] = prompt_cache.get(prompt)
+        except Exception as e:  # noqa: BLE001 — the text prompt still works
+            logger.warning("Prompt embedding failed (%s); using the text prompt.", e)
 
     try:
-        gen_image = generator(
-            pipe, base_image, prompt,
-            **_common_generate_kwargs(
-                intensity, seed, identity_bias, negative_prompt,
-            ),
-        )
+        gen_image = generator(pipe, base_image, prompt, **kwargs)
     except Exception as e:
         raise RuntimeError(
             f"Variation failed for {var_type}({intensity}) "
             f"with {loaded_key} on attempt {attempt}: {e}"
         ) from e
-    finally:
-        # Mapped offload leaves the last model on the GPU; the card is shared
-        # with the identity check and with sibling miner processes.
-        try:
-            from .models._cuda_place import release_offloaded
-            release_offloaded(pipe)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Could not release the offloaded pipeline: %s", e)
 
     return {
+        "prompt": prompt,
         "image": gen_image,
         "variation_type": var_type,
         "model_key": loaded_key,

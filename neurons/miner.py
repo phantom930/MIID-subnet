@@ -115,6 +115,15 @@ from MIID.miner.request_archive import (
 from MIID.miner.gpu_scheduler import SCHEDULER, Turn, queue_cutoff
 from MIID.miner.gpu_scheduler import describe as describe_gpu_sharing
 
+# The image model keeps its weights on the GPU between attempts (mapped
+# offload); they are evicted when the GPU is handed over, and here before
+# the voice models need the room.
+try:
+    from MIID.miner.generate_variations import free_gpu as free_gpu_models
+except Exception:  # noqa: BLE001 — no image stack, nothing resident
+    def free_gpu_models() -> None:
+        return None
+
 # Running several hotkeys (docs/miner.md, "Running several hotkeys"): a
 # per-hotkey style profile and a shared ledger that keeps sibling hotkeys
 # from submitting near-identical takes. Needs the image stack.
@@ -726,6 +735,7 @@ class Miner(BaseMinerNeuron):
                 )
                 voice_summary["outcome"] = "skipped_deadline"
             else:
+                free_gpu_models()  # the image weights make room for the voice models
                 voice_started = time.time()
                 try:
                     voice_clip = self.clone_voice_request(

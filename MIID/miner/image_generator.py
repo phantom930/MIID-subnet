@@ -19,9 +19,11 @@ from PIL import Image
 from MIID.miner.generate_variations import (
     SCREEN_REPLAY_TYPE,
     active_model_key,
+    build_prompt,
     canonical_variation_type,
     generate_one,
     get_selected_model_info,
+    prepare_prompt_cache,
     requested_accessory,
     requested_levels,
 )
@@ -62,14 +64,18 @@ from MIID.miner import sibling_registry as siblings
 # to put identity first.
 IDENTITY_TARGET = float(os.environ.get("MIID_IDENTITY_TARGET", "0.7"))
 
-# Extra attempts per variation when the first one misses IDENTITY_TARGET.
-# Three: over 128 archived rounds (2026-10-12/13) the retry loop stopped on
-# "attempts used up" more often than on "every slot met its targets" (76 vs
-# 67) while the deadline never bound once, and a tenth of the
-# pose+expression slots still shipped under 0.6 — a slot that scores 0
-# whenever it is the one the validator samples. Whether they run is a
-# question of time: see generate_variations.
-IDENTITY_RETRIES = int(os.environ.get("MIID_IDENTITY_RETRIES", "3"))
+# Extra attempts per variation after the first pass: identity rescues (the
+# edit held back) and edit retries (a hint naming the measured miss). Zero
+# since 2026-10-16: six hotkeys share one 16 GB card, their first passes
+# alone fill most of it, and the user chose to spend what is left on polish
+# — full-strength re-rolls that keep the best take. With retries off, polish
+# also covers the slots that missed their targets (_Slot.polish_priority):
+# a new seed at full strength, a hint when an edit was measured short, and
+# the ranking in _Slot.record decides which take ships. Three is right for
+# a card with time to spare: over 128 archived rounds (2026-10-12/13) the
+# retry loop stopped on "attempts used up" more often than on "every slot
+# met its targets" (76 vs 67) while the deadline never bound once.
+IDENTITY_RETRIES = int(os.environ.get("MIID_IDENTITY_RETRIES", "0"))
 
 # Identity worth polishing toward once a slot already clears the target.
 # The validator ranks miners by validation score and breaks ties on identity
@@ -340,18 +346,26 @@ class _Slot:
             self.pose_direction, self.bg_miss, self.edit_misses, self.dup,
         ) = snapshot
 
-    def polish_priority(self, goal: float, polish_allowed: int) -> Optional[float]:
+    def polish_priority(
+        self, goal: float, polish_allowed: int, include_unsatisfied: bool = False,
+    ) -> Optional[float]:
         """Identity headroom a full-strength re-roll could still close, or None.
 
-        Only a slot that already meets its targets is polished — an unsatisfied
-        one is the rescue loop's business — and only while it is short of the
-        goal. screen_replay is skipped: the grading API ignores that slot.
+        A slot that meets its targets is polished while it is short of the
+        goal. One that does not is the retry loop's business — unless
+        ``include_unsatisfied`` (retries are off), when it is polished first:
+        a missed target outranks any identity headroom, since under the 0.6
+        gate the whole challenge is capped and a measured edit miss is a
+        grade lost whenever that slot is sampled. screen_replay is skipped:
+        the grading API ignores that slot.
         """
-        if self.best is None or not self.satisfied or self.screen_replay:
-            return None
-        if self.polished >= polish_allowed:
+        if self.best is None or self.screen_replay or self.polished >= polish_allowed:
             return None
         similarity = self.best["identity_similarity"]
+        if not self.satisfied:
+            if not include_unsatisfied:
+                return None
+            return 1.0 + (goal - min(similarity or 0.0, goal))
         if similarity is None or similarity >= goal:
             return None
         return goal - similarity
@@ -632,59 +646,40 @@ def generate_variations(
     slots = [_Slot(i, req) for i, req in enumerate(variation_requests)]
     first_attempt = [True]
 
-    # Face blends are CPU work (a few seconds each) and the GPU would sit
-    # idle for them, so during the first pass they run in one worker thread
-    # while the next slot generates; each is settled — identity and edit
-    # re-measured, the take re-judged — before anything depends on it.
-    blend_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="face-blend")
-    pending: Dict[int, Tuple[Future, Dict]] = {}
-
-    def blend_job(slot: _Slot, result: Dict) -> Optional[Dict]:
+    # The request's prompts, built ahead so FLUX.2 klein can encode them in
+    # one text-encoder pass (generate_variations.PromptCache) instead of one
+    # per attempt — the 8 GB text encoder then leaves the GPU to the
+    # transformer for the rest of the request — and so a polish re-roll can
+    # re-use a slot's prompt exactly. None for models without embeddings.
+    prompt_cache = prepare_prompt_cache(model_info["key"])
+    first_prompts: Dict[int, str] = {}
+    for slot in slots:
         try:
-            return face_blend.apply(
-                base_image, base_embedding, base_geometry, result,
-                edit_context=edit_context, levels=slot.levels,
-                accessory=slot.accessory, scene=slot.scene,
+            first_prompts[slot.index] = build_prompt(
+                slot.req, attempt=0, identity_bias=0.0, subject_gender=subject_gender,
             )
-        except Exception as e:
-            bt.logging.warning(f"Face blend failed: {e}")
-            return None
+        except Exception as e:  # noqa: BLE001 — generate_one builds its own then
+            bt.logging.warning(f"Could not build slot {slot.index}'s prompt ahead: {e}")
+    if prompt_cache is not None and first_prompts:
+        try:
+            encode_started = time.time()
+            encoded = prompt_cache.warm(list(first_prompts.values()))
+            bt.logging.debug(f"Encoded {encoded} first-pass prompt(s) in {time.time() - encode_started:.1f}s")
+        except Exception as e:  # noqa: BLE001
+            bt.logging.warning(f"Prompt embeddings unavailable ({e}); encoding per attempt.")
+            prompt_cache = None
 
-    def log_blend(result: Dict) -> None:
-        blend = result.get("blend")
-        if blend and blend.get("applied"):
-            bt.logging.info(f"{result['variation_type']}: {face_blend.describe(blend)}, {blend['seconds']:.1f}s")
-        elif blend and blend.get("reason"):
-            bt.logging.debug(f"{result['variation_type']}: face blend skipped — {blend['reason']}")
+    # Everything that judges a take after it is generated — identity, head
+    # turn, scene, edit measurements, the face blend, the sibling check — is
+    # CPU work or a small GPU model taking a few seconds, and the big model
+    # would sit idle for it. During the first pass it runs in one worker
+    # thread while the next slot generates; a slot is settled — judged and
+    # recorded — before anything depends on it (a retry, polish, ranking).
+    judge_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge")
+    pending: Dict[int, Future] = {}
 
-    def settle(slot: _Slot) -> None:
-        """Wait for the slot's deferred blend, if any, and re-judge the take."""
-        entry = pending.pop(slot.index, None)
-        if entry is None:
-            return
-        future, result = entry
-        result["blend"] = future.result()
-        if result["blend"] and result["blend"].get("applied"):
-            slot.rerecord(result, target)
-        log_blend(result)
-
-    def settle_all() -> None:
-        for slot in slots:
-            settle(slot)
-
-    def run_attempt(
-        slot: _Slot, identity_bias: float, hints: Optional[Dict[str, str]] = None,
-        defer_blend: bool = False,
-    ) -> None:
-        settle(slot)
-        cycle_started = time.time()
-        result = generate_one(
-            base_image, slot.req, model_key=model_info["key"],
-            attempt=slot.generated, subject_gender=subject_gender,
-            identity_bias=identity_bias, hints=hints,
-        )
-        generated_at = time.time()
-        slot.generated += 1
+    def judge(slot: _Slot, result: Dict, cycle_started: float, generated_at: float) -> None:
+        """Measure, blend, check against the siblings and record one attempt."""
         result["identity_similarity"] = _similarity(base_embedding, result["image"])
         identity_at = time.time()
         result["pose_yaw"] = (
@@ -701,44 +696,78 @@ def generate_variations(
         # A take short of the blend goal on a blendable slot gets the base
         # face blended back in (face_blend): identity rises, the edit stays,
         # and the take is re-measured so the ranking sees the final image.
-        # In the first pass this happens in the background (see settle).
         result["blend"] = None
-        deferred = False
         if face_blend.wanted(slot.background, result):
-            if defer_blend:
-                pending[slot.index] = (blend_pool.submit(blend_job, slot, result), result)
-                deferred = True
-            else:
-                result["blend"] = blend_job(slot, result)
+            try:
+                result["blend"] = face_blend.apply(
+                    base_image, base_embedding, base_geometry, result,
+                    edit_context=edit_context, levels=slot.levels,
+                    accessory=slot.accessory, scene=slot.scene,
+                )
+            except Exception as e:
+                bt.logging.warning(f"Face blend failed: {e}")
         result["sibling"] = None
         if sibling is not None and not slot.screen_replay:
             try:
                 fingerprint = siblings.fingerprint(result["image"])
                 match = sibling.closest(result["variation_type"], fingerprint)
                 result["sibling"] = match.as_dict() if match else None
-                sibling.register(result["variation_type"], slot.generated, fingerprint)
+                sibling.register(result["variation_type"], result["winning_attempt"], fingerprint)
             except Exception as e:
                 bt.logging.warning(f"Sibling ledger failed: {e}")
         checked_at = time.time()
-        result["winning_attempt"] = slot.generated
         # The request's first cycle carries warm-up (pipeline load, offload
-        # hooks) and would overstate every later one.
+        # hooks) and would overstate every later one. A cycle is the GPU
+        # time plus the judging, whether or not the two overlapped: it is
+        # what a retry or polish attempt, which cannot overlap, will cost.
         if not first_attempt[0]:
-            _recent_cycles.append(checked_at - cycle_started)
+            _recent_cycles.append((generated_at - cycle_started) + (checked_at - generated_at))
         first_attempt[0] = False
         slot.record(result, target)
         measured = describe_edit(result.get("edit"))
         blended = face_blend.describe(result.get("blend"))
         bt.logging.debug(
-            f"{result['variation_type']}: attempt {slot.generated} — generate "
+            f"{result['variation_type']}: attempt {result['winning_attempt']} — generate "
             f"{generated_at - cycle_started:.1f}s, identity {identity_at - generated_at:.1f}s, "
             f"checks {checked_at - identity_at:.1f}s"
             + (f"; {measured}" if measured else "")
             + (f"; {blended}" if blended else "")
-            + ("; face blend running in the background" if deferred else "")
         )
-        if not deferred:
-            log_blend(result)
+        blend = result.get("blend")
+        if blend and blend.get("applied"):
+            bt.logging.info(f"{result['variation_type']}: {face_blend.describe(blend)}, {blend['seconds']:.1f}s")
+        elif blend and blend.get("reason"):
+            bt.logging.debug(f"{result['variation_type']}: face blend skipped — {blend['reason']}")
+
+    def settle(slot: _Slot) -> None:
+        """Wait for the slot's deferred judgement, if any."""
+        future = pending.pop(slot.index, None)
+        if future is not None:
+            future.result()
+
+    def settle_all() -> None:
+        for slot in slots:
+            settle(slot)
+
+    def run_attempt(
+        slot: _Slot, identity_bias: float, hints: Optional[Dict[str, str]] = None,
+        defer: bool = False, prompt: Optional[str] = None,
+    ) -> None:
+        settle(slot)
+        cycle_started = time.time()
+        result = generate_one(
+            base_image, slot.req, model_key=model_info["key"],
+            attempt=slot.generated, subject_gender=subject_gender,
+            identity_bias=identity_bias, hints=hints,
+            prompt=prompt, prompt_cache=prompt_cache,
+        )
+        generated_at = time.time()
+        slot.generated += 1
+        result["winning_attempt"] = slot.generated
+        if defer:
+            pending[slot.index] = judge_pool.submit(judge, slot, result, cycle_started, generated_at)
+        else:
+            judge(slot, result, cycle_started, generated_at)
 
     # ── phase 1: one attempt per slot ──
     skipped = []
@@ -746,10 +775,12 @@ def generate_variations(
         if deadline is not None and time.time() + cycle_estimate() > deadline:
             skipped.append(slot)
             continue
-        run_attempt(slot, 0.0, None, defer_blend=True)
+        run_attempt(slot, 0.0, None, defer=True, prompt=first_prompts.get(slot.index))
     settle_all()
-    blend_pool.shutdown(wait=True)
+    judge_pool.shutdown(wait=True)
     first_pass_seconds = time.time() - started
+    if prompt_cache is not None:
+        bt.logging.debug(prompt_cache.describe())
     if skipped:
         bt.logging.warning(
             f"Deadline: no time for {len(skipped)} slot(s) "
@@ -782,7 +813,7 @@ def generate_variations(
         ]
         if not candidates:
             if any(not s.satisfied for s in slots if s.best is not None):
-                stop_reason = "attempts used up"
+                stop_reason = "attempts used up" if retries > 0 else "retries off, polish takes over"
             break
         cutoff, stop_reason = next_cutoff()
         if time.time() + cycle_estimate() > cutoff:
@@ -828,14 +859,18 @@ def generate_variations(
         run_attempt(slot, identity_bias, hints)
         retries_run += 1
 
-    # ── phase 3: polish — full-strength re-rolls of satisfied slots, while time allows ──
+    # ── phase 3: polish — full-strength re-rolls, while time allows ──
+    # Satisfied slots short of the identity goal; with retries off, first the
+    # slots that missed a target (identity or a measured edit), since nothing
+    # else will re-roll them.
+    polish_unsatisfied = retries == 0
     polish_run = 0
     polish_kept = 0
     polish_stop = "every slot at the goal or polished out"
     while polish_allowed > 0 and not gpu_lost:
         candidates = [
             (headroom, slot) for slot in slots
-            if (headroom := slot.polish_priority(goal, polish_allowed)) is not None
+            if (headroom := slot.polish_priority(goal, polish_allowed, polish_unsatisfied)) is not None
         ]
         if not candidates:
             polish_stop = "every slot at the goal or polished out"
@@ -860,8 +895,12 @@ def generate_variations(
                 "— keeping the best attempts."
             )
             break
+        _, slot = max(candidates, key=lambda c: (c[0], -c[1].index))
         if yield_fn is not None:
-            waited = yield_fn(cutoff - cycle_estimate(), 2)
+            # A slot still under the identity target queues at rescue
+            # priority (phase 1); everything else is surplus work (phase 2).
+            phase = 1 if not slot.identity_ok else 2
+            waited = yield_fn(cutoff - cycle_estimate(), phase)
             if waited is None:
                 gpu_lost = True
                 polish_stop = "the deadline, reached while queued for the GPU"
@@ -875,18 +914,34 @@ def generate_variations(
                     f"Handed the GPU to more urgent queued work for {waited:.0f}s; back for polish."
                 )
                 continue
-        _, slot = max(candidates, key=lambda c: (c[0], -c[1].index))
         incumbent = slot.snapshot()
+        incumbent_satisfied = slot.satisfied
         before = incumbent[0]["identity_similarity"]
         slot.polished += 1
-        # Full strength, no hints: the edit landed, only the face is being
-        # re-rolled. _Slot.record adopts the new take if it ranks higher —
-        # and then it stays only if it kept every measured edit of the one it
-        # replaced, because a higher-identity take is usually a weaker edit.
-        run_attempt(slot, 0.0, None)
+        hints: Optional[Dict[str, str]] = None
+        if incumbent_satisfied:
+            # Full strength, no hints: the edit landed, only the face is being
+            # re-rolled. _Slot.record adopts the new take if it ranks higher —
+            # and then it stays only if it kept every measured edit of the one
+            # it replaced, because a higher-identity take is usually a weaker
+            # edit. The same prompt as the first pass: only the seed moves.
+            run_attempt(slot, 0.0, None, prompt=first_prompts.get(slot.index))
+        else:
+            # A missed target: full strength again (never the edit held back),
+            # with a hint naming a measured edit miss; the ranking in record()
+            # keeps whichever take is better.
+            _, hints = slot.next_settings()
+            bt.logging.info(
+                f"{slot.best['variation_type']}: {slot.reason(target)} — re-rolling at full strength"
+                + (" with hints (" + ", ".join(f"{c}: {h}" for c, h in hints.items()) + ")." if hints else ".")
+            )
+            run_attempt(slot, 0.0, hints or None, prompt=None if hints else first_prompts.get(slot.index))
         polish_run += 1
         if slot.best is incumbent[0]:
             verdict = "kept the earlier take"
+        elif not incumbent_satisfied:
+            polish_kept += 1
+            verdict = "kept the new take" + ("" if slot.satisfied else f" ({slot.reason(target)})")
         else:
             kept, lost = edit_preserved(slot.levels, incumbent[0], slot.best, slot.scene)
             if kept:
@@ -896,9 +951,10 @@ def generate_variations(
                 slot.restore(incumbent)
                 verdict = f"kept the earlier take: the new one weakened the {lost}"
         after = slot.best["identity_similarity"]
+        shown = lambda v: "n/a" if v is None else f"{v:.3f}"  # noqa: E731
         bt.logging.info(
             f"{slot.best['variation_type']}: polish {slot.polished}/{polish_allowed} — "
-            f"identity {before:.3f} → {after:.3f} ({verdict})"
+            f"identity {shown(before)} → {shown(after)} ({verdict})"
         )
 
     # ── assemble, in request order ──

@@ -41,7 +41,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from typing import Iterator, List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 LOCK_DIR = os.environ.get("MIID_GPU_LOCK_DIR", "").strip()
 # How often a request waiting for another process's turn re-checks the lock.
@@ -97,6 +97,14 @@ class GpuScheduler:
         self.lock_dir = LOCK_DIR if lock_dir is None else lock_dir
         if self.lock_dir:
             os.makedirs(os.path.join(self.lock_dir, "waiting"), exist_ok=True)
+        # Run whenever a held turn is given up (release, yield, leaving the
+        # acquire block): the image model evicts its resident weights here,
+        # so the next process finds the card empty. Hooks must not raise.
+        self._release_hooks: List[Callable[[], None]] = []
+
+    def on_release(self, hook: Callable[[], None]) -> None:
+        """Call ``hook`` every time this process hands the GPU back."""
+        self._release_hooks.append(hook)
 
     # ── cross-process pieces ──
 
@@ -233,6 +241,11 @@ class GpuScheduler:
         if not turn.held:
             return
         turn.held = False
+        for hook in self._release_hooks:
+            try:
+                hook()
+            except Exception:  # noqa: BLE001 — a hook must never keep the GPU locked
+                pass
         if turn._fd is not None:
             try:
                 fcntl.flock(turn._fd, fcntl.LOCK_UN)

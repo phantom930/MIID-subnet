@@ -13,9 +13,10 @@ Standalone test:
     python flux_klein_model.py [path/to/seed_image.png]
 """
 
+import inspect
 import os
 import sys
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from PIL import Image
@@ -88,6 +89,28 @@ def load_pipeline(
     return pipe
 
 
+def supports_prompt_embeds(pipe) -> bool:
+    """True when ``pipe`` can take pre-computed prompt embeddings."""
+    try:
+        return hasattr(pipe, "encode_prompt") and "prompt_embeds" in inspect.signature(pipe.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def encode_prompts(pipe, prompts: List[str]) -> List[torch.Tensor]:
+    """Prompt embeddings for ``prompts`` from one text-encoder pass, each
+    ``(1, tokens, channels)`` on the CPU, in the order given.
+
+    The text encoder is 8.0 GB and uploaded to the GPU when it runs; one
+    pass for a whole request's prompts costs that upload once, where a
+    text prompt per attempt costs it every attempt (and evicts the
+    transformer each time).
+    """
+    with torch.no_grad():
+        embeds, _ = pipe.encode_prompt(list(prompts), device=pipe._execution_device)
+    return [e.unsqueeze(0).to("cpu") for e in embeds]
+
+
 def generate(
     pipe,
     image: Image.Image,
@@ -100,11 +123,14 @@ def generate(
     seed: Optional[int] = None,
     identity_bias: float = 0.0,
     negative_prompt: Optional[str] = None,
+    prompt_embeds: Optional[torch.Tensor] = None,
 ) -> Image.Image:
     """Generate a single variation and return the PIL Image.
 
     ``identity_bias`` (0–1) is raised on an identity retry: it eases the
     prompt off so the result drifts less far from the reference face.
+    ``prompt_embeds`` (from encode_prompts) stands in for ``prompt`` and
+    keeps the text encoder off the GPU.
     """
     try:
         from ._common import fit_to_target, generation_size, make_generator, supported_kwargs
@@ -117,11 +143,15 @@ def generate(
     steps = num_steps or DEFAULT_STEPS
     gen_w, gen_h = generation_size(width, height)
 
+    if prompt_embeds is not None:
+        text = {"prompt": None, "prompt_embeds": prompt_embeds.to(pipe._execution_device)}
+    else:
+        text = {"prompt": prompt}
     out = pipe(
-        prompt=prompt,
         image=[image],
         num_inference_steps=steps,
         guidance_scale=guidance,
+        **text,
         **supported_kwargs(
             pipe,
             width=gen_w,
