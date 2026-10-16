@@ -122,10 +122,6 @@ def voice_available() -> bool:
     return _availability
 
 
-# Name kept for callers written against the former worker-process design.
-voice_env_available = voice_available
-
-
 def _requested_device() -> str:
     wanted = os.environ.get("MIID_VOICE_DEVICE", "").strip().lower()
     if wanted:
@@ -519,9 +515,6 @@ def release_worker(force: bool = False) -> None:
         _MODELS.unload()
     elif not VOICE_KEEP_LOADED:
         _MODELS.park()
-
-
-release_models = release_worker
 
 
 def hash_voice_bytes(wav_bytes: bytes) -> str:

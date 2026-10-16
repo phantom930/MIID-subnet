@@ -5,6 +5,7 @@
 # See MIID.miner.generate_variations module docstring for setup.
 
 import base64
+import contextlib
 import hashlib
 import io
 import os
@@ -13,6 +14,7 @@ import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 import bittensor as bt
+import torch
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 from PIL import Image
 
@@ -677,44 +679,56 @@ def generate_variations(
     # recorded — before anything depends on it (a retry, polish, ranking).
     judge_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge")
     pending: Dict[int, Future] = {}
+    # The judging thread's GPU work (AdaFace, its face detector, the blend's
+    # identity reads) runs on its own CUDA stream. On the default stream it
+    # queues behind the thousands of denoising kernels the main thread keeps
+    # launching and finishes only when they do — measured live on
+    # 2026-10-16: identity 13–44 s per slot instead of 0.7 s, the first pass
+    # no shorter than before the overlap, and the attempt estimate inflated
+    # to 45 s. The current stream is per thread, so the main thread is not
+    # affected.
+    judge_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
     def judge(slot: _Slot, result: Dict, cycle_started: float, generated_at: float) -> None:
         """Measure, blend, check against the siblings and record one attempt."""
-        result["identity_similarity"] = _similarity(base_embedding, result["image"])
-        identity_at = time.time()
-        result["pose_yaw"] = (
-            _yaw(base_yaw, result["image"]) if slot.pose_level else None
-        )
-        result["environment"] = (
-            environment_probs(result["image"]) if slot.background else None
-        )
-        try:
-            result["edit"] = measure_edit(edit_context, result["image"], slot.levels, slot.accessory)
-        except Exception as e:
-            bt.logging.warning(f"Edit measurement failed: {e}")
-            result["edit"] = None
-        # A take short of the blend goal on a blendable slot gets the base
-        # face blended back in (face_blend): identity rises, the edit stays,
-        # and the take is re-measured so the ranking sees the final image.
-        result["blend"] = None
-        if face_blend.wanted(slot.background, result):
+        with (torch.cuda.stream(judge_stream) if judge_stream is not None else contextlib.nullcontext()):
+            result["identity_similarity"] = _similarity(base_embedding, result["image"])
+            identity_at = time.time()
+            result["pose_yaw"] = (
+                _yaw(base_yaw, result["image"]) if slot.pose_level else None
+            )
+            result["environment"] = (
+                environment_probs(result["image"]) if slot.background else None
+            )
             try:
-                result["blend"] = face_blend.apply(
-                    base_image, base_embedding, base_geometry, result,
-                    edit_context=edit_context, levels=slot.levels,
-                    accessory=slot.accessory, scene=slot.scene,
-                )
+                result["edit"] = measure_edit(edit_context, result["image"], slot.levels, slot.accessory)
             except Exception as e:
-                bt.logging.warning(f"Face blend failed: {e}")
-        result["sibling"] = None
-        if sibling is not None and not slot.screen_replay:
-            try:
-                fingerprint = siblings.fingerprint(result["image"])
-                match = sibling.closest(result["variation_type"], fingerprint)
-                result["sibling"] = match.as_dict() if match else None
-                sibling.register(result["variation_type"], result["winning_attempt"], fingerprint)
-            except Exception as e:
-                bt.logging.warning(f"Sibling ledger failed: {e}")
+                bt.logging.warning(f"Edit measurement failed: {e}")
+                result["edit"] = None
+            # A take short of the blend goal on a blendable slot gets the base
+            # face blended back in (face_blend): identity rises, the edit stays,
+            # and the take is re-measured so the ranking sees the final image.
+            result["blend"] = None
+            if face_blend.wanted(slot.background, result):
+                try:
+                    result["blend"] = face_blend.apply(
+                        base_image, base_embedding, base_geometry, result,
+                        edit_context=edit_context, levels=slot.levels,
+                        accessory=slot.accessory, scene=slot.scene,
+                    )
+                except Exception as e:
+                    bt.logging.warning(f"Face blend failed: {e}")
+            result["sibling"] = None
+            if sibling is not None and not slot.screen_replay:
+                try:
+                    fingerprint = siblings.fingerprint(result["image"])
+                    match = sibling.closest(result["variation_type"], fingerprint)
+                    result["sibling"] = match.as_dict() if match else None
+                    sibling.register(result["variation_type"], result["winning_attempt"], fingerprint)
+                except Exception as e:
+                    bt.logging.warning(f"Sibling ledger failed: {e}")
+            if judge_stream is not None:
+                judge_stream.synchronize()
         checked_at = time.time()
         # The request's first cycle carries warm-up (pipeline load, offload
         # hooks) and would overstate every later one. A cycle is the GPU

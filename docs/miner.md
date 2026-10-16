@@ -33,7 +33,7 @@ For the full roadmap and detailed architecture, see [Yanez Identity Generation B
 - A Bittensor wallet with TAO for registration
 - A Hugging Face account with an API token (free)
 - Access to the base image models used by the miner:
-  - [FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) (used by `flux_klein` and `pulid_flux2`)
+  - [FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) (used by `flux_klein`)
   - [FLUX.1-Kontext-dev](https://huggingface.co/black-forest-labs/FLUX.1-Kontext-dev) (used by `pulid` fallback and `flux_kontext` alternative)
   - Optional alternative: [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511)
 - **GPU with at least 8GB VRAM** (NVIDIA CUDA or Apple Silicon MPS) — required for production mining
@@ -262,7 +262,7 @@ python neurons/miner.py \
   --logging.debug
 ```
 
-The miner logs `Phase 4 image generation: ENABLED`, then **randomly picks one of three image models** per session (unless `MIID_MODEL` is set).
+The miner logs `Phase 4 image generation: ENABLED`, then loads `flux_klein` (or the model `MIID_MODEL` selects).
 
 ### Quick Start Cheat Sheet
 
@@ -415,8 +415,8 @@ MIID-subnet/miner_requests/2026-09-29/20260929T014500Z__challenge_1759000000_5Dv
 }
 ```
 
-`generation.model_key` records which approach ran, so you can compare how `flux_klein`, `pulid`
-and `pulid_flux2` are actually performing for you across rounds rather than guessing.
+`generation.model_key` records which approach ran, so you can compare how `flux_klein` and the
+models `MIID_MODEL` selects are actually performing for you across rounds rather than guessing.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -472,8 +472,8 @@ each round it prints:
 - **Δrep if reviewed.** The reputation change from the manual-review table (+0.10 for a 5,
   −0.10 for a −3). Reputation (UAV) carries 90% of miner emissions.
 
-The summary breaks scores down by model and by slot, so you can compare `flux_klein`, `pulid`
-and `pulid_flux2` on your own submissions.
+The summary breaks scores down by model and by slot, so you can compare `flux_klein` against
+the models `MIID_MODEL` selects on your own submissions.
 
 | Check | Score | Basis |
 |-------|-------|-------|
@@ -508,7 +508,7 @@ Environment variables:
 |----------|-------------|---------|
 | `HF_TOKEN` or `HUGGINGFACE_TOKEN` | Your Hugging Face API token | none |
 | `FLUX_DEVICE` | Device for image generation (`cuda`, `mps`, or `cpu`) | `cpu` |
-| `MIID_MODEL` | Force `flux_klein`, `flux_kontext`, `pulid`, `pulid_flux2`, or `qwen` | `flux_klein` (the only model in the random pool) |
+| `MIID_MODEL` | Select `flux_klein`, `pulid`, `flux_kontext`, or `qwen`; an unknown name logs a warning and uses `flux_klein` | `flux_klein` |
 | `MIID_INFERENCE_STEPS`, `MIID_GUIDANCE_SCALE` | Tune generation (see `MIID/miner/generate_variations.py`) | see code |
 | `MIID_IDENTITY_TARGET` | AdaFace similarity a slot should reach before its take is accepted as-is: under it the slot is re-rolled while time allows (a rescue attempt with the edit held back when `MIID_IDENTITY_RETRIES` is set, otherwise a full-strength polish re-roll), and between two takes of one slot the one over the target wins before edit strength is compared. The validator's gate is 0.6, but the paid top 50 of a round are decided by identity around 0.8, so the default was raised from 0.6 on 2026-10-15 | 0.7 |
 | `MIID_IDENTITY_RETRIES` | Extra attempts per slot that misses the identity target or a measured edit (identity rescues hold the edit back; edit retries carry a hint naming the miss). `0` since 2026-10-16: with six hotkeys on one 16 GB card the first passes fill it, and the time left goes to polish, which then also re-rolls the slots that missed a target (see `MIID_POLISH_ATTEMPTS`). Set 3 on a card with time to spare | 0 |
@@ -676,20 +676,17 @@ Validators may also request **accessories** on background edits (head coverings,
 
 ---
 
-## How the Three Image Models Work
+## How the Image Models Work
 
-The miner ships with **three** diffusion models. By default, the miner **randomly picks one at the start of each query** (unless `MIID_MODEL` is set).
+The miner runs `flux_klein` by default; `MIID_MODEL` selects one of the others. The main ones:
 
 | Model | Description | VRAM needed |
 |-------|-------------|-------------|
 | **FLUX.2-klein** (`flux_klein`) | Fast baseline model; lowest overhead and most stable default path | ~8 GB |
 | **PuLID** (`pulid`) | Identity-focused path: tries Nunchaku PuLID on CUDA, otherwise falls back to FLUX.1-Kontext | ~12 GB+ (Nunchaku path); fallback depends on Kontext |
-| **PuLID-FLUX2** (`pulid_flux2`) | FLUX.2-klein backbone for PuLID-FLUX2-style identity experiments | ~8 GB |
 
-Default behavior is:
-- If `MIID_MODEL` is set, the miner uses that exact model.
-- If `MIID_MODEL` is not set and `MIID_MODEL_RANDOM` is unset (or set to `1`), it randomly picks from the **three base models** above at the start of each query.
-- If `MIID_MODEL` is not set and `MIID_MODEL_RANDOM=0`, it uses `flux_klein`.
+`flux_kontext` (FLUX.1-Kontext-dev, ≥24 GB) and `qwen` (Qwen-Image-Edit-2511) are wired too. There is
+no PuLID adapter for the FLUX.2-klein 4B: the published PuLID-FLUX2 weights are sized for the 9B.
 
 If a model fails to load, the miner falls back to `flux_klein`. Licenses, pipeline details, and model wiring are documented in `MIID/miner/generate_variations.py`.
 

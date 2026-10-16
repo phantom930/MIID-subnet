@@ -7,16 +7,16 @@ This file makes the miner generate image variations.
 
 What this file does:
 1. Keeps a list of image models the miner can use.
-2. Picks one of the active models at random (or uses the forced model).
+2. Uses ``flux_klein``, or the model ``MIID_MODEL`` forces.
 3. Loads that model (importing from MIID.miner.models.*).
-4. Uses the model to make the requested image variations.
-5. Keeps the same return format so the rest of the miner still works.
+4. Builds the prompt for each requested variation and generates one attempt
+   (``generate_one``); image_generator owns retries and the identity checks.
 
 =============================================================================
-Base models (default pool)
+Models
 =============================================================================
 
-1. ``flux_klein``
+1. ``flux_klein`` (default)
    - Model: ``black-forest-labs/FLUX.2-klein-4B``
    - Why: fastest and lightest, good baseline for GPU-constrained setups.
 
@@ -25,21 +25,12 @@ Base models (default pool)
    - Why: very high identity fidelity without changing background/lighting.
    - Extra packages: ``pip install nunchaku`` (CUDA required for true PuLID).
 
-3. ``pulid_flux2``
-   - Model: ``black-forest-labs/FLUX.2-klein-4B`` (PuLID-FLUX2 adapter compatible)
-   - Why: strong identity preservation with the FLUX.2 Klein backbone,
-     compatible with Fayens PuLID-FLUX2 adapter weights.
-
-=============================================================================
-Recommended alternatives (easy to set up)
-=============================================================================
-
-4. ``flux_kontext``
+3. ``flux_kontext``
    - Model: ``black-forest-labs/FLUX.1-Kontext-dev``
    - Why: best text-guided editing quality with minimal visual drift.
    - Requires ≥24 GB VRAM on GPU.
 
-5. ``qwen``
+4. ``qwen``
    - Model: ``Qwen/Qwen-Image-Edit-2511``
    - Why: strong instruction-following image editor from Qwen.
    - Install latest diffusers from source for this model.
@@ -62,11 +53,9 @@ output and are willing to use API credits:
 How model choice works
 =============================================================================
 
-1. If ``MIID_MODEL`` is set, this file uses that exact model.
-2. If ``MIID_MODEL`` is not set, ``MIID_MODEL_RANDOM`` controls random selection.
-3. ``MIID_MODEL_RANDOM`` defaults to ``1`` (random among the 3 base models).
-4. Model selection happens once at the start of each query and is reused for all
-   variations in that query.
+1. If ``MIID_MODEL`` names a model above, this file uses that model.
+2. Otherwise it uses ``flux_klein``.
+3. A model that fails to load falls back to ``flux_klein``.
 
 =============================================================================
 How intensity works
@@ -90,7 +79,7 @@ Simple setup steps
    ``export HF_TOKEN="hf_..."``
 3. Install the packages for the model you want to use.
 
-Packages for ``flux_klein`` and ``pulid_flux2``:
+Packages for ``flux_klein``:
 - ``pip install diffusers transformers accelerate``
 
 Packages for ``pulid``:
@@ -109,21 +98,17 @@ Packages for ``qwen``:
 Helpful environment variables
 =============================================================================
 
-- ``MIID_MODEL``: force one model, for example ``flux_klein``
+- ``MIID_MODEL``: use another model, for example ``qwen``
 - ``FLUX_DEVICE``: choose ``cuda``, ``mps``, or ``cpu``
-- ``MIID_MODEL_RANDOM``: set to ``1`` to randomly pick among base models
 - ``MIID_INFERENCE_STEPS``: change number of generation steps
 - ``MIID_GUIDANCE_SCALE``: change prompt strength
 - ``MIID_OUTPUT_WIDTH`` / ``MIID_OUTPUT_HEIGHT``: output size, default the
   1015 x 1350 the validator asks for; set both to 0 to ship raw model output
-- ``MIID_IDENTITY_TARGET``: AdaFace similarity a variation must reach before it
-  is accepted without a retry (default 0.6 — the validator's own gate)
-- ``MIID_IDENTITY_RETRIES``: extra attempts per variation when it misses that
-  target, or when its measured head turn misses the requested pose range
-  (default 2)
-- ``MIID_GENERATION_BUDGET_SECONDS``: wall-clock budget for one request's
-  generation, retries included (default 900, inside the validator's 1200s)
 - ``HF_TOKEN``: Hugging Face access token
+
+Identity targets, retries, polish and the generation budget are
+image_generator's (``MIID_IDENTITY_*``, ``MIID_POLISH_ATTEMPTS``,
+``MIID_GENERATION_BUDGET_SECONDS``); see docs/miner.md.
 
 =============================================================================
 Testing individual models
@@ -132,7 +117,6 @@ Testing individual models
 Each model can be tested standalone from MIID/miner/models/:
     python MIID/miner/models/flux_klein_model.py [seed_image.png]
     python MIID/miner/models/pulid_model.py [seed_image.png]
-    python MIID/miner/models/pulid_flux2_model.py [seed_image.png]
     python MIID/miner/models/flux_kontext_model.py [seed_image.png]
     python MIID/miner/models/qwen_model.py [seed_image.png]
 
@@ -629,14 +613,17 @@ def _screen_replay_prompt(
 # Available models
 # =============================================================================
 
+# flux_klein is the default; the others are selected with MIID_MODEL. There is
+# no PuLID adapter for this FLUX.2 Klein 4B: the only published weights
+# (Fayens/Pulid-Flux2) are 4096 wide, the Klein 9B width, against the 4B's
+# 3072, and the 9B transformer (~18 GB bf16) does not fit a 16 GB card
+# (checked 2026-10-15).
 AVAILABLE_MODELS: Dict[str, Dict[str, Any]] = {
-    # ── Base models (default pool for random selection) ──
     "flux_klein": {
         "model_id": "black-forest-labs/FLUX.2-klein-4B",
         "type": "flux_klein",
         "params": "4B",
         "license": "FLUX.1 dev non-commercial (commercial available from BFL)",
-        "base": True,
         "notes": (
             "Original default. Lightweight, fast inference. "
             "Good baseline for GPU-constrained setups."
@@ -647,52 +634,20 @@ AVAILABLE_MODELS: Dict[str, Dict[str, Any]] = {
         "type": "pulid",
         "params": "~12B",
         "license": "NeurIPS 2024 (ByteDance) / FLUX dev non-commercial",
-        # Out of the random pool: without nunchaku it is FLUX.1 Kontext, which
-        # kept the seed's face pixels (copy-paste risk) and returned unchanged
-        # images for pose/expression slots. Still selectable via MIID_MODEL.
-        "base": False,
+        # Without nunchaku this is FLUX.1 Kontext, which kept the seed's face
+        # pixels (copy-paste risk) and returned unchanged images for
+        # pose/expression slots.
         "notes": (
             "PuLID: Pure and Lightning ID Customization. Very high identity "
             "fidelity. Uses Nunchaku PuLIDFluxPipeline on CUDA; falls back to "
             "FLUX.1 Kontext when Nunchaku is unavailable."
         ),
     },
-    "pulid_flux2": {
-        "model_id": "black-forest-labs/FLUX.2-klein-4B",
-        "type": "pulid_flux2",
-        "params": "4B",
-        "license": "FLUX.1 dev non-commercial",
-        # Out of the random pool: no PuLID adapter is loaded, so this is the
-        # same FLUX.2 Klein weights as flux_klein with slower sequential
-        # offload (~41 s vs ~37 s per attempt), and a random switch between
-        # the two reloaded the pipeline (~13 s) for no difference in output.
-        # MIID_MODEL=pulid_flux2 still selects it.
-        #
-        # Checked 2026-10-15: the only published adapter weights
-        # (Fayens/Pulid-Flux2, pulid_flux2_klein_v1/v2.safetensors, 341M
-        # params F32) are 4096 wide — the Klein 9B width; this 4B model is
-        # 3072 wide (24 heads × 128), and the reference ComfyUI node then
-        # substitutes a randomly initialised projection and injector. The
-        # checkpoint's cross-attention keys (pulid_ca_double.*,
-        # pulid_ca_single.*) also do not match the node's module names
-        # (double_ca.*, single_ca.*), so they are skipped by its non-strict
-        # load. No standalone inference code and no reported identity
-        # numbers exist. Not a usable identity lever for the 4B on a 16 GB
-        # card; the 9B transformer (~18 GB bf16) would not fit either.
-        "base": False,
-        "notes": (
-            "FLUX.2 Klein backbone compatible with Fayens PuLID-FLUX2 adapter "
-            "weights (pulid_flux2_klein_v1/v2.safetensors). Strong identity "
-            "preservation with reduced artifacts."
-        ),
-    },
-    # ── Recommended alternatives ──
     "flux_kontext": {
         "model_id": "black-forest-labs/FLUX.1-Kontext-dev",
         "type": "flux_kontext",
         "params": "12B",
         "license": "FLUX.1 dev non-commercial (commercial $999/mo from BFL)",
-        "base": False,
         "notes": (
             "Context-aware editing model from Black Forest Labs. Best text-guided "
             "editing quality with minimal visual drift. Requires ≥24 GB VRAM."
@@ -703,7 +658,6 @@ AVAILABLE_MODELS: Dict[str, Dict[str, Any]] = {
         "type": "qwen",
         "params": "~14B",
         "license": "Check Qwen model card",
-        "base": False,
         "notes": (
             "Qwen's instruction-based image editor. Strong prompt following. "
             "Requires latest diffusers from source and torchvision."
@@ -711,7 +665,7 @@ AVAILABLE_MODELS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-BASE_MODELS = [k for k, v in AVAILABLE_MODELS.items() if v.get("base")]
+DEFAULT_MODEL = "flux_klein"
 
 # =============================================================================
 # Module state
@@ -726,26 +680,17 @@ _cached_model_key: Optional[str] = None
 
 
 def _select_model() -> str:
-    """Choose the model for this generation round."""
-
+    """The model for this request: MIID_MODEL when it names one, else the default."""
     forced = os.environ.get("MIID_MODEL", "").strip().lower()
-    # Default behavior: randomly pick among base models each call.
-    random_flag = os.environ.get("MIID_MODEL_RANDOM", "1").strip().lower() in (
-        "1", "true", "yes",
-    )
-
-    if forced and forced in AVAILABLE_MODELS:
+    if forced in AVAILABLE_MODELS:
         selected_model = forced
-        logger.info("Model forced via MIID_MODEL env var: %s", selected_model)
-    elif random_flag:
-        selected_model = random.choice(BASE_MODELS)
-        logger.info("Randomly selected model for this round: %s", selected_model)
     else:
-        selected_model = "flux_klein"
-        logger.info(
-            "Using default model: %s (override with MIID_MODEL=..., or MIID_MODEL_RANDOM=1)",
-            selected_model,
-        )
+        if forced:
+            logger.warning(
+                "MIID_MODEL=%s is not one of %s; using %s.",
+                forced, ", ".join(AVAILABLE_MODELS), DEFAULT_MODEL,
+            )
+        selected_model = DEFAULT_MODEL
 
     cfg = AVAILABLE_MODELS[selected_model]
     logger.info(
@@ -792,11 +737,6 @@ def _load_pulid() -> Any:
     return load_pipeline(device=DEVICE, token=_get_hf_token())
 
 
-def _load_pulid_flux2() -> Any:
-    from .models.pulid_flux2_model import load_pipeline
-    return load_pipeline(device=DEVICE, token=_get_hf_token())
-
-
 def _load_flux_kontext() -> Any:
     from .models.flux_kontext_model import load_pipeline
     return load_pipeline(device=DEVICE, token=_get_hf_token())
@@ -810,7 +750,6 @@ def _load_qwen() -> Any:
 _MODEL_LOADERS: Dict[str, Any] = {
     "flux_klein":   _load_flux_klein,
     "pulid":        _load_pulid,
-    "pulid_flux2":  _load_pulid_flux2,
     "flux_kontext": _load_flux_kontext,
     "qwen":         _load_qwen,
 }
@@ -850,8 +789,8 @@ def _get_pipeline(model_key: str) -> Any:
     if _cached_pipeline is not None and _cached_model_key == model_key:
         return _cached_pipeline
 
-    # Model choice is re-rolled per query, so this is the swap path: free the
-    # outgoing pipeline before the incoming one starts allocating.
+    # A different model (MIID_MODEL changed, or a fallback): free the outgoing
+    # pipeline before the incoming one starts allocating.
     _release_pipeline()
 
     loader = _MODEL_LOADERS.get(model_key)
@@ -1070,11 +1009,6 @@ def requested_levels(req: Any) -> Dict[str, str]:
     var_type = _req_field(req, "type")
     canonical = _canonical_background_type(req, var_type) if var_type else var_type
     return dict(_split_components(canonical, _req_field(req, "intensity")))
-
-
-def requested_pose_level(req: Any) -> Optional[str]:
-    """The intensity a slot asks of its pose_edit component, or None."""
-    return requested_levels(req).get("pose_edit")
 
 
 def requested_accessory(req: Any) -> Optional[str]:
@@ -1358,13 +1292,6 @@ def _generate_with_pulid(
     return generate(pipe, base_image, prompt, **kwargs)
 
 
-def _generate_with_pulid_flux2(
-    pipe: Any, base_image: Image.Image, prompt: str, **kwargs: Any,
-) -> Image.Image:
-    from .models.pulid_flux2_model import generate
-    return generate(pipe, base_image, prompt, **kwargs)
-
-
 def _generate_with_flux_kontext(
     pipe: Any, base_image: Image.Image, prompt: str, **kwargs: Any,
 ) -> Image.Image:
@@ -1382,7 +1309,6 @@ def _generate_with_qwen(
 _GENERATORS: Dict[str, Any] = {
     "flux_klein":   _generate_with_flux_klein,
     "pulid":        _generate_with_pulid,
-    "pulid_flux2":  _generate_with_pulid_flux2,
     "flux_kontext": _generate_with_flux_kontext,
     "qwen":         _generate_with_qwen,
 }
@@ -1417,9 +1343,9 @@ def generate_one(
 ) -> Dict[str, Any]:
     """Generate a single variation for one validator request.
 
-    Separate from :func:`generate_variations` so a caller that measured the
-    result — the identity check in ``image_generator`` — can re-roll one slot
-    without regenerating the others. The pipeline is cached, so a retry costs
+    One slot at a time, so a caller that measured the result — the identity
+    check in ``image_generator`` — can re-roll one slot without regenerating
+    the others. The pipeline is cached, so a retry costs
     one denoising pass, not another model load; its weights stay on the GPU
     between attempts until free_gpu() (the GPU scheduler's release hook).
 
@@ -1498,40 +1424,3 @@ def generate_one(
         "attempt": attempt,
     }
 
-
-def generate_variations(
-    base_image: Image.Image,
-    variation_requests: List[Any],
-    model_key: Optional[str] = None,
-    subject_gender: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Generate one image variation per validator request, first attempt only.
-
-    Picks and loads the model once, then runs :func:`generate_one` for each
-    request. No identity checking happens here — ``image_generator`` owns that,
-    because it is the layer that can re-roll a slot that came back too far from
-    the reference face.
-
-    Args:
-        base_image: PIL Image of the base face.
-        variation_requests: List of validator requests; each has ``.type`` and
-            ``.intensity`` (e.g. ``VariationRequest`` or dict).
-
-    Returns:
-        List of dicts as returned by :func:`generate_one` — ``image``,
-        ``variation_type``, ``model_key``, ``model_id``, ``attempt``.
-    """
-    if not variation_requests:
-        return []
-
-    model_key = model_key or _select_model()
-
-    logger.info(
-        "Generating %d variation(s) with %s (%s)",
-        len(variation_requests), model_key, AVAILABLE_MODELS[model_key]["model_id"],
-    )
-
-    return [
-        generate_one(base_image, req, model_key=model_key, subject_gender=subject_gender)
-        for req in variation_requests
-    ]

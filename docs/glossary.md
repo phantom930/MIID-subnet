@@ -206,8 +206,7 @@ Hardcoded unless the row says otherwise.
 |------|--------|
 | `HF_TOKEN` | Hugging Face token; required to pull the diffusion weights (miner only). |
 | `FLUX_DEVICE` | `cuda`, `mps`, or `cpu`. |
-| `MIID_MODEL` | Forces one model instead of the random pick. |
-| `MIID_MODEL_RANDOM` | Defaults to `1` — random base model per query. |
+| `MIID_MODEL` | Selects another model than the default `flux_klein`. |
 | `MIID_INFERENCE_STEPS` / `MIID_GUIDANCE_SCALE` | Diffusion knobs, default 20 and 3.5. |
 | `MIID_USE_S3`, `MIID_S3_BUCKET`, `MIID_S3_REGION`, `MIID_LOCAL_STORAGE` | Storage routing. |
 | `MIID_IMAGES_SERVER` | Base image / IOTD server, default `http://52.44.186.20:5000` (validator only). The only external endpoint that is overridable. |
@@ -219,18 +218,15 @@ Hardcoded unless the row says otherwise.
 
 ## 11. Model vocabulary
 
-Defined in [`MIID/miner/generate_variations.py`](../MIID/miner/generate_variations.py). One of the
-base models is picked at random per query unless `MIID_MODEL` forces one; a load failure falls
-back to `flux_klein`.
+Defined in [`MIID/miner/generate_variations.py`](../MIID/miner/generate_variations.py). The miner
+uses `flux_klein` unless `MIID_MODEL` selects another; a load failure falls back to `flux_klein`.
 
 | Key | What it is |
 |-----|-----------|
 | `flux_klein` | FLUX.2-klein-4B. The lightweight default and the fallback. |
 | `pulid` | PuLID ("Pure and Lightning ID Customization") via Nunchaku on CUDA, falling back to FLUX.1-Kontext. Highest identity fidelity. |
-| `pulid_flux2` | FLUX.2 Klein backbone with PuLID-FLUX2 adapter weights. |
 | `flux_kontext` | FLUX.1-Kontext-dev. Wired but opt-in; needs ≥24 GB VRAM. |
 | `qwen` | Qwen-Image-Edit-2511. Wired but opt-in. |
-| **Base models** | The three entries with `base: True` — the random-selection pool. |
 | **Nunchaku** | The quantised inference runtime PuLID uses when available on CUDA. |
 
 ---

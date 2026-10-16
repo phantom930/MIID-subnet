@@ -344,8 +344,7 @@ class Miner(BaseMinerNeuron):
         if PHASE4_AVAILABLE:
             bt.logging.info("Phase 4 image generation: ENABLED")
 
-            forced_model = os.environ.get("MIID_MODEL", "").strip() or "(unset -> random base model)"
-            random_flag = os.environ.get("MIID_MODEL_RANDOM", "1").strip()
+            forced_model = os.environ.get("MIID_MODEL", "").strip() or "(unset -> flux_klein)"
             inference_steps = os.environ.get("MIID_INFERENCE_STEPS", "6").strip()
             guidance_scale = os.environ.get("MIID_GUIDANCE_SCALE", "3.5").strip()
             flux_device = os.environ.get("FLUX_DEVICE", "(auto)").strip()
@@ -357,7 +356,7 @@ class Miner(BaseMinerNeuron):
                 offload = "(unknown)"
             alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "(unset)").strip()
             bt.logging.info(
-                f"Phase 4 env: MIID_MODEL={forced_model} MIID_MODEL_RANDOM={random_flag} "
+                f"Phase 4 env: MIID_MODEL={forced_model} "
                 f"MIID_INFERENCE_STEPS={inference_steps} MIID_GUIDANCE_SCALE={guidance_scale} "
                 f"FLUX_DEVICE={flux_device} MIID_ENABLE_CPU_OFFLOAD={enable_offload} "
                 f"offload mode={offload} PYTORCH_CUDA_ALLOC_CONF={alloc_conf}"

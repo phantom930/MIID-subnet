@@ -446,10 +446,9 @@ Every function on the live path, by file. Helpers are prefixed `_`.
 | Function | Role |
 |---|---|
 | `generate_one()` | One variation; re-rolls seed and raises `identity_bias` per attempt |
-| `generate_variations()` | First-pass loop over all requests |
 | `_select_model()` / `get_selected_model_info()` / `active_model_key()` | Which model is chosen vs actually loaded |
 | `_get_pipeline()` / `_release_pipeline()` | Cached pipeline, with `flux_klein` fallback |
-| `_load_*()` (5) | Lazy per-backend loaders |
+| `_load_*()` (4) | Lazy per-backend loaders |
 | `_generate_with_*()` (5) | Per-backend dispatch |
 | `_common_generate_kwargs()` | Args every backend takes identically |
 | `_get_prompt_from_request()` | Builds the prompt: framing → edit → identity |
@@ -457,7 +456,7 @@ Every function on the live path, by file. Helpers are prefixed `_`.
 | `_canonical_background_type()` / `_get_type_and_intensity()` | Normalizes the request |
 | `_resolve_device()` / `_get_hf_token()` | Device and credentials |
 
-**[`MIID/miner/models/`](../MIID/miner/models/)** — each of `flux_klein_model`, `pulid_model`, `pulid_flux2_model`, `flux_kontext_model`, `qwen_model` exposes `load_pipeline()` + `generate()` and a `main()` for standalone testing.
+**[`MIID/miner/models/`](../MIID/miner/models/)** — each of `flux_klein_model`, `pulid_model`, `flux_kontext_model`, `qwen_model` exposes `load_pipeline()` + `generate()` and a `main()` for standalone testing.
 
 - `_common.py` — `supported_kwargs()` (drop kwargs a pipeline doesn't accept), `generation_size()` (snap to the latent stride), `fit_to_target()` (crop + resize to the requested frame), `make_generator()` (per-attempt seed)
 - `_cuda_place.py` — `place_diffusers_pipeline()` (full GPU vs model vs sequential offload), `_total_vram_gib()`

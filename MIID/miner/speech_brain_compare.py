@@ -17,7 +17,6 @@ import bittensor as bt
 from MIID.miner.voice_generator import voice_available, voice_similarity  # noqa: F401
 
 
-SPEECHBRAIN_MODEL_ID = "speechbrain/spkrec-ecapa-voxceleb"
 DEFAULT_MIN_SIMILARITY = 0.6
 
 
