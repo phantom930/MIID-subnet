@@ -114,6 +114,7 @@ from MIID.miner.request_archive import (
 # One GPU shared by every validator's request: earliest deadline first.
 from MIID.miner.gpu_scheduler import SCHEDULER, Turn, queue_cutoff
 from MIID.miner.gpu_scheduler import describe as describe_gpu_sharing
+from MIID.miner import gpu_health
 
 # The image model keeps its weights on the GPU between attempts (mapped
 # offload); they are evicted when the GPU is handed over, and here before
@@ -309,6 +310,11 @@ class Miner(BaseMinerNeuron):
     def __init__(self, config=None):
         super(Miner, self).__init__(config=config)
 
+        # GPU memory creep guards (MIID/miner/gpu_health.py): trace where live
+        # GPU memory was allocated, and restart cleanly before the card fills.
+        gpu_health.start_trace()
+        gpu_health.start_recycler(lambda: not SCHEDULER.idle(), SCHEDULER.lock_dir)
+
         self.output_path = os.path.join(self.config.logging.logging_dir, "mining_results")
         os.makedirs(self.output_path, exist_ok=True)
         bt.logging.info(f"Mining results will be saved to: {self.output_path}")
@@ -480,6 +486,10 @@ class Miner(BaseMinerNeuron):
         Returns:
             The synapse with s3_submissions and/or voice_s3_submissions populated
         """
+        with gpu_health.inflight():  # no clean-restart recycle while a request runs
+            return await self._forward(synapse)
+
+    async def _forward(self, synapse: IdentitySynapse) -> IdentitySynapse:
         received = time.time()
         deadline, sent_at = self._request_deadline(synapse, received)
         if synapse.image_request is None and synapse.voice_request is None:

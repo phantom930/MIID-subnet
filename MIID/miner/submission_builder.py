@@ -80,6 +80,9 @@ def free_gpu_memory(stage: str = "") -> None:
                 f"torch_reserved={reserved_b / gib:.2f} GiB, "
                 f"torch_allocated={allocated_b / gib:.2f} GiB"
             )
+            if stage == "before_request":
+                from MIID.miner import gpu_health
+                gpu_health.report(stage)
     except Exception as _e:
         bt.logging.debug(f"free_gpu_memory({stage}) failed: {_e}")
 

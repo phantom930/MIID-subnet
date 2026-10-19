@@ -292,6 +292,11 @@ class GpuScheduler:
                 return True
         return any((p, d) < key for p, d, _, _, _ in self._others_waiting())
 
+    def idle(self) -> bool:
+        """True when this process neither holds the GPU nor has a request queued for it."""
+        with self._cond:
+            return not self._busy and not self._waiting
+
     def first_pass_waiting(self) -> bool:
         """True when a request that has not had its first pass yet is queued."""
         return self.waiting_ahead(1, float("-inf"))

@@ -103,6 +103,28 @@ def _preserve_root_logging() -> Iterator[None]:
         root.setLevel(level)
 
 
+@contextlib.contextmanager
+def _drop_new_hooks(root: Any) -> Iterator[None]:
+    """Remove the forward hooks a Chatterbox call adds under ``root``.
+
+    chatterbox-tts 0.1.7's T3.inference resets ``self.compiled`` just before
+    testing it, so every generate builds a new AlignmentStreamAnalyzer and
+    registers its attention hooks on the transformer without ever removing
+    them. Each one keeps its analyzer alive and keeps firing on every later
+    call: three more hooks per generate, so a miner process that had cloned
+    for a few hours ran dozens of stale analyzers on every decoding step.
+    The current call's own hooks are left in place while it runs.
+    """
+    before = {id(m): set(m._forward_hooks) for m in root.modules()}
+    try:
+        yield
+    finally:
+        for module in root.modules():
+            known = before.get(id(module), set())
+            for key in [k for k in module._forward_hooks if k not in known]:
+                del module._forward_hooks[key]
+
+
 def voice_available() -> bool:
     """True when the in-process voice stack (Chatterbox + SpeechBrain) imports."""
     global _availability, _import_error
@@ -392,7 +414,13 @@ def _clone(base_wav: bytes, text: str, language: str) -> Tuple[float, bytes, int
     with tempfile.TemporaryDirectory(prefix="miid_voice_") as tmp:
         cond_path = os.path.join(tmp, "reference.wav")
         _write_reference(base_wav, cond_path)
-        tts.prepare_conditionals(cond_path, exaggeration=0.5)
+        # Chatterbox builds the conditionals with autograd on, and the graph
+        # they carry pins every activation of the speaker encoder and mel
+        # extractor — ~270 MB per clone that the garbage collector never
+        # reclaims (measured on CPU), and the GPU memory every miner process
+        # gained per voice request until the card ran out (2026-10-16 14:13).
+        with torch.inference_mode():
+            tts.prepare_conditionals(cond_path, exaggeration=0.5)
 
     attempts = max(1, VOICE_ATTEMPTS)
     best = None
@@ -402,13 +430,14 @@ def _clone(base_wav: bytes, text: str, language: str) -> Tuple[float, bytes, int
         torch.manual_seed(int(time.time() * 1000) % 2**31 + attempt)
         # Later attempts lean harder on the reference: less exaggeration and
         # temperature keep the timbre closer to the speaker.
-        wav = tts.generate(
-            text,
-            language_id=language,
-            exaggeration=0.5 if attempt == 0 else 0.4,
-            cfg_weight=0.5,
-            temperature=0.8 if attempt == 0 else 0.6,
-        )
+        with _drop_new_hooks(tts.t3):
+            wav = tts.generate(
+                text,
+                language_id=language,
+                exaggeration=0.5 if attempt == 0 else 0.4,
+                cfg_weight=0.5,
+                temperature=0.8 if attempt == 0 else 0.6,
+            )
         wav = wav.squeeze().float().cpu()
         sim = _similarity(ecapa, ref16k, AF.resample(wav, tts.sr, ECAPA_SR))
         bt.logging.info(f"Voice: take {made}/{attempts} — ECAPA similarity {sim:.3f}")

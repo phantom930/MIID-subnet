@@ -23,6 +23,7 @@ from MIID.miner.generate_variations import (
     active_model_key,
     build_prompt,
     canonical_variation_type,
+    free_gpu,
     generate_one,
     get_selected_model_info,
     prepare_prompt_cache,
@@ -287,6 +288,30 @@ def cycle_estimate() -> float:
     if not _recent_cycles:
         return DEFAULT_CYCLE_SECONDS
     return float(statistics.median(_recent_cycles))
+
+
+def _is_oom(error: BaseException) -> bool:
+    """Is ``error`` (or what it wraps — generate_one re-raises as
+    RuntimeError) a CUDA out-of-memory error?"""
+    seen = 0
+    while error is not None and seen < 8:
+        if isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error):
+            return True
+        error = error.__cause__ or error.__context__
+        seen += 1
+    return False
+
+
+def _recover_gpu_memory() -> None:
+    """Give back everything this process holds on the GPU between attempts:
+    the image model's resident weights (re-uploaded by the next attempt) and
+    PyTorch's cached blocks. What the sibling processes hold stays theirs."""
+    import gc
+
+    gc.collect()
+    free_gpu()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def _req_type(req: Any) -> Optional[str]:
@@ -754,10 +779,14 @@ def generate_variations(
             bt.logging.debug(f"{result['variation_type']}: face blend skipped — {blend['reason']}")
 
     def settle(slot: _Slot) -> None:
-        """Wait for the slot's deferred judgement, if any."""
+        """Wait for the slot's deferred judgement, if any. A judgement that
+        failed loses that one take, not the request."""
         future = pending.pop(slot.index, None)
         if future is not None:
-            future.result()
+            try:
+                future.result()
+            except Exception as e:  # noqa: BLE001
+                bt.logging.error(f"{_req_type(slot.req)}: judging the take failed ({e}); dropping it.")
 
     def settle_all() -> None:
         for slot in slots:
@@ -783,13 +812,43 @@ def generate_variations(
         else:
             judge(slot, result, cycle_started, generated_at)
 
+    def attempt(slot: _Slot, *args: Any, **kwargs: Any) -> bool:
+        """run_attempt that a failure cannot take the request down with.
+
+        Before this, one CUDA out-of-memory error on the first slot ended the
+        whole request with nothing submitted — every round from 2026-10-16
+        14:13 until the restart, once the six processes' leaked VRAM had
+        filled the card. Now an out-of-memory attempt gives back this
+        process's GPU memory and runs once more; an attempt that still fails
+        (or fails any other way) loses only that slot. False when the
+        attempt did not produce a take.
+        """
+        for retry in (False, True):
+            try:
+                run_attempt(slot, *args, **kwargs)
+                return True
+            except Exception as e:  # noqa: BLE001
+                fits = deadline is None or time.time() + cycle_estimate() <= deadline
+                if not retry and fits and _is_oom(e):
+                    bt.logging.warning(
+                        f"{_req_type(slot.req)}: CUDA out of memory; freeing this process's "
+                        "GPU memory and trying the slot once more."
+                    )
+                    _recover_gpu_memory()
+                    continue
+                bt.logging.error(f"{_req_type(slot.req)}: attempt failed ({e}).")
+                return False
+        return False
+
     # ── phase 1: one attempt per slot ──
     skipped = []
+    failed: List[_Slot] = []
     for slot in sorted(slots, key=lambda s: (s.screen_replay, s.index)):
         if deadline is not None and time.time() + cycle_estimate() > deadline:
             skipped.append(slot)
             continue
-        run_attempt(slot, 0.0, None, defer=True, prompt=first_prompts.get(slot.index))
+        if not attempt(slot, 0.0, None, defer=True, prompt=first_prompts.get(slot.index)):
+            failed.append(slot)
     settle_all()
     judge_pool.shutdown(wait=True)
     first_pass_seconds = time.time() - started
@@ -800,6 +859,11 @@ def generate_variations(
             f"Deadline: no time for {len(skipped)} slot(s) "
             f"({', '.join(str(_req_type(s.req)) for s in skipped)}) "
             "— submitting the rest on time instead of everything late."
+        )
+    if failed:
+        bt.logging.warning(
+            f"{len(failed)} slot(s) failed to generate "
+            f"({', '.join(str(_req_type(s.req)) for s in failed)}) — submitting the rest."
         )
 
     def next_cutoff() -> Tuple[float, str]:
@@ -870,7 +934,12 @@ def generate_variations(
             else "retrying with the edit held back."
         )
         bt.logging.info(f"{slot.best['variation_type']}: {slot.reason(target)} — {plan}")
-        run_attempt(slot, identity_bias, hints)
+        if not attempt(slot, identity_bias, hints):
+            # Another attempt would most likely fail the same way; ship
+            # what the first pass made.
+            gpu_lost = True
+            stop_reason = "a failed attempt"
+            break
         retries_run += 1
 
     # ── phase 3: polish — full-strength re-rolls, while time allows ──
@@ -939,7 +1008,7 @@ def generate_variations(
             # and then it stays only if it kept every measured edit of the one
             # it replaced, because a higher-identity take is usually a weaker
             # edit. The same prompt as the first pass: only the seed moves.
-            run_attempt(slot, 0.0, None, prompt=first_prompts.get(slot.index))
+            ran = attempt(slot, 0.0, None, prompt=first_prompts.get(slot.index))
         else:
             # A missed target: full strength again (never the edit held back),
             # with a hint naming a measured edit miss; the ranking in record()
@@ -949,7 +1018,10 @@ def generate_variations(
                 f"{slot.best['variation_type']}: {slot.reason(target)} — re-rolling at full strength"
                 + (" with hints (" + ", ".join(f"{c}: {h}" for c, h in hints.items()) + ")." if hints else ".")
             )
-            run_attempt(slot, 0.0, hints or None, prompt=None if hints else first_prompts.get(slot.index))
+            ran = attempt(slot, 0.0, hints or None, prompt=None if hints else first_prompts.get(slot.index))
+        if not ran:
+            polish_stop = "a failed attempt"
+            break
         polish_run += 1
         if slot.best is incumbent[0]:
             verdict = "kept the earlier take"
