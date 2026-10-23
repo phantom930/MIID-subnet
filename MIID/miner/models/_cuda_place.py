@@ -15,8 +15,8 @@ SMALL_VRAM_GIB = float(os.environ.get("MIID_SMALL_VRAM_GIB", "12"))
 #   mapped     one model on the GPU at a time, uploaded from the memory-mapped
 #              safetensors and evicted without copying back (default; the
 #              process keeps ~1.5 GB private memory for FLUX.2 klein instead
-#              of 15 GB, and sibling processes share the page cache). Same
-#              peak VRAM as model offload.
+#              of 15 GB; the weights stay in the page cache). Same peak VRAM
+#              as model offload.
 #   model      diffusers' enable_model_cpu_offload: whole models, copied back
 #              to fresh CPU memory after each generation.
 #   sequential diffusers' enable_sequential_cpu_offload: layer by layer, the

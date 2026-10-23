@@ -195,33 +195,6 @@ def zero_shot(image: Image.Image, prompts: Dict[str, str]) -> Optional[Dict[str,
             torch.set_num_threads(previous_threads)
 
 
-def image_embedding(image: Image.Image) -> Optional[list]:
-    """Unit-length CLIP image embedding of one image, or None when unavailable.
-
-    Used by the sibling ledger (sibling_registry.py) to tell whether two
-    hotkeys' takes of the same slot are near-identical.
-    """
-    loaded = _model()
-    if loaded is None:
-        return None
-    model, processor, torch = loaded
-    previous_threads = torch.get_num_threads()
-    try:
-        if DEVICE == "cpu" and previous_threads != THREADS:
-            torch.set_num_threads(THREADS)
-        with torch.no_grad():
-            pixels = processor(images=image.convert("RGB"), return_tensors="pt")["pixel_values"]
-            emb = _features(model.get_image_features(pixel_values=pixels.to(DEVICE)))
-            emb = emb / emb.norm(dim=-1, keepdim=True)
-        return [float(x) for x in emb[0].tolist()]
-    except Exception as e:
-        bt.logging.warning(f"CLIP embedding failed: {e}")
-        return None
-    finally:
-        if torch.get_num_threads() != previous_threads:
-            torch.set_num_threads(previous_threads)
-
-
 def environment_probs(image: Image.Image) -> Optional[Dict[str, float]]:
     """CLIP softmax over ENV_PROMPTS for one image, or None when unavailable."""
     if not ENABLED:

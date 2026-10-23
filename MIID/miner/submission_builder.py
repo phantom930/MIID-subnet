@@ -24,7 +24,6 @@ from MIID.miner.image_generator import (
     validate_face_variation,
 )
 from MIID.miner.generate_variations import subject_gender_from_filename
-from MIID.miner import sibling_registry
 from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
 from MIID.miner.s3_upload import upload_to_s3
 
@@ -197,9 +196,6 @@ def generate_image_variations(
             f"(from validator: {[f'{v.type}({v.intensity})' for v in image_request.variation_requests]})"
         )
         challenge_id = image_request.challenge_id or "sandbox_test"
-        # Sibling hotkeys of one operator share a ledger of their takes so none
-        # of them submits a near-duplicate of another (MIID_SIBLING_DIR).
-        sibling = sibling_registry.context(challenge_id, hotkey.ss58_address)
 
         generation_started = time.monotonic()
         variations = generate_variations(
@@ -209,7 +205,6 @@ def generate_image_variations(
             subject_gender=subject_gender_from_filename(image_request.image_filename),
             deadline=deadline,
             retry_cutoff_fn=retry_cutoff_fn,
-            sibling=sibling,
             yield_fn=yield_fn,
         )
         generation_seconds = time.monotonic() - generation_started
@@ -377,7 +372,6 @@ def upload_image_variations(
                             environment=var.get("environment"),
                             head_turn_deg=var.get("pose_yaw"),
                             edit=var.get("edit"),
-                            sibling=var.get("sibling"),
                             blend=var.get("blend"),
                             bytes=len(encrypted_data))
                 else:

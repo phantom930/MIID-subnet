@@ -51,7 +51,6 @@ from MIID.miner.edit_check import (
     preserved as edit_preserved,
 )
 from MIID.miner import face_blend
-from MIID.miner import sibling_registry as siblings
 
 
 # AdaFace similarity a variation should reach before it is accepted as-is.
@@ -68,17 +67,15 @@ from MIID.miner import sibling_registry as siblings
 IDENTITY_TARGET = float(os.environ.get("MIID_IDENTITY_TARGET", "0.7"))
 
 # Extra attempts per variation after the first pass: identity rescues (the
-# edit held back) and edit retries (a hint naming the measured miss). Zero
-# since 2026-10-16: six hotkeys share one 16 GB card, their first passes
-# alone fill most of it, and the user chose to spend what is left on polish
-# — full-strength re-rolls that keep the best take. With retries off, polish
-# also covers the slots that missed their targets (_Slot.polish_priority):
-# a new seed at full strength, a hint when an edit was measured short, and
-# the ranking in _Slot.record decides which take ships. Three is right for
-# a card with time to spare: over 128 archived rounds (2026-10-12/13) the
+# edit held back) and edit retries (a hint naming the measured miss). They
+# run at a lower GPU priority than any queued first pass, so they only use
+# time no other request needs. (Zero from 2026-10-16 while six hotkeys
+# shared the card; back to three on 2026-10-19.) With
+# retries set to 0, polish also covers the slots that missed their targets
+# (_Slot.polish_priority). Over 128 archived rounds (2026-10-12/13) the
 # retry loop stopped on "attempts used up" more often than on "every slot
 # met its targets" (76 vs 67) while the deadline never bound once.
-IDENTITY_RETRIES = int(os.environ.get("MIID_IDENTITY_RETRIES", "0"))
+IDENTITY_RETRIES = int(os.environ.get("MIID_IDENTITY_RETRIES", "3"))
 
 # Identity worth polishing toward once a slot already clears the target.
 # The validator ranks miners by validation score and breaks ties on identity
@@ -271,9 +268,6 @@ BACKGROUND_RETRY_WEIGHT = 0.8
 # validator scores the edit first and breaks ties on identity.
 MISS_PENALTY: Dict[str, float] = {
     "scene": 6.0, "accessory": 5.0, "pose": 2.0, "lighting": 2.0, "expression": 2.0,
-    # Near-identical to another hotkey's take (sibling_registry): the grader's
-    # duplicate penalty is -3 to -5 and can watchlist every hotkey involved.
-    "duplicate": 6.0,
 }
 
 # Seconds one generate + score cycle takes, until this process has measured
@@ -302,10 +296,31 @@ def _is_oom(error: BaseException) -> bool:
     return False
 
 
+_JUDGE_STREAM: Optional[Any] = None
+
+
+def _judge_stream() -> Optional[Any]:
+    """The CUDA stream the judging thread runs on, created once per process.
+
+    PyTorch gives every (cuBLAS handle, stream) pair its own cuBLAS workspace
+    (8.1 MiB on this card) and never frees it. A new stream per request — as
+    from 2026-10-16 09:28 — handed out the next of the pool's 32 streams each
+    time, so every miner process grew by one workspace per request up to
+    ~0.27 GiB, and with the fragmentation around them ~0.6 GiB; six processes
+    filled the card and every round went empty (2026-10-16 14:13 and the
+    weekend after). Found by the gpu_health leak trace: +8.1 MiB per request
+    allocated at MTCNN's RNet linear layer.
+    """
+    global _JUDGE_STREAM
+    if _JUDGE_STREAM is None and torch.cuda.is_available():
+        _JUDGE_STREAM = torch.cuda.Stream()
+    return _JUDGE_STREAM
+
+
 def _recover_gpu_memory() -> None:
     """Give back everything this process holds on the GPU between attempts:
     the image model's resident weights (re-uploaded by the next attempt) and
-    PyTorch's cached blocks. What the sibling processes hold stays theirs."""
+    PyTorch's cached blocks."""
     import gc
 
     gc.collect()
@@ -348,29 +363,27 @@ class _Slot:
         self.pose_direction: Optional[str] = None
         self.bg_miss: Optional[str] = None
         self.edit_misses: List[Tuple[str, str]] = []
-        # The sibling take this one is near-identical to, when it is.
-        self.dup: Optional[Dict] = None
 
     @property
     def satisfied(self) -> bool:
         return (
             self.best is not None and self.identity_ok
             and self.pose_miss == 0.0 and self.bg_miss is None
-            and not self.edit_misses and self.dup is None
+            and not self.edit_misses
         )
 
     def snapshot(self) -> Tuple:
         """The current best take and its judgement, for restore()."""
         return (
             self.best, self.best_key, self.identity_ok, self.pose_miss,
-            self.pose_direction, self.bg_miss, list(self.edit_misses), self.dup,
+            self.pose_direction, self.bg_miss, list(self.edit_misses),
         )
 
     def restore(self, snapshot: Tuple) -> None:
         """Put a snapshot() back as the best take (a polish take that lost an edit)."""
         (
             self.best, self.best_key, self.identity_ok, self.pose_miss,
-            self.pose_direction, self.bg_miss, self.edit_misses, self.dup,
+            self.pose_direction, self.bg_miss, self.edit_misses,
         ) = snapshot
 
     def polish_priority(
@@ -417,8 +430,6 @@ class _Slot:
             if self.background else None
         )
         misses = edit_misses(self.levels, result.get("edit"))
-        sibling = result.get("sibling")
-        dup = sibling if sibling and sibling.get("too_close") else None
         penalty = 0.0
         if miss:
             penalty += MISS_PENALTY["pose"] + miss / 45.0
@@ -426,8 +437,6 @@ class _Slot:
             penalty += MISS_PENALTY["scene"]
         for component, _ in misses:
             penalty += MISS_PENALTY[component]
-        if dup:
-            penalty += MISS_PENALTY["duplicate"]
         if not identity_ok:
             self.identity_misses += 1
         key = (
@@ -442,7 +451,6 @@ class _Slot:
             )
             self.bg_miss = bg_miss
             self.edit_misses = misses
-            self.dup = dup
 
     def rerecord(self, result: Dict, target: float) -> None:
         """Re-judge a take whose measurements changed after it was recorded
@@ -462,7 +470,7 @@ class _Slot:
         if self.best is None or self.satisfied or self.generated >= attempts_allowed:
             return None
         if self.identity_ok and (
-            self.bg_miss is not None or self.dup is not None
+            self.bg_miss is not None
             or any(component == "accessory" for component, _ in self.edit_misses)
         ):
             value = BACKGROUND_RETRY_ODDS * BACKGROUND_RETRY_WEIGHT
@@ -496,8 +504,6 @@ class _Slot:
             hints["background"] = self.bg_miss
         for component, hint in self.edit_misses:
             hints[component] = hint
-        if self.dup:
-            hints["duplicate"] = "vary"
         return 0.0, hints
 
     def reason(self, target: float) -> str:
@@ -506,10 +512,6 @@ class _Slot:
             shown = "no face detected" if similarity is None else f"{similarity:.3f}"
             return f"identity {shown} < {target}"
         parts = []
-        if self.dup:
-            parts.append(
-                f"near-identical to {siblings.Match(**{k: self.dup[k] for k in ('hotkey', 'variation_type', 'attempt', 'bits', 'cosine')}).describe()}"
-            )
         if self.bg_miss is not None:
             parts.append(
                 f"background reads as an {self.bg_miss} scene, {self.scene} scene requested "
@@ -555,7 +557,6 @@ def generate_variations(
     retry_cutoff_fn: Optional[Callable[[], Optional[float]]] = None,
     identity_goal: Optional[float] = None,
     polish_attempts: Optional[int] = None,
-    sibling: Optional[siblings.Context] = None,
     yield_fn: Optional[Callable[[float, int], Optional[float]]] = None,
 ) -> List[Dict]:
     """Generate image variations from a base image (see generate_variations.py).
@@ -618,11 +619,6 @@ def generate_variations(
             alone. Defaults to IDENTITY_GOAL.
         polish_attempts: Full-strength re-rolls allowed per satisfied slot.
             Defaults to POLISH_ATTEMPTS; 0 disables polishing.
-        sibling: This hotkey's view of the challenge in the sibling ledger
-            (sibling_registry.context), or None. With it, every attempt is
-            compared with the other hotkeys' takes of the same slot, a
-            near-identical one is re-rolled, and each attempt is recorded for
-            the siblings to steer away from.
 
     Returns:
         List of dicts, each containing:
@@ -697,7 +693,7 @@ def generate_variations(
             prompt_cache = None
 
     # Everything that judges a take after it is generated — identity, head
-    # turn, scene, edit measurements, the face blend, the sibling check — is
+    # turn, scene, edit measurements, the face blend — is
     # CPU work or a small GPU model taking a few seconds, and the big model
     # would sit idle for it. During the first pass it runs in one worker
     # thread while the next slot generates; a slot is settled — judged and
@@ -711,11 +707,11 @@ def generate_variations(
     # 2026-10-16: identity 13–44 s per slot instead of 0.7 s, the first pass
     # no shorter than before the overlap, and the attempt estimate inflated
     # to 45 s. The current stream is per thread, so the main thread is not
-    # affected.
-    judge_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+    # affected. One stream for the life of the process (_judge_stream).
+    judge_stream = _judge_stream()
 
     def judge(slot: _Slot, result: Dict, cycle_started: float, generated_at: float) -> None:
-        """Measure, blend, check against the siblings and record one attempt."""
+        """Measure, blend and record one attempt."""
         with (torch.cuda.stream(judge_stream) if judge_stream is not None else contextlib.nullcontext()):
             result["identity_similarity"] = _similarity(base_embedding, result["image"])
             identity_at = time.time()
@@ -743,15 +739,6 @@ def generate_variations(
                     )
                 except Exception as e:
                     bt.logging.warning(f"Face blend failed: {e}")
-            result["sibling"] = None
-            if sibling is not None and not slot.screen_replay:
-                try:
-                    fingerprint = siblings.fingerprint(result["image"])
-                    match = sibling.closest(result["variation_type"], fingerprint)
-                    result["sibling"] = match.as_dict() if match else None
-                    sibling.register(result["variation_type"], result["winning_attempt"], fingerprint)
-                except Exception as e:
-                    bt.logging.warning(f"Sibling ledger failed: {e}")
             if judge_stream is not None:
                 judge_stream.synchronize()
         checked_at = time.time()
@@ -1067,7 +1054,6 @@ def generate_variations(
             "environment": best.get("environment"),
             "pose_yaw": best.get("pose_yaw"),
             "edit": best.get("edit"),
-            "sibling": best.get("sibling"),
             "blend": best.get("blend"),
         })
 

@@ -534,19 +534,6 @@ ACCESSORY_HINTS: Dict[str, str] = {
     ),
 }
 
-# Appended on a retry after the sibling ledger (MIID/miner/sibling_registry.py)
-# found the attempt near-identical to what another hotkey of the same
-# operator already produced for this slot. The edit stays; the composition
-# must not.
-DUPLICATE_HINTS: Dict[str, str] = {
-    "vary": (
-        "Compose this take differently from any previous one: a different "
-        "arrangement of the scene and its objects, a different colour palette "
-        "and light direction, and different clothing colours — while the "
-        "requested edit and the subject's identity stay exactly as described."
-    ),
-}
-
 # The synthetic screen replay (6th slot, P5 C1). The validator names one
 # device and two visual cues (SCREEN_REPLAY_VISUAL_CUES in
 # MIID/validator/image_variations.py); each cue is recognised by a phrase from
@@ -830,11 +817,11 @@ def _get_pipeline(model_key: str) -> Any:
 def free_gpu() -> None:
     """Move the cached pipeline's weights off the GPU.
 
-    Mapped offload keeps the models it used resident between attempts (one
-    upload per request instead of one per attempt). They go when this
-    process hands the GPU to another request or process — the GPU
-    scheduler calls this from its release hook — and before the voice
-    models need the room. Safe to call at any time.
+    Mapped offload keeps the models it used resident between attempts and
+    between requests: the miner has the GPU to itself, so the next request
+    finds the transformer and VAE already there. They go only before the
+    voice models need the room and when an out-of-memory attempt is
+    recovered. Safe to call at any time.
     """
     pipe = _cached_pipeline
     if pipe is None:
@@ -846,11 +833,15 @@ def free_gpu() -> None:
         logger.warning("Could not release the offloaded pipeline: %s", e)
 
 
-try:
-    from .gpu_scheduler import SCHEDULER as _GPU_SCHEDULER
-    _GPU_SCHEDULER.on_release(free_gpu)
-except Exception:  # noqa: BLE001 — standalone use without the scheduler
-    pass
+def resident_gpu_bytes() -> int:
+    """Bytes of the cached pipeline's weights resident on the GPU right now."""
+    manager = getattr(_cached_pipeline, "_miid_mapped_offload", None)
+    if manager is None:
+        return 0
+    try:
+        return manager.loaded_bytes()
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 class PromptCache:
@@ -1094,19 +1085,6 @@ def _soften(level: str) -> str:
     return _RANK_TO_INTENSITY[max(0, INTENSITY_RANK[level] - 1)]
 
 
-from MIID.miner.diversity import preferred_side, style_clause  # noqa: E402
-
-# The running hotkey's style profile (MIID/miner/diversity.py), installed by
-# the miner at startup. None leaves every choice to chance, which is what a
-# single hotkey wants.
-_PROFILE: Optional[Dict[str, Any]] = None
-
-
-def set_diversity_profile(profile: Optional[Dict[str, Any]]) -> None:
-    global _PROFILE
-    _PROFILE = profile
-
-
 def _edit_clause(
     components: List[Tuple[str, str]], identity_bias: float,
 ) -> Optional[str]:
@@ -1118,9 +1096,8 @@ def _edit_clause(
     generates something rather than raising.
     """
     phrases = []
-    # One side per slot, so a pose turn and a directional light agree; a
-    # hotkey with a profile leans to its own side (diversity.preferred_side).
-    side = preferred_side(_PROFILE)
+    # One side per slot, so a pose turn and a directional light agree.
+    side = random.choice(("left", "right"))
     for comp_type, level in components:
         # A retry means the face already drifted past the identity floor, and
         # pose is what moves an embedding furthest — so give that component a
@@ -1205,7 +1182,7 @@ def _get_prompt_from_request(
         for component, table in (
             ("pose", POSE_HINTS), ("background", BACKGROUND_HINTS),
             ("lighting", LIGHT_HINTS), ("expression", EXPRESSION_HINTS),
-            ("accessory", ACCESSORY_HINTS), ("duplicate", DUPLICATE_HINTS),
+            ("accessory", ACCESSORY_HINTS),
         ):
             hint = merged.get(component)
             if hint in table:
@@ -1230,11 +1207,6 @@ def _get_prompt_from_request(
                 "This is the only accessory added — no other hat, scarf or "
                 "head covering — and the subject keeps their own clothing."
             )
-        # This hotkey's own scenes, cast and colours (diversity.py): after the
-        # edit, so it colours the choices without changing the instruction.
-        style = style_clause(_PROFILE, dict(components), accessory=bool(accessory))
-        if style:
-            parts.append(style)
     else:
         edit = ". ".join(
             _strip_requirements(p).rstrip(".")
@@ -1347,7 +1319,7 @@ def generate_one(
     check in ``image_generator`` — can re-roll one slot without regenerating
     the others. The pipeline is cached, so a retry costs
     one denoising pass, not another model load; its weights stay on the GPU
-    between attempts until free_gpu() (the GPU scheduler's release hook).
+    between attempts and requests (see free_gpu()).
 
     Args:
         base_image: PIL Image of the base face.

@@ -44,10 +44,12 @@ from PIL import Image
 
 from MIID.miner.ada_face_compare import face_geometry, similarity_to_embedding
 
-try:  # OpenCV grabs every advertised core by default; the miner shares a quota.
+try:  # OpenCV grabs every advertised core by default, not the cgroup quota.
     import cv2 as _cv2
 
-    _cv2.setNumThreads(int(os.environ.get("MIID_TORCH_THREADS", "4")))
+    _cv2.setNumThreads(int(
+        os.environ.get("MIID_TORCH_THREADS") or os.environ.get("OMP_NUM_THREADS") or "4"
+    ))
 except Exception:
     pass
 
@@ -120,7 +122,7 @@ MIN_GAIN = 0.02
 RESIDUAL_MAX = 0.12
 SCALE_RANGE = (0.7, 1.4)
 # dHash distance (of 256 bits) under which two images are the same picture
-# (the sibling ledger's benchmark: <= 12 is the same image).
+# (the benchmark treats <= 12 as the same image).
 SEED_DHASH_BITS = 20
 
 

@@ -18,8 +18,7 @@ modes then lose that during generation:
 This module does what model offload does — uploads a model when its forward
 runs — but uploads from the mapped tensors and evicts to the meta device,
 never copying back. The process keeps about 1.5 GB of private memory for the
-pipeline instead of 15 GB, and sibling miner processes share one copy of the
-weights in the page cache.
+pipeline instead of 15 GB; the weights themselves stay in the page cache.
 
 Models stay on the GPU as long as they fit a budget (RESIDENT_BYTES,
 ``MIID_RESIDENT_GB``); when one does not fit, the largest resident model
@@ -29,9 +28,9 @@ encoder (8.0 GB) does not fit beside the transformer, so a generation that
 needs the text encoder swaps the two. One that is handed its prompt
 embeddings (see generate_variations.PromptCache) touches only the
 transformer and the VAE, and with both resident from the previous attempt
-uploads nothing at all. Eviction otherwise happens when the process hands
-the GPU to another one (``release_offloaded`` from the GPU scheduler's
-release hook) and before the voice clone.
+or request uploads nothing at all. Eviction otherwise happens only before
+the voice clone and when an out-of-memory attempt is recovered
+(``release_offloaded``).
 
 Usage (see ``_cuda_place.place_diffusers_pipeline``)::
 
@@ -54,8 +53,10 @@ from accelerate.utils import send_to_device, set_module_tensor_to_device
 
 ATTR = "_miid_mapped_offload"
 # Weights kept on the GPU at once. 9 GB holds the klein transformer and VAE
-# (8.0 GB) with room for the denoising activations (~1.5 GB) beside the idle
-# footprints of five sibling processes (~0.5 GB each) on a 16 GB card.
+# (8.0 GB) with room for the denoising activations (~1.5 GB) and the face
+# models on a 16 GB card. Anything from 8.2 to just under 16 behaves the
+# same for klein: its text encoder (8.0 GB) never fits beside the
+# transformer, so the two swap whatever the budget.
 RESIDENT_BYTES = int(float(os.environ.get("MIID_RESIDENT_GB", "9")) * 1e9)
 
 

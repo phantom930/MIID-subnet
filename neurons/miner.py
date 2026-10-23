@@ -68,9 +68,9 @@ def _cpu_quota() -> int:
 # OpenBLAS spawns 63 threads when numpy loads and torch another 127 at its
 # first op, each thread with its own malloc arena. Those pools read their
 # size from the environment once, before the miner's own torch cap runs, so
-# the default is set here, ahead of every import. MIID_TORCH_THREADS or an
-# explicit OMP_NUM_THREADS etc. wins; several miners on one box should each
-# get a share of the quota (scripts/miner/start_hotkeys.sh sets 4).
+# the default is set here, ahead of every import: the whole quota, since the
+# miner is the only one on the box. MIID_TORCH_THREADS or an explicit
+# OMP_NUM_THREADS etc. wins.
 _THREADS = os.environ.get("MIID_TORCH_THREADS", "").strip() or str(_cpu_quota())
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, _THREADS)
@@ -113,32 +113,20 @@ from MIID.miner.request_archive import (
 
 # One GPU shared by every validator's request: earliest deadline first.
 from MIID.miner.gpu_scheduler import SCHEDULER, Turn, queue_cutoff
-from MIID.miner.gpu_scheduler import describe as describe_gpu_sharing
 from MIID.miner import gpu_health
 
-# The image model keeps its weights on the GPU between attempts (mapped
-# offload); they are evicted when the GPU is handed over, and here before
-# the voice models need the room.
+# The image model keeps its weights on the GPU between attempts and between
+# requests (mapped offload); they are evicted here before the voice models
+# need the room.
 try:
     from MIID.miner.generate_variations import free_gpu as free_gpu_models
+    from MIID.miner.generate_variations import resident_gpu_bytes
 except Exception:  # noqa: BLE001 — no image stack, nothing resident
     def free_gpu_models() -> None:
         return None
 
-# Running several hotkeys (docs/miner.md, "Running several hotkeys"): a
-# per-hotkey style profile and a shared ledger that keeps sibling hotkeys
-# from submitting near-identical takes. Needs the image stack.
-try:
-    from MIID.miner import sibling_registry as _siblings
-    from MIID.miner.diversity import (
-        ENABLED as DIVERSITY_ENABLED,
-        describe as describe_profile,
-        profile_for,
-    )
-    from MIID.miner.generate_variations import set_diversity_profile
-    MULTI_HOTKEY_HELPERS = True
-except Exception:  # noqa: BLE001 — without the image stack there is nothing to profile
-    MULTI_HOTKEY_HELPERS = False
+    def resident_gpu_bytes() -> int:
+        return 0
 
 # # --- PAUSED: real screen-replay paths (restore later) ---
 # # screen_replay.json lives under MIID/miner/real_image_miner_guide/. Miners fill
@@ -313,7 +301,7 @@ class Miner(BaseMinerNeuron):
         # GPU memory creep guards (MIID/miner/gpu_health.py): trace where live
         # GPU memory was allocated, and restart cleanly before the card fills.
         gpu_health.start_trace()
-        gpu_health.start_recycler(lambda: not SCHEDULER.idle(), SCHEDULER.lock_dir)
+        gpu_health.start_recycler(lambda: not SCHEDULER.idle(), resident_gpu_bytes)
 
         self.output_path = os.path.join(self.config.logging.logging_dir, "mining_results")
         os.makedirs(self.output_path, exist_ok=True)
@@ -337,15 +325,6 @@ class Miner(BaseMinerNeuron):
             )
 
         self.axon.verify_fns[IdentitySynapse.__name__] = self._verify_validator_request
-
-        # Several hotkeys of one operator: each gets its own style profile and
-        # they share a ledger of their takes, so no two submit near-duplicates.
-        if MULTI_HOTKEY_HELPERS:
-            profile = profile_for(self.wallet.hotkey.ss58_address) if DIVERSITY_ENABLED else None
-            set_diversity_profile(profile)
-            bt.logging.info(describe_profile(profile))
-            bt.logging.info(_siblings.describe())
-        bt.logging.info(describe_gpu_sharing())
 
         if PHASE4_AVAILABLE:
             bt.logging.info("Phase 4 image generation: ENABLED")

@@ -2,10 +2,10 @@
 #
 # Two guards against the GPU memory creep that took every hotkey down on
 # 2026-10-16 (14:13 UTC) and again from 2026-10-16 23:05 until 2026-10-19:
-# each miner process keeps ~10–15 MB more GPU memory after almost every
+# each miner process kept ~10–15 MB more GPU memory after almost every
 # request (torch allocated 0.22 → 0.49 GiB, reserved 0.28 → 0.85 GiB per
-# process in ~5 h). Six processes share one 16 GB card, so after ~4.7 h the
-# active one no longer has room to denoise and every round comes back empty.
+# process in ~5 h) — a new CUDA stream, and with it a cuBLAS workspace, per
+# request (image_generator._judge_stream now makes one per process).
 #
 # Leak trace (MIID_GPU_TRACE, default on): PyTorch records the Python stack
 # of every live GPU block ("state" history: no event log, only what is
@@ -14,15 +14,13 @@
 # since the previous request are logged, so the leaking call site shows up
 # by name after a few hours of rounds.
 #
-# Recycle (MIID_RECYCLE_RESERVED_GB, default 0.6; 0 turns it off): a watcher
-# thread measures this process's idle GPU footprint (torch reserved after
-# emptying the cache). Past the threshold, and only while no request is in
-# flight or queued here, the process exits and pm2 starts it again with a
-# clean card. At most one process on the machine recycles per
-# RECYCLE_SPACING_SECONDS (a timestamp in MIID_GPU_LOCK_DIR), so the hotkeys
-# are never down together.
+# Recycle (MIID_RECYCLE_RESERVED_GB, default 2; 0 turns it off): a watcher
+# thread measures this process's idle GPU footprint — torch reserved after
+# emptying the cache, less the image model's weights that stay resident
+# between requests. Past the threshold, and only while no request is in
+# flight or queued, the process exits and pm2 starts it again with a clean
+# card.
 
-import fcntl
 import gc
 import os
 import threading
@@ -32,12 +30,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 import bittensor as bt
 
 TRACE = os.environ.get("MIID_GPU_TRACE", "1").strip().lower() not in ("0", "false", "no")
-# Idle reserved memory per process at which it recycles. A fresh process sits
-# at ~0.2–0.3 GiB after its first request; the card ran out at ~0.85 GiB in
-# each of six processes. 0.6 leaves every sibling room for the active one.
-RECYCLE_RESERVED_GB = float(os.environ.get("MIID_RECYCLE_RESERVED_GB", "0.6"))
+# Idle reserved memory, beyond the resident image weights, at which the
+# process recycles. A fresh process sits at ~0.2–0.3 GiB after its first
+# request. The miner has the card to itself, so 2 GiB of creep still leaves
+# a request room to denoise; the old 0.6 was one process's share when six
+# shared the card.
+RECYCLE_RESERVED_GB = float(os.environ.get("MIID_RECYCLE_RESERVED_GB", "2"))
 RECYCLE_MIN_UPTIME_SECONDS = 30 * 60
-RECYCLE_SPACING_SECONDS = 10 * 60
 CHECK_SECONDS = 60
 TOP_GROUPS = 6
 
@@ -144,7 +143,8 @@ class inflight:
             _last_done = time.time()
 
 
-def _idle_reserved_gb() -> Optional[float]:
+def _idle_reserved_gb(resident_bytes: Callable[[], int]) -> Optional[float]:
+    """Reserved GPU memory after emptying the cache, less the resident weights."""
     try:
         import torch
 
@@ -152,37 +152,15 @@ def _idle_reserved_gb() -> Optional[float]:
             return None
         gc.collect()
         torch.cuda.empty_cache()
-        return torch.cuda.memory_reserved() / 2 ** 30
+        return (torch.cuda.memory_reserved() - resident_bytes()) / 2 ** 30
     except Exception:  # noqa: BLE001
         return None
 
 
-def _claim_recycle_slot(lock_dir: Optional[str]) -> bool:
-    """True when no sibling recycled within RECYCLE_SPACING_SECONDS (and
-    record this one). Without a shared lock dir, every process may recycle."""
-    if not lock_dir:
-        return True
-    path = os.path.join(lock_dir, "recycle.last")
-    try:
-        os.makedirs(lock_dir, exist_ok=True)
-        with open(path + ".lock", "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                last = float(open(path).read().strip())
-            except (OSError, ValueError):
-                last = 0.0
-            if time.time() - last < RECYCLE_SPACING_SECONDS:
-                return False
-            with open(path, "w") as f:
-                f.write(f"{time.time():.0f}")
-            return True
-    except OSError:
-        return True
-
-
-def start_recycler(busy: Callable[[], bool], lock_dir: Optional[str]) -> None:
+def start_recycler(busy: Callable[[], bool], resident_bytes: Callable[[], int]) -> None:
     """Watch this process's idle GPU footprint and exit for a clean restart
-    once it passes RECYCLE_RESERVED_GB. ``busy`` reports queued GPU work."""
+    once it passes RECYCLE_RESERVED_GB. ``busy`` reports queued GPU work;
+    ``resident_bytes`` the image weights kept on the GPU on purpose."""
     if RECYCLE_RESERVED_GB <= 0:
         bt.logging.info("GPU recycle: off (MIID_RECYCLE_RESERVED_GB=0).")
         return
@@ -197,16 +175,14 @@ def start_recycler(busy: Callable[[], bool], lock_dir: Optional[str]) -> None:
                     running, done = _inflight, _last_done
                 if running or busy() or time.time() - done < RESPONSE_GRACE_SECONDS:
                     continue
-                reserved = _idle_reserved_gb()
+                reserved = _idle_reserved_gb(resident_bytes)
                 if reserved is None or reserved < RECYCLE_RESERVED_GB:
-                    continue
-                if not _claim_recycle_slot(lock_dir):
                     continue
                 with _inflight_lock:  # a request may have arrived meanwhile
                     if _inflight or time.time() - _last_done < RESPONSE_GRACE_SECONDS:
                         continue
                     bt.logging.warning(
-                        f"GPU recycle: idle GPU footprint {reserved:.2f} GiB ≥ "
+                        f"GPU recycle: idle GPU footprint {reserved:.2f} GiB beyond the resident weights ≥ "
                         f"{RECYCLE_RESERVED_GB:.2f} GiB after {(time.time() - _started) / 3600:.1f} h; "
                         "exiting so pm2 restarts this miner with a clean card."
                     )
@@ -217,6 +193,6 @@ def start_recycler(busy: Callable[[], bool], lock_dir: Optional[str]) -> None:
 
     threading.Thread(target=watch, name="gpu-recycle", daemon=True).start()
     bt.logging.info(
-        f"GPU recycle: exits for a clean restart once idle GPU memory passes "
-        f"{RECYCLE_RESERVED_GB:.2f} GiB (one hotkey per {RECYCLE_SPACING_SECONDS // 60} min)."
+        f"GPU recycle: exits for a clean restart once idle GPU memory beyond the "
+        f"resident image weights passes {RECYCLE_RESERVED_GB:.2f} GiB."
     )
