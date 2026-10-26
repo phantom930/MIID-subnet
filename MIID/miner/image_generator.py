@@ -44,6 +44,7 @@ from MIID.miner.background_check import (
     wanted_environment,
 )
 from MIID.miner.edit_check import (
+    POSE_TARGET_DEG,
     base_context as edit_base_context,
     describe as describe_edit,
     measure as measure_edit,
@@ -65,6 +66,18 @@ from MIID.miner import face_blend
 # strength is compared. Raised from 0.6 on 2026-10-15 at the user's request
 # to put identity first.
 IDENTITY_TARGET = float(os.environ.get("MIID_IDENTITY_TARGET", "0.7"))
+
+# The validator's own identity gate. Above it the grade is decided by the
+# edit — a 5 needs every component in its requested intensity bin — so takes
+# are ranked edit first from here up: a take in the right bin at identity
+# 0.65 beats a take a bin off at 0.75 (5 against 3 on the score sheet, and
+# +0.10 against +0.03 reputation if reviewed). Under it the grade is capped
+# whatever the edit, so a slot whose best take is under the gate is retried
+# with the edit held back; between the gate and IDENTITY_TARGET it is
+# re-rolled at full strength instead. Until 2026-10-23 the target itself
+# was the ranking gate, and held-back rescues of 0.6–0.7 takes shipped far
+# pose requests as medium or light turns (7 of 7 on that morning's rounds).
+IDENTITY_GATE = float(os.environ.get("MIID_IDENTITY_GATE", "0.6"))
 
 # Extra attempts per variation after the first pass: identity rescues (the
 # edit held back) and edit retries (a hint naming the measured miss). They
@@ -104,23 +117,18 @@ GENERATION_BUDGET_SECONDS = float(
     os.environ.get("MIID_GENERATION_BUDGET_SECONDS", "900")
 )
 
-# Head turn, in degrees, that each requested pose intensity should land in.
-# The validator describes light / medium / far as ±15° / ±30° / >±45°, but
-# the grader is more lenient than that: on 2026-10-07 lighting+pose slots
-# whose "far" turns measured ~30° graded 5 every time, while a "light" slot
-# with no visible turn graded 3. So the ranges guard against a missing or
-# clearly undersized turn rather than chasing the nominal angle, which costs
-# identity. An attempt outside its range is retried at full edit strength
-# (the face held; the turn did not), budget permitting, and the closest
-# attempt that clears the identity target wins.
+# Head turn, in degrees, that each requested pose intensity should land in:
+# the benchmark's bins in this miner's units (edit_check.POSE_TARGET_DEG).
+# An attempt outside its range — short or past it — is retried at full edit
+# strength with a hint (the face held; the turn did not), budget
+# permitting, and the closest attempt over the identity gate wins.
 #
-# Light and medium floors raised from 6° / 15° on 2026-10-13: with those,
-# the offline benchmark (MediaPipe head pose) still measured 13 of 32 "light"
-# slots and 5 of 33 "medium" slots under 7°, i.e. no visible turn at all —
-# and two of that day's four real -1 grades fell on combined slots with a
-# "light" pose component. The far floor stays: the same grader gave 5 to
-# ~30° "far" turns, and pushing further costs identity.
-POSE_RANGE_DEG = {"light": (10.0, 30.0), "medium": (20.0, 45.0), "far": (24.0, 180.0)}
+# History: from 2026-10-07 the ranges only guarded against a missing turn
+# (far from 24°), on a grader that then gave 5 to ~30° far turns. On the
+# 2026-10-22/23 rounds only 10 of 152 miners graded 5 on a pose_edit
+# challenge, and the benchmark read 90% of our far requests as medium or
+# light, so the ranges now follow the bins in both directions.
+POSE_RANGE_DEG = POSE_TARGET_DEG
 
 
 def decode_base_image(base64_image: str) -> Image.Image:
@@ -413,17 +421,20 @@ class _Slot:
     def record(self, result: Dict, target: float) -> None:
         """Score one attempt and keep it if it is the best so far.
 
-        Rank: clearing the identity target first (under it the grade is capped
+        Rank: clearing the identity gate first (under it the grade is capped
         whatever the edit), then the estimated validation-score cost of every
         measured miss — a head turn outside its range, a background slot
         showing the wrong kind of scene or missing its accessory, a lighting
-        change or expression that reads a level short (MISS_PENALTY) — and
-        only then similarity. A variation AdaFace cannot read a face in
-        (None) is the worst outcome there is — the grading API scores it 0
-        for identity — so it ranks below every scored one.
+        change outside its level or an expression that still reads neutral
+        (MISS_PENALTY) — and only then similarity. ``target`` decides whether
+        the slot still wants more identity (identity_ok), not the ranking. A
+        variation AdaFace cannot read a face in (None) is the worst outcome
+        there is — the grading API scores it 0 for identity — so it ranks
+        below every scored one.
         """
         similarity = result["identity_similarity"]
         identity_ok = similarity is not None and similarity >= target
+        gate_ok = similarity is not None and similarity >= IDENTITY_GATE
         miss, direction = _pose_miss(self.pose_level, result.get("pose_yaw"))
         bg_miss = (
             background_miss(result["variation_type"], result.get("environment"))
@@ -440,8 +451,8 @@ class _Slot:
         if not identity_ok:
             self.identity_misses += 1
         key = (
-            identity_ok,
-            -penalty if identity_ok else 0.0,
+            gate_ok,
+            -penalty if gate_ok else 0.0,
             -1.0 if similarity is None else similarity,
         )
         if self.best is None or key > self.best_key:
@@ -490,12 +501,14 @@ class _Slot:
     def next_settings(self) -> Tuple[float, Dict[str, str]]:
         """(identity_bias, hints by component) for the next attempt.
 
-        An identity miss holds the edit back, more with each miss; a measured
-        miss of the edit — head turn, scene, lighting, expression, accessory
-        — re-rolls at full strength with a hint naming it (the face held; the
-        edit did not).
+        A best take under the identity gate holds the edit back, more with
+        each miss; one over the gate but under the target, or a measured miss
+        of the edit — head turn, scene, lighting, expression, accessory —
+        re-rolls at full strength, with a hint naming any edit miss (the face
+        held; the edit did not).
         """
-        if not self.identity_ok:
+        similarity = self.best["identity_similarity"] if self.best else None
+        if similarity is None or similarity < IDENTITY_GATE:
             return min(0.8, 0.4 * self.identity_misses), {}
         hints: Dict[str, str] = {}
         if self.pose_direction:
@@ -913,12 +926,12 @@ def generate_variations(
                 continue
         identity_bias, hints = slot.next_settings()
         plan = (
-            "retrying at full strength with hints ("
+            "retrying with the edit held back." if identity_bias > 0
+            else "retrying at full strength with hints ("
             + ", ".join(f"{component}: {hint}" for component, hint in hints.items())
             + ")."
-            if slot.identity_ok and hints
-            else "retrying at full strength." if slot.identity_ok
-            else "retrying with the edit held back."
+            if hints
+            else "retrying at full strength."
         )
         bt.logging.info(f"{slot.best['variation_type']}: {slot.reason(target)} — {plan}")
         if not attempt(slot, identity_bias, hints):

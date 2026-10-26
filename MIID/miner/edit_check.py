@@ -28,13 +28,17 @@
 # Pose (head turn) and scene (indoor / outdoor) are measured in
 # image_generator and background_check and only compared here.
 #
-# The intensity bins are the benchmark's estimates of the grader's, not
-# published rules, so only gross misses spend a retry: no measurable lighting
-# change at all, a far lighting request that reads light, a medium or far
-# expression request that still reads neutral, a missing or wrong accessory.
-# The finer use — refusing a polish take whose edit reads weaker than the
-# incumbent's — is a relative comparison between two takes of the same slot
-# and needs no calibration at all.
+# The score sheet gives a 5 only when every component lands in the requested
+# intensity bin; too strong is as much a "partial match" (3) as too weak.
+# The bins are the benchmark's estimates of the grader's (MIID/benchmark/
+# scoring.py), and the head turn and lighting measured here track the
+# benchmark's own closely — on 2026-10-22/23 (381 lighting and 354 pose
+# slots) r = 0.99 and 0.95 — so a take outside its requested bin is a miss
+# in either direction: POSE_TARGET_DEG and LIGHT_TARGETS are those bins in
+# this module's units, kept a little inside the edges where the two
+# measurements disagree. The CLIP expression reading cannot tell a toothy
+# smile (medium) from a laugh (far), so for expressions only a request that
+# still reads neutral is a miss.
 #
 # MIID_EDIT_CHECK=0 switches the lighting, expression and accessory
 # measurements off (pose and scene checks have their own switches). Anything
@@ -56,6 +60,29 @@ ENABLED = os.environ.get("MIID_EDIT_CHECK", "1").strip().lower() not in ("0", "f
 # Lighting magnitude cut-offs between none / light / medium / far, as the
 # benchmark estimates them (scoring.py T["light_bins"]).
 LIGHT_BINS: Tuple[float, float, float] = (0.60, 1.20, 2.00)
+# The magnitude a take should land in for each requested level. Against the
+# benchmark's bins on 381 archived slots: 0.6–0.9 read light 76% of the
+# time, 0.9–1.2 only 62% (35% medium); 1.2–1.6 read medium 94%, 1.6–2.0 only
+# 71% (29% far); 2.0 and up read far every time. Requested medium landed
+# far on 71% of the slots and light landed medium on 49%, which is what
+# makes the upper edges matter as much as the lower ones.
+LIGHT_TARGETS: Dict[str, Tuple[float, float]] = {
+    "light": (0.60, 1.00),
+    "medium": (1.25, 1.75),
+    "far": (2.00, float("inf")),
+}
+# Head turn (degrees, ada_face_compare.face_yaw_delta) a take should land in
+# for each requested pose level: the benchmark's bins (7 / 22.5 / 37.5° of
+# MediaPipe pose) in this module's MTCNN units. On 354 archived slots the
+# two read benchmark ≈ 0.88 × ours + 3.6° (residual sd 3°); with these
+# ranges 88% / 92% / 67% of the takes inside read light / medium / far to
+# the benchmark. Klein rarely turns far enough for far (10% of far requests
+# on 2026-10-22), so that range is mostly a reason to keep re-rolling.
+POSE_TARGET_DEG: Dict[str, Tuple[float, float]] = {
+    "light": (6.0, 20.0),
+    "medium": (23.0, 37.0),
+    "far": (40.0, 180.0),
+}
 # Expression: cut-offs on the change in expected ordinal (see EXPRESSION_ORDINAL).
 EXPRESSION_BINS: Tuple[float, float, float] = (0.5, 1.5, 2.5)
 # A medium or far expression request whose take still reads neutral at least
@@ -373,27 +400,36 @@ def measure(
 # ── judgements ───────────────────────────────────────────────────────────
 
 
-def misses(levels: Dict[str, str], measured: Optional[Dict[str, Any]]) -> List[Tuple[str, str]]:
-    """Gross misses worth a retry: (component, hint) pairs.
+def lighting_miss(requested: Optional[str], magnitude: Optional[float]) -> Optional[str]:
+    """The retry hint for a lighting take outside its LIGHT_TARGETS range:
+    "more", "less" (back to a light change) or "moderate" (back to medium);
+    None when it is in range or unmeasured."""
+    if requested not in LIGHT_TARGETS or magnitude is None:
+        return None
+    low, high = LIGHT_TARGETS[requested]
+    if magnitude < low:
+        return "more"
+    if magnitude > high:
+        return "less" if requested == "light" else "moderate"
+    return None
 
-    Only what the bins can be trusted for: no lighting change at all, a far
-    lighting request that reads light, a light one that reads far, a medium or
-    far expression request that still reads neutral, and an accessory that is
-    missing or something else. Unmeasured components never miss.
+
+def misses(levels: Dict[str, str], measured: Optional[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    """Misses worth a retry: (component, hint) pairs.
+
+    A lighting change outside the requested level's range, either way; a
+    medium or far expression request that still reads neutral; an accessory
+    that is missing or something else. Unmeasured components never miss.
+    (The head turn is judged in image_generator against POSE_TARGET_DEG.)
     """
     out: List[Tuple[str, str]] = []
     if not measured:
         return out
     lighting = measured.get("lighting")
     if lighting and "lighting_edit" in levels:
-        magnitude = lighting["magnitude"]
-        requested = levels["lighting_edit"]
-        if magnitude < LIGHT_BINS[0]:
-            out.append(("lighting", "more"))
-        elif requested == "far" and magnitude < LIGHT_BINS[1]:
-            out.append(("lighting", "more"))
-        elif requested == "light" and magnitude >= LIGHT_BINS[2]:
-            out.append(("lighting", "less"))
+        hint = lighting_miss(levels["lighting_edit"], lighting["magnitude"])
+        if hint:
+            out.append(("lighting", hint))
     expression = measured.get("expression")
     if expression and levels.get("expression_edit") in ("medium", "far"):
         if expression["neutral"] >= NEUTRAL_PROB:
@@ -415,19 +451,24 @@ def preserved(
     Both are attempt results carrying ``pose_yaw``, ``environment`` and
     ``edit`` (this module's measurement). A component the incumbent measured
     but the candidate did not counts as lost: an unmeasured take is not a
-    safe replacement. Returns (kept, what was lost).
+    safe replacement. A head turn or lighting change inside its requested
+    range is kept whatever the incumbent's strength — weaker within the
+    range is not worse, and stronger past it is. Returns (kept, what was lost).
     """
     inc_edit = incumbent.get("edit") or {}
     cand_edit = candidate.get("edit") or {}
 
     if "pose_edit" in levels and incumbent.get("pose_yaw") is not None:
         yaw = candidate.get("pose_yaw")
-        if yaw is None or yaw < incumbent["pose_yaw"] - POSE_KEEP_DEG:
+        low, high = POSE_TARGET_DEG.get(levels["pose_edit"], (0.0, float("inf")))
+        in_range = yaw is not None and low <= yaw <= high
+        if not in_range and (yaw is None or yaw < incumbent["pose_yaw"] - POSE_KEEP_DEG):
             return False, "head turn"
     inc = inc_edit.get("lighting")
     if inc:
         cand = cand_edit.get("lighting")
-        if not cand or cand["magnitude"] < inc["magnitude"] * LIGHT_KEEP:
+        in_range = bool(cand) and lighting_miss(levels.get("lighting_edit"), cand["magnitude"]) is None
+        if not in_range and (not cand or cand["magnitude"] < inc["magnitude"] * LIGHT_KEEP):
             return False, "lighting"
     inc = inc_edit.get("expression")
     if inc:

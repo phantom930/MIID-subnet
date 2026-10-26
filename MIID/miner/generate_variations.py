@@ -402,14 +402,19 @@ EDIT_PHRASES: Dict[Tuple[str, str], str] = {
         "lifted, lips together with no teeth showing, and a relaxed brow."
     ),
     # The validator's medium is "smile" between a slight smile and laughing,
-    # and the benchmark grades a smile by what the mouth does: teeth showing
-    # = medium. Offering "a serious set to the mouth" as an alternative read
-    # as no change — on 2026-10-14 four of eight single expression_edit
-    # (medium) slots graded "got light" and two "no variation detected".
+    # and the benchmark grades a smile by what the mouth does: lips apart
+    # over the teeth = medium, the upper lip drawn high or the jaw dropped =
+    # far. Offering "a serious set to the mouth" as an alternative read as no
+    # change — on 2026-10-14 four of eight single expression_edit (medium)
+    # slots graded "got light" and two "no variation detected". The "clear,
+    # open smile with the teeth showing" that replaced it overshot: 104 of
+    # 109 medium requests on 2026-10-22/23 read as a laugh (far), and a
+    # graded one came back 3/5. Hence a smile whose mouth only just opens.
     ("expression_edit", "medium"): (
-        "Give the subject a clear, open smile with the teeth showing and the "
-        "cheeks lifted — unmistakably smiling, well beyond a slight "
-        "closed-mouth smile, but not laughing."
+        "Give the subject a natural, relaxed smile with the lips just parted, "
+        "so that only the edges of the upper teeth show. The jaw stays "
+        "closed and the mouth is not open: clearly more than a closed-mouth "
+        "smile, but nowhere near a broad grin or a laugh."
     ),
     ("expression_edit", "far"): (
         "Give the subject a pronounced expression — laughing with the mouth "
@@ -467,8 +472,8 @@ POSE_HINTS: Dict[str, str] = {
         "this time — the change of angle must be obvious at a glance."
     ),
     "less": (
-        "Keep the head turn modest — no more than the angle described, with "
-        "the face still mostly toward the camera."
+        "The previous attempt turned the head too far: turn it only as far as "
+        "the angle described, no further, with both eyes clearly visible."
     ),
 }
 
@@ -491,9 +496,11 @@ BACKGROUND_HINTS: Dict[str, str] = {
 }
 
 # Appended on a retry after edit_check measured the lighting change outside
-# the requested level (no measurable change, or a far request that read
-# light). The exposure guard of the lighting phrases still applies: more
-# contrast comes from the shadow side, never from a brighter lit side.
+# the requested level's range (edit_check.LIGHT_TARGETS): "more" when it
+# fell short, "less" when a light request came out stronger, "moderate" when
+# a medium one did (71% of medium requests read far on 2026-10-22/23). The
+# exposure guard of the lighting phrases still applies: more contrast comes
+# from the shadow side, never from a brighter lit side.
 LIGHT_HINTS: Dict[str, str] = {
     "more": (
         "The previous attempt's lighting change was too weak to notice: this "
@@ -506,6 +513,12 @@ LIGHT_HINTS: Dict[str, str] = {
         "The previous attempt changed the lighting far too much: this time "
         "keep the change subtle — the same overall exposure, only a gentle "
         "shift in colour temperature and faint, soft shadows."
+    ),
+    "moderate": (
+        "The previous attempt's lighting was too dramatic: keep one clear "
+        "directional light, but let the shadow side fall only moderately "
+        "darker — never near-black, with skin detail visible on both halves "
+        "of the face — and no strong colour cast."
     ),
 }
 

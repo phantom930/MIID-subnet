@@ -14,7 +14,8 @@
 # This module puts the inner face back. The base image is warped onto the
 # take's face with the similarity transform between their five MTCNN
 # landmarks, colour-matched to the take inside a soft ellipse that covers
-# eyebrows to chin and cheek to cheek, and alpha-blended there. Everything
+# eyebrows to chin and cheek to cheek, and its coarse structure blended in
+# there while the take keeps its own fine skin texture (DETAIL_SIGMA). Everything
 # outside the ellipse — the scene, hair, ears, any requested headwear — is
 # the take's own: the ellipse stays inside a hijab's or bandana's edge and
 # clear of headphones, and the accessory and scene checks are re-run and must
@@ -27,11 +28,14 @@
 #   - the blend does not raise identity by at least MIN_GAIN;
 #   - the blended image reads as a copy of the seed (dHash within
 #     SEED_DHASH_BITS of the base image): the grader scores a copy -1;
+#   - the blend carries the seed's skin texture into the take (texture_corr
+#     rising by more than COPY_RISE_MAX): face pixels copied from the seed
+#     are a -5 on the score sheet;
 #   - a measured edit weakened (edit_check.preserved on scene and accessory).
 #
 # The smallest alpha in the ladder that reaches MIID_FACE_BLEND_GOAL wins and
-# a full copy is never used: even the strongest alpha leaves the take's own
-# texture in the face, so the result is a regenerated face steered back
+# a full copy is never used: the take keeps all of its own fine texture and
+# part of its structure, so the result is a regenerated face steered back
 # toward the seed, not a paste. MIID_FACE_BLEND=0 switches it off;
 # MIID_FACE_BLEND_SLOTS lists the slot types it applies to.
 
@@ -116,6 +120,22 @@ POISSON = os.environ.get("MIID_FACE_BLEND_POISSON", "0").strip().lower() in ("1"
 ALPHAS: Tuple[float, ...] = tuple(a for a in _LADDER if a <= MAX_ALPHA + 1e-9) or (MAX_ALPHA,)
 # A blend that lifts identity by less than this is not worth the changed pixels.
 MIN_GAIN = 0.02
+# Only detail coarser than this (Gaussian sigma, pixels) is taken from the
+# base face; finer detail — skin texture, pores, hair strands — stays the
+# take's own. The benchmark's copy-paste check (and a reviewer's eye) looks
+# for exactly that fine texture: blending it in too read as a copy-paste risk
+# (high-pass correlation with the seed >= 0.5) on 31% of background blends
+# and 48% of lighting blends, while AdaFace, which sees the face at 112 px,
+# barely uses it. On 69 archived takes re-blended at alpha 0.8 (2026-10-23):
+# background identity +0.113 here against +0.120 with the full texture,
+# lighting +0.040 against +0.050, and no blend at 0.5 or above (max 0.38;
+# the takes themselves sit at 0.1–0.4). 0 restores the full-texture blend.
+DETAIL_SIGMA = float(os.environ.get("MIID_FACE_BLEND_DETAIL_SIGMA", "2.0"))
+# How far a blend may raise the seed-texture correlation of the take
+# (texture_corr, on the blend's own alignment). A structure-only blend
+# raised it by +0.20 on average and +0.31 at most on the takes above; a
+# full-texture blend by +0.55 at least. Anything past this is a paste.
+COPY_RISE_MAX = 0.4
 # Landmark fit: RMS residual of the base landmarks mapped onto the take's,
 # as a fraction of the take's eye distance. A still face fits within ~0.05;
 # a turned head or a changed expression does not.
@@ -376,6 +396,38 @@ def warp_base(base_rgb: np.ndarray, matrix: np.ndarray, shape: Tuple[int, int]) 
     )
 
 
+def texture_corr(
+    base_rgb: np.ndarray, image_rgb: np.ndarray, matrix: np.ndarray, points: np.ndarray,
+) -> Optional[float]:
+    """How much of the seed's skin texture ``image`` reproduces: the
+    correlation of the high-pass detail of the aligned base and the image
+    over the inner face — the benchmark's copy-paste residual
+    (MIID/benchmark/analyzers.py _copy_paste_residual) on the five MTCNN
+    landmarks instead of MediaPipe's 478. ``matrix`` should be the transform
+    the blend itself used, so the pasted texture lines up exactly. None when
+    too little face overlaps."""
+    import cv2
+
+    h, w = image_rgb.shape[:2]
+    region = face_ellipse((h, w), points) > 0.5
+    covered = cv2.warpAffine(
+        np.ones(base_rgb.shape[:2], dtype=np.uint8), matrix.astype(np.float32), (w, h),
+        flags=cv2.INTER_NEAREST,
+    ).astype(bool)
+    region &= covered
+    if region.sum() < 500:
+        return None
+
+    def high_pass(rgb: np.ndarray) -> np.ndarray:
+        grey = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        return grey - cv2.GaussianBlur(grey, (0, 0), 3.0)
+
+    a = high_pass(warp_base(base_rgb, matrix, (h, w)))[region]
+    b = high_pass(image_rgb)[region]
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b) / denom) if denom > 0 else 0.0
+
+
 def seamless(src: np.ndarray, dst: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """``src`` cloned into ``dst`` under ``mask`` (Poisson image editing):
     the gradients of the base face with the illumination of the take, and no
@@ -403,12 +455,18 @@ def seamless(src: np.ndarray, dst: np.ndarray, mask: np.ndarray) -> np.ndarray:
 def composite(
     base_rgb: np.ndarray, take_rgb: np.ndarray, matrix: np.ndarray, mask: np.ndarray, alpha: float,
     poisson: bool = False, match: str = "global", eye_distance: Optional[float] = None,
+    detail_sigma: Optional[float] = None,
 ) -> np.ndarray:
     """The take with the base face warped in by ``matrix`` and blended under
     ``mask`` at strength ``alpha``. The warped face is colour-matched to the
     take first — globally, or locally (``match="local"``) so the take's
     shading survives — and with ``poisson`` cloned in seamlessly before the
-    mix."""
+    mix. With ``detail_sigma`` (default DETAIL_SIGMA) above 0 only the
+    face's structure coarser than that is mixed in; the take keeps its own
+    finer detail."""
+    import cv2
+
+    detail_sigma = DETAIL_SIGMA if detail_sigma is None else detail_sigma
     warped = warp_base(base_rgb, matrix, take_rgb.shape[:2])
     if match == "local":
         sigma = max(2.0, LOCAL_MATCH_SIGMA * (eye_distance or 40.0))
@@ -418,7 +476,15 @@ def composite(
     if poisson:
         face = seamless(face, take_rgb, mask)
     weight = (alpha * mask)[..., None]
-    out = take_rgb.astype(np.float32) + weight * (face.astype(np.float32) - take_rgb.astype(np.float32))
+    face_f, take_f = face.astype(np.float32), take_rgb.astype(np.float32)
+    if detail_sigma > 0:
+        difference = (
+            cv2.GaussianBlur(face_f, (0, 0), detail_sigma)
+            - cv2.GaussianBlur(take_f, (0, 0), detail_sigma)
+        )
+    else:
+        difference = face_f - take_f
+    out = take_f + weight * difference
     return np.clip(out + 0.5, 0, 255).astype(np.uint8)
 
 
@@ -606,6 +672,12 @@ def apply(
     info["seed_bits"] = seed_bits
     if seed_bits < SEED_DHASH_BITS:
         return done(f"would read as a copy of the seed (dHash {seed_bits} bits)")
+    texture_raw = texture_corr(base_rgb, take_rgb, matrix, take_points)
+    texture_new = texture_corr(base_rgb, np.asarray(image), matrix, take_points)
+    if texture_raw is not None and texture_new is not None:
+        info["texture_rise"] = round(texture_new - texture_raw, 3)
+        if texture_new - texture_raw > COPY_RISE_MAX:
+            return done(f"would carry the seed's skin texture (texture correlation +{texture_new - texture_raw:.2f})")
 
     # The scene cannot change — only the face did — so the scene check is a
     # plain miss test on the blended image, not the 0.10-point "no weaker
