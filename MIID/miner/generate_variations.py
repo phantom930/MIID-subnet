@@ -548,63 +548,55 @@ ACCESSORY_HINTS: Dict[str, str] = {
 }
 
 # The synthetic screen replay (6th slot, P5 C1). The validator names one
-# device and two visual cues (SCREEN_REPLAY_VISUAL_CUES in
-# MIID/validator/image_variations.py); each cue is recognised by a phrase from
-# its description and replaced by a concrete rendering. The passport framing
-# and the "jpeg artifacts / blurry / text" negatives are exactly what this
-# slot must show, so neither applies to it.
+# device and two visual cues; the slot is reviewed by hand and must break
+# Passive Liveness v3 while showing both. A FLUX-drawn device scene never
+# did (every one probed on 2026-10-26 read as a replay at 0.999+), so FLUX
+# now draws only what the screen shows — the reference person in an
+# everyday photo, at the screen's own shape (screen_replay.content_size) —
+# and MIID/miner/screen_replay.py draws the device and the cues around it.
+# What the screen shows decides /is_live's verdict more than anything drawn
+# around it: over 37 composites probed on 2026-10-26, 11 of 12 showing the
+# person outdoors passed, 6 of 11 indoors and 2 of 14 on a plain studio
+# backdrop. Hence outdoor daylight settings only.
 SCREEN_REPLAY_TYPE = "screen_replay"
-SCREEN_REPLAY_CUES: Tuple[Tuple[str, str], ...] = (
-    ("moir", "fine moiré interference ripples and a faintly visible RGB "
-             "subpixel grid across the displayed image"),
-    ("glare", "one or two bright specular glare hotspots reflected on the "
-              "glossy screen surface, kept off the eyes"),
-    ("keystone", "the screen photographed slightly off-axis, so the display "
-                 "appears as a gently converging trapezoid (keystone "
-                 "perspective)"),
-    ("gamma", "the washed-out, slightly blue-tinted, high-contrast look of a "
-              "backlit display, with lifted blacks and clipped highlights"),
-    ("edge", "the device's dark bezel and the screen's edges visible along "
-             "the borders of the photo"),
+SCREEN_CONTENT_SETTINGS: Tuple[str, ...] = (
+    "a leafy park path in daylight",
+    "a quiet city street with shop fronts and trees",
+    "a garden with flowers and a hedge",
+    "a waterfront promenade on a clear day",
+    "a sunny town square with old buildings",
+    "a tree-lined avenue in the afternoon",
+    "a beach boardwalk with the sea behind",
 )
-_SCREEN_REPLAY_DEVICE = re.compile(r"\bon an? (.+?) screen\b", re.IGNORECASE)
 SCREEN_REPLAY_NEGATIVE_PROMPT = (
     "different person, face swap, distorted or deformed face, asymmetric "
     "eyes, cartoon, anime, illustration, painting, 3d render, tiny face, "
-    "face cut off, multiple people, blank screen"
+    "face cut off, multiple people, screen, monitor, phone, text, watermark"
 )
 
 
 def _screen_replay_prompt(
     description: str, detail: str, identity_bias: float,
 ) -> str:
-    """Prompt for the synthetic screen replay: a photo of the face on a screen.
-
-    The face stays the dominant object — the grader detects it and matches it
-    to the seed — while the named device and both requested cues are spelled
-    out concretely. Cues the table does not know are relayed verbatim.
-    """
-    match = _SCREEN_REPLAY_DEVICE.search(f"{description} {detail}")
-    device = match.group(1).strip() if match else "phone"
-
-    blob = detail.lower()
-    cues = [rendering for key, rendering in SCREEN_REPLAY_CUES if key in blob]
-    if len(cues) < 2:
-        cues.append(_strip_requirements(detail))
-
+    """Prompt for what the screen replay's screen shows: the reference
+    person in an ordinary photo, framed with room around the head so the
+    screen edge stays clear of the face once screen_replay.compose has put
+    it on the device."""
+    setting = random.choice(SCREEN_CONTENT_SETTINGS)
     parts = [
-        f"A real camera photograph of a {device} screen that is displaying a "
-        "portrait photo of the reference person. The face on the screen is "
-        "large, centred and fills most of the photo, in focus and clearly "
-        "recognisable.",
-        "The photo clearly shows it was taken of a screen: "
-        + "; ".join(cues) + ".",
+        "An everyday photograph of the reference person, the kind of picture "
+        "kept on a phone or shown on a screen: head and shoulders, facing the "
+        "camera with a relaxed, neutral expression, centred in the frame with "
+        "clear space around the head.",
+        f"They are in {setting}, the place clearly visible behind them and "
+        "softly out of focus, in natural light. The face is sharp, evenly lit "
+        "and fully visible, with natural skin texture.",
         IDENTITY_CLAUSE,
     ]
     if identity_bias > 0:
         parts.append(
-            "Keep the screen effects lighter over the face — it must stay "
-            "clearly recognizable as the reference person."
+            "Above all the face must stay exactly the reference person's — "
+            "keep the setting simple."
         )
     return " ".join(parts)
 
@@ -1386,6 +1378,12 @@ def generate_one(
         else NEGATIVE_PROMPT
     )
     kwargs = _common_generate_kwargs(intensity, seed, identity_bias, negative_prompt)
+    if var_type == SCREEN_REPLAY_TYPE:
+        # The screen's content, drawn at the screen's own shape.
+        from MIID.miner.screen_replay import content_size, parse_request
+
+        device, _ = parse_request(_req_field(req, "description"), _req_field(req, "detail"))
+        kwargs["width"], kwargs["height"] = content_size(device)
     if prompt_cache is not None and model_type == "flux_klein" and prompt_cache.pipe is pipe:
         try:
             kwargs["prompt_embeds"] = prompt_cache.get(prompt)

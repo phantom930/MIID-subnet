@@ -373,6 +373,8 @@ def upload_image_variations(
                             head_turn_deg=var.get("pose_yaw"),
                             edit=var.get("edit"),
                             blend=var.get("blend"),
+                            screen=var.get("screen"),
+                            content_identity=var.get("content_identity"),
                             bytes=len(encrypted_data))
                 else:
                     bt.logging.warning(

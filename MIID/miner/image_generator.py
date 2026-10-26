@@ -9,7 +9,9 @@ import contextlib
 import hashlib
 import io
 import os
+import random
 import statistics
+import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -20,6 +22,7 @@ from PIL import Image
 
 from MIID.miner.generate_variations import (
     SCREEN_REPLAY_TYPE,
+    _req_field,
     active_model_key,
     build_prompt,
     canonical_variation_type,
@@ -51,7 +54,7 @@ from MIID.miner.edit_check import (
     misses as edit_misses,
     preserved as edit_preserved,
 )
-from MIID.miner import face_blend
+from MIID.miner import face_blend, liveness_check, screen_replay
 
 
 # AdaFace similarity a variation should reach before it is accepted as-is.
@@ -67,17 +70,27 @@ from MIID.miner import face_blend
 # to put identity first.
 IDENTITY_TARGET = float(os.environ.get("MIID_IDENTITY_TARGET", "0.7"))
 
-# The validator's own identity gate. Above it the grade is decided by the
-# edit — a 5 needs every component in its requested intensity bin — so takes
-# are ranked edit first from here up: a take in the right bin at identity
-# 0.65 beats a take a bin off at 0.75 (5 against 3 on the score sheet, and
-# +0.10 against +0.03 reputation if reviewed). Under it the grade is capped
-# whatever the edit, so a slot whose best take is under the gate is retried
-# with the edit held back; between the gate and IDENTITY_TARGET it is
-# re-rolled at full strength instead. Until 2026-10-23 the target itself
-# was the ranking gate, and held-back rescues of 0.6–0.7 takes shipped far
-# pose requests as medium or light turns (7 of 7 on that morning's rounds).
-IDENTITY_GATE = float(os.environ.get("MIID_IDENTITY_GATE", "0.6"))
+# The identity a face variation must reach to count at all. Above it the
+# grade is decided by the edit — a 5 needs every component in its requested
+# intensity bin — so takes are ranked edit first from here up. Under it the
+# variation fails whatever the edit, so a take over the gate beats every
+# take under it. The subnet owner's stated bar (2026-10-26) is identity
+# above 0.7 on each of the five face variations, with the prompt followed;
+# the gate was 0.6 (the KAV filter) from 2026-10-23 to 10-26.
+#
+# A slot whose best take is under the gate is retried (see next_settings):
+# full-strength re-rolls alternate with ones that hold the edit back, so
+# the edit is not given up first — held-back rescues alone shipped far
+# pose requests as medium or light turns (7 of 7 on 2026-10-23's morning
+# rounds) — and it gets GATE_RETRIES attempts beyond IDENTITY_RETRIES.
+IDENTITY_GATE = float(os.environ.get("MIID_IDENTITY_GATE", "0.7"))
+# Extra attempts for a slot still under the gate once IDENTITY_RETRIES are
+# spent. Retries stopped on "attempts used up" in 129 of 150 requests on
+# 2026-10-26 and on time in 16: there was GPU time to spare for them.
+GATE_RETRIES = int(os.environ.get("MIID_GATE_RETRIES", "2"))
+# A best take this far under the gate is held back at once: a full-strength
+# re-roll scatters by ~0.05 and will not close a gap that size.
+GATE_FAR_MARGIN = 0.12
 
 # Extra attempts per variation after the first pass: identity rescues (the
 # edit held back) and edit retries (a hint naming the measured miss). They
@@ -129,6 +142,12 @@ GENERATION_BUDGET_SECONDS = float(
 # challenge, and the benchmark read 90% of our far requests as medium or
 # light, so the ranges now follow the bins in both directions.
 POSE_RANGE_DEG = POSE_TARGET_DEG
+
+# Seconds a request that is otherwise done may wait for the screen replay's
+# pending /is_live verdicts (liveness_check; calls are a minute apart) and
+# for new content after a flagged take, as long as no other request is
+# queued for the GPU. Three rungs and one new take need about four minutes.
+PL_WAIT_SECONDS = float(os.environ.get("MIID_PL_WAIT_SECONDS", "240"))
 
 
 def decode_base_image(base64_image: str) -> Image.Image:
@@ -226,6 +245,76 @@ def _yaw(base_signature, image: Image.Image) -> Optional[float]:
         return None
 
 
+def _screen_take(
+    result: Dict, req: Any, base_image: Image.Image, base_embedding: Any,
+    base_geometry: Optional[Tuple], edit_context: Dict[str, Any],
+) -> None:
+    """Turn a screen_replay generation into its composites, in place.
+
+    ``result["image"]`` is what FLUX drew for the screen (the reference
+    person in an everyday photo). Its face is blended toward the base like
+    a background take's when short of the blend goal, then screen_replay
+    puts it on the requested device with the requested cues, once per rung
+    of the variant ladder (screen_replay.variants), and each composite is
+    scored for identity. The take's image becomes the first composite over
+    the identity gate (else the best-scoring one); the liveness thread may
+    later swap in a rung that /is_live passes. ``result["screen"]`` holds
+    the ladder, ``result["screen_images"]`` its images.
+    """
+    from MIID.miner.ada_face_compare import face_geometry
+
+    device, cues = screen_replay.parse_request(_req_field(req, "description"), _req_field(req, "detail"))
+    content = result["image"]
+    result["content_identity"] = _similarity(base_embedding, content)
+    blend = None
+    if face_blend.ENABLED and result["content_identity"] is not None and result["content_identity"] < face_blend.GOAL:
+        stand_in = {
+            "variation_type": "background_in", "image": content,
+            "identity_similarity": result["content_identity"],
+            "environment": None, "edit": None, "pose_yaw": None,
+        }
+        try:
+            blend = face_blend.apply(
+                base_image, base_embedding, base_geometry, stand_in,
+                edit_context=edit_context, levels={}, accessory=None, scene=None,
+            )
+            content = stand_in["image"]
+        except Exception as e:  # noqa: BLE001
+            bt.logging.warning(f"screen_replay: face blend failed: {e}")
+    result["blend"] = blend
+    geometry = face_geometry(content)
+    box = geometry[0] if geometry else None
+
+    seed = random.randrange(2**31)
+    rungs, images = [], []
+    for settings in screen_replay.variants(device, cues):
+        image = screen_replay.compose(content, device, cues, face_box=box, seed=seed, **settings)
+        images.append(image)
+        rungs.append({"settings": settings, "identity": _similarity(base_embedding, image), "pl": None})
+    over = [i for i, r in enumerate(rungs) if (r["identity"] or 0.0) >= IDENTITY_GATE]
+    chosen = over[0] if over else max(range(len(rungs)), key=lambda i: rungs[i]["identity"] or -1.0)
+    result["screen"] = {
+        "device": device, "cues": cues, "rungs": rungs, "chosen": chosen,
+        "passed": None, "failed": False,
+    }
+    result["screen_images"] = images
+    result["image"] = images[chosen]
+    result["identity_similarity"] = rungs[chosen]["identity"]
+    result["pose_yaw"] = result["environment"] = result["edit"] = None
+
+
+def _describe_screen(screen: Dict) -> str:
+    """Log form: "phone, moire+glare, rung 2, /is_live passed (0.81)"."""
+    rung = screen["rungs"][screen["chosen"]]
+    verdict = rung.get("pl")
+    checked = sum(1 for r in screen["rungs"] if r.get("pl"))
+    if verdict is None:
+        pl = f"/is_live {'flagged ' + str(checked) + ' other rung(s)' if checked else 'not asked'}"
+    else:
+        pl = f"/is_live {'flagged it' if verdict['is_screen_replay'] else 'passed'} ({verdict['confidence']:.2f})"
+    return f"{screen['device']}, {'+'.join(screen['cues'])}, rung {screen['chosen'] + 1}, {pl}"
+
+
 def _pose_miss(level: Optional[str], yaw: Optional[float]) -> Tuple[float, Optional[str]]:
     """(degrees outside the requested range, "more" / "less" / None).
 
@@ -256,11 +345,11 @@ _IDENTITY_RETRY_ODDS = (
 # Retry priority, part 2: what a successful retry is worth relative to an
 # identity rescue. A head turn, lighting change or expression outside its
 # level costs at most a partial match, and the grader has been lenient on
-# angle; the screen_replay slot is ignored by the grading API (validator
-# image_variations.py) and has never missed the identity target anyway.
+# angle. The screen_replay slot is reviewed by hand like the others (and must
+# break Passive Liveness v3), so its retries weigh the same since 2026-10-26.
 POSE_RETRY_ODDS = 0.5
 POSE_RETRY_WEIGHT = 0.3
-SCREEN_REPLAY_RETRY_WEIGHT = 0.25
+SCREEN_REPLAY_RETRY_WEIGHT = 1.0
 # A background slot whose scene read as the wrong kind, or whose accessory
 # is missing or something else, is a -1 or 0 against a possible 5 — a bigger
 # swing than a partial match — so it outranks a pose retry and sits level
@@ -367,6 +456,10 @@ class _Slot:
         self.polished = 0
         self.identity_misses = 0
         self.identity_ok = False
+        self.gate_ok = False
+        # Rescue attempts made while under the gate, by kind (next_settings).
+        self.held_back = 0
+        self.full_rescues = 0
         self.pose_miss = 0.0
         self.pose_direction: Optional[str] = None
         self.bg_miss: Optional[str] = None
@@ -377,20 +470,25 @@ class _Slot:
         return (
             self.best is not None and self.identity_ok
             and self.pose_miss == 0.0 and self.bg_miss is None
-            and not self.edit_misses
+            and not self.edit_misses and not self.screen_flagged
         )
+
+    @property
+    def screen_flagged(self) -> bool:
+        """Did /is_live call every composite of the best take a replay?"""
+        return bool(self.best and (self.best.get("screen") or {}).get("failed"))
 
     def snapshot(self) -> Tuple:
         """The current best take and its judgement, for restore()."""
         return (
-            self.best, self.best_key, self.identity_ok, self.pose_miss,
+            self.best, self.best_key, self.identity_ok, self.gate_ok, self.pose_miss,
             self.pose_direction, self.bg_miss, list(self.edit_misses),
         )
 
     def restore(self, snapshot: Tuple) -> None:
         """Put a snapshot() back as the best take (a polish take that lost an edit)."""
         (
-            self.best, self.best_key, self.identity_ok, self.pose_miss,
+            self.best, self.best_key, self.identity_ok, self.gate_ok, self.pose_miss,
             self.pose_direction, self.bg_miss, self.edit_misses,
         ) = snapshot
 
@@ -405,7 +503,7 @@ class _Slot:
         a missed target outranks any identity headroom, since under the 0.6
         gate the whole challenge is capped and a measured edit miss is a
         grade lost whenever that slot is sampled. screen_replay is skipped:
-        the grading API ignores that slot.
+        its composites are judged by /is_live, not polished for identity.
         """
         if self.best is None or self.screen_replay or self.polished >= polish_allowed:
             return None
@@ -450,15 +548,19 @@ class _Slot:
             penalty += MISS_PENALTY[component]
         if not identity_ok:
             self.identity_misses += 1
+        # A screen take /is_live flagged in every rung ranks below one it
+        # has not (yet) flagged; for every other slot this is always True.
+        screen_ok = not (result.get("screen") or {}).get("failed")
         key = (
+            screen_ok,
             gate_ok,
             -penalty if gate_ok else 0.0,
             -1.0 if similarity is None else similarity,
         )
         if self.best is None or key > self.best_key:
             self.best, self.best_key = result, key
-            self.identity_ok, self.pose_miss, self.pose_direction = (
-                identity_ok, miss, direction,
+            self.identity_ok, self.gate_ok, self.pose_miss, self.pose_direction = (
+                identity_ok, gate_ok, miss, direction,
             )
             self.bg_miss = bg_miss
             self.edit_misses = misses
@@ -477,9 +579,16 @@ class _Slot:
         self.identity_misses = misses_before
 
     def retry_priority(self, attempts_allowed: int) -> Optional[float]:
-        """Expected value of one more attempt, or None if it needs none."""
+        """Expected value of one more attempt, or None if it needs none.
+        A slot still under the identity gate may take GATE_RETRIES more
+        attempts than the rest."""
+        if not self.gate_ok:
+            attempts_allowed += GATE_RETRIES
         if self.best is None or self.satisfied or self.generated >= attempts_allowed:
             return None
+        if self.screen_flagged and self.identity_ok:
+            # New content, a new setting: the composite's verdict hangs on it.
+            return BACKGROUND_RETRY_ODDS * BACKGROUND_RETRY_WEIGHT
         if self.identity_ok and (
             self.bg_miss is not None
             or any(component == "accessory" for component, _ in self.edit_misses)
@@ -501,15 +610,21 @@ class _Slot:
     def next_settings(self) -> Tuple[float, Dict[str, str]]:
         """(identity_bias, hints by component) for the next attempt.
 
-        A best take under the identity gate holds the edit back, more with
-        each miss; one over the gate but under the target, or a measured miss
-        of the edit — head turn, scene, lighting, expression, accessory —
-        re-rolls at full strength, with a hint naming any edit miss (the face
-        held; the edit did not).
+        A best take under the identity gate is rescued two ways in turn: a
+        full-strength re-roll (with hints for any edit miss) and one with
+        the edit held back, a little more each time. The ranking keeps a
+        held-back take only if no full-strength one clears the gate, so the
+        edit is given up last. A take far under the gate (GATE_FAR_MARGIN),
+        or with no face at all, is held back straight away. A slot over the
+        gate, or one with a measured miss of the edit — head turn, scene,
+        lighting, expression, accessory — re-rolls at full strength, with a
+        hint naming any edit miss (the face held; the edit did not).
         """
         similarity = self.best["identity_similarity"] if self.best else None
-        if similarity is None or similarity < IDENTITY_GATE:
-            return min(0.8, 0.4 * self.identity_misses), {}
+        under_gate = similarity is None or similarity < IDENTITY_GATE
+        far_under = similarity is None or similarity < IDENTITY_GATE - GATE_FAR_MARGIN
+        if under_gate and (far_under or self.full_rescues > self.held_back):
+            return min(0.8, 0.3 * (self.held_back + 1) + (0.2 if far_under else 0.0)), {}
         hints: Dict[str, str] = {}
         if self.pose_direction:
             hints["pose"] = self.pose_direction
@@ -525,6 +640,8 @@ class _Slot:
             shown = "no face detected" if similarity is None else f"{similarity:.3f}"
             return f"identity {shown} < {target}"
         parts = []
+        if self.screen_flagged:
+            parts.append("/is_live called every composite a screen replay")
         if self.bg_miss is not None:
             parts.append(
                 f"background reads as an {self.bg_miss} scene, {self.scene} scene requested "
@@ -725,6 +842,9 @@ def generate_variations(
 
     def judge(slot: _Slot, result: Dict, cycle_started: float, generated_at: float) -> None:
         """Measure, blend and record one attempt."""
+        if slot.screen_replay:
+            judge_screen(slot, result, cycle_started, generated_at)
+            return
         with (torch.cuda.stream(judge_stream) if judge_stream is not None else contextlib.nullcontext()):
             result["identity_similarity"] = _similarity(base_embedding, result["image"])
             identity_at = time.time()
@@ -778,6 +898,92 @@ def generate_variations(
         elif blend and blend.get("reason"):
             bt.logging.debug(f"{result['variation_type']}: face blend skipped — {blend['reason']}")
 
+    # The screen_replay slot: its take is composed onto the device in the
+    # judging step, and a thread of its own asks /is_live about the
+    # composites while the GPU works on the other slots (one call a minute,
+    # liveness_check). Both it and the main thread touch the slot's best
+    # take, under screen_lock.
+    screen_lock = threading.Lock()
+    screen_stop = threading.Event()
+    screen_thread: List[threading.Thread] = []
+    liveness_end = min([budget_end] + ([deadline] if deadline is not None else [])) - 5.0
+
+    def judge_screen(slot: _Slot, result: Dict, cycle_started: float, generated_at: float) -> None:
+        with (torch.cuda.stream(judge_stream) if judge_stream is not None else contextlib.nullcontext()):
+            try:
+                _screen_take(result, slot.req, base_image, base_embedding, base_geometry, edit_context)
+            except Exception as e:  # noqa: BLE001 — the raw content is still a take
+                bt.logging.warning(f"screen_replay: composing the take failed ({e}); shipping the content as is")
+                result["identity_similarity"] = _similarity(base_embedding, result["image"])
+                result["pose_yaw"] = result["environment"] = result["edit"] = result["blend"] = None
+            if judge_stream is not None:
+                judge_stream.synchronize()
+        if not first_attempt[0]:
+            _recent_cycles.append(time.time() - cycle_started)
+        first_attempt[0] = False
+        with screen_lock:
+            slot.record(result, target)
+        screen = result.get("screen")
+        if screen:
+            bt.logging.info(
+                f"screen_replay: {screen['device']} with {', '.join(screen['cues'])} — identity "
+                + ", ".join("n/a" if r["identity"] is None else f"{r['identity']:.3f}" for r in screen["rungs"])
+                + f" by rung (content {result.get('content_identity') or 0:.3f}"
+                + (f", {face_blend.describe(result.get('blend'))}" if face_blend.describe(result.get("blend")) else "")
+                + f"); attempt {result['winning_attempt']}, generate {generated_at - cycle_started:.1f}s"
+            )
+            if liveness_check.available() and not screen_thread:
+                worker = threading.Thread(target=liveness_worker, args=(slot,), name="liveness", daemon=True)
+                screen_thread.append(worker)
+                worker.start()
+
+    def liveness_worker(slot: _Slot) -> None:
+        """Check the best screen take's rungs with /is_live, strongest cues
+        first, until one passes; a take whose every rung over the identity
+        gate is flagged is marked failed (the retry loop then draws new
+        content) and the next best take's rungs are checked in turn."""
+        while not screen_stop.is_set():
+            with screen_lock:
+                take = slot.best
+                screen = (take or {}).get("screen")
+                if not screen or screen["passed"] is not None:
+                    rung = None
+                else:
+                    rung = next(
+                        (i for i, r in enumerate(screen["rungs"])
+                         if r["pl"] is None and (r["identity"] or 0.0) >= IDENTITY_GATE),
+                        None,
+                    )
+                    checked = any(r["pl"] is not None for r in screen["rungs"])
+                    if rung is None and checked and not screen["failed"]:
+                        screen["failed"] = True
+                        slot.best_key = (False,) + slot.best_key[1:]
+                        bt.logging.info("screen_replay: /is_live flagged every rung of this take; new content next")
+            if screen and screen["passed"] is not None:
+                return
+            if rung is None:
+                # Nothing left to ask about this take: wait for another one.
+                if screen_stop.wait(2.0) or time.time() > liveness_end:
+                    return
+                continue
+            verdict = liveness_check.check(take["screen_images"][rung], latest_start=liveness_end)
+            if verdict is None:
+                if not liveness_check.available() or time.time() + liveness_check.seconds_until_allowed() > liveness_end:
+                    return
+                continue
+            with screen_lock:
+                screen["rungs"][rung]["pl"] = verdict
+                passed = not verdict["is_screen_replay"]
+                if passed and not screen_stop.is_set():
+                    screen["passed"] = screen["chosen"] = rung
+                    take["image"] = take["screen_images"][rung]
+                    take["identity_similarity"] = screen["rungs"][rung]["identity"]
+            bt.logging.info(
+                f"screen_replay: rung {rung + 1} (strength {screen['rungs'][rung]['settings']['strength']}) — "
+                f"/is_live {'passed' if passed else 'flagged it'} "
+                f"(confidence {verdict['confidence']:.3f})"
+            )
+
     def settle(slot: _Slot) -> None:
         """Wait for the slot's deferred judgement, if any. A judgement that
         failed loses that one take, not the request."""
@@ -797,6 +1003,11 @@ def generate_variations(
         defer: bool = False, prompt: Optional[str] = None,
     ) -> None:
         settle(slot)
+        if slot.best is not None and not slot.gate_ok:
+            if identity_bias > 0:
+                slot.held_back += 1
+            else:
+                slot.full_rescues += 1
         cycle_started = time.time()
         result = generate_one(
             base_image, slot.req, model_key=model_info["key"],
@@ -843,7 +1054,9 @@ def generate_variations(
     # ── phase 1: one attempt per slot ──
     skipped = []
     failed: List[_Slot] = []
-    for slot in sorted(slots, key=lambda s: (s.screen_replay, s.index)):
+    # The screen replay first: its /is_live checks (a minute apart) then run
+    # while the other slots generate.
+    for slot in sorted(slots, key=lambda s: (not s.screen_replay, s.index)):
         if deadline is not None and time.time() + cycle_estimate() > deadline:
             skipped.append(slot)
             continue
@@ -880,6 +1093,38 @@ def generate_variations(
         )
         return cutoff, reason
 
+    # The screen replay's /is_live verdicts come a minute apart, so a request
+    # whose slots are all settled may still be waiting on one — and on a
+    # flagged take, on new content and its verdict. While no other request
+    # is queued for the GPU and the deadline allows, it waits for them, up to
+    # PL_WAIT_SECONDS in all.
+    def screen_pending() -> bool:
+        """Is the best screen take neither passed nor yet given up on (the
+        liveness thread marks it failed once every rung is flagged)?"""
+        with screen_lock:
+            for slot in slots:
+                screen = (slot.best or {}).get("screen") if slot.screen_replay else None
+                if screen and screen["passed"] is None and not screen["failed"] and any(
+                    (r["identity"] or 0.0) >= IDENTITY_GATE for r in screen["rungs"]
+                ):
+                    return True
+        return False
+
+    waited_for_pl = [0.0]
+
+    def wait_for_screen_verdict() -> bool:
+        """Wait two seconds for a pending verdict; False when there is none
+        to wait for, or no time or GPU to wait with."""
+        if not (screen_thread and screen_thread[0].is_alive() and screen_pending()):
+            return False
+        if waited_for_pl[0] >= PL_WAIT_SECONDS or time.time() + 2.0 > liveness_end:
+            return False
+        if retry_cutoff_fn is not None and retry_cutoff_fn() is not None:
+            return False
+        screen_thread[0].join(timeout=2.0)
+        waited_for_pl[0] += 2.0
+        return True
+
     # ── phase 2: retries, most valuable first, while time allows ──
     retries_run = 0
     stop_reason = "every slot met its targets"
@@ -890,6 +1135,8 @@ def generate_variations(
             if (priority := slot.retry_priority(attempts_allowed)) is not None
         ]
         if not candidates:
+            if wait_for_screen_verdict():
+                continue  # a flagged screen take becomes a candidate
             if any(not s.satisfied for s in slots if s.best is not None):
                 stop_reason = "attempts used up" if retries > 0 else "retries off, polish takes over"
             break
@@ -1043,10 +1290,23 @@ def generate_variations(
             f"identity {shown(before)} → {shown(after)} ({verdict})"
         )
 
+    # A verdict still pending once everything else is done gets the rest of
+    # the wait (see wait_for_screen_verdict); then the liveness thread stops
+    # and a verdict still in flight is dropped.
+    while wait_for_screen_verdict():
+        pass
+    if waited_for_pl[0]:
+        bt.logging.info(f"screen_replay: waited {waited_for_pl[0]:.0f}s for /is_live")
+
     # ── assemble, in request order ──
+    screen_stop.set()
     variations = []
     for slot in slots:
-        best = slot.best
+        with screen_lock:
+            best = slot.best
+            screen = dict(best["screen"]) if best and best.get("screen") else None
+            if screen:
+                screen["rungs"] = [dict(r) for r in screen["rungs"]]
         if best is None:
             continue
         var_type = best["variation_type"]
@@ -1068,7 +1328,10 @@ def generate_variations(
             "pose_yaw": best.get("pose_yaw"),
             "edit": best.get("edit"),
             "blend": best.get("blend"),
+            "screen": screen,
+            "content_identity": best.get("content_identity"),
         })
+        best.pop("screen_images", None)
 
         environment = describe_environment(var_type, best.get("environment"))
         measured = describe_edit(best.get("edit"))
@@ -1084,6 +1347,7 @@ def generate_variations(
             + (f", background {environment}" if environment else "")
             + (f", {measured}" if measured else "")
             + (f", {blended}" if blended else "")
+            + (f", {_describe_screen(screen)}" if screen else "")
             + (f", {slot.reason(target)}" if not slot.satisfied and slot.identity_ok else "")
             + f", kept attempt {best['winning_attempt']} of {slot.generated})"
             f", hash: {image_hash[:16]}..."

@@ -216,8 +216,11 @@ except ImportError as _phase4_err:
 UPLOAD_SECONDS_PER_SLOT = 4.0
 VOICE_RESERVE_SECONDS = 60.0
 # The clone itself, the only part of the voice work that needs the GPU
-# (~11 s measured on 2026-10-14); the rest of the reserve is upload and margin.
-VOICE_GPU_SECONDS = 15.0
+# (~11 s measured on 2026-10-14, before the word check added a Whisper pass
+# and up to six takes); the rest of the reserve is upload and margin.
+VOICE_GPU_SECONDS = 25.0
+# What the voice upload needs after the last take (encrypt + S3, measured ~3 s).
+VOICE_UPLOAD_SECONDS = 8.0
 # Latest the clone may start: it plus its own upload have to end before the
 # image uploads and the margin. VOICE_RESERVE_SECONDS keeps room for it while
 # generation runs; this is the tighter figure the clone itself is held to.
@@ -328,6 +331,15 @@ class Miner(BaseMinerNeuron):
 
         if PHASE4_AVAILABLE:
             bt.logging.info("Phase 4 image generation: ENABLED")
+            # The screen_replay composite is checked against Passive Liveness
+            # v3 before it ships (MIID/miner/liveness_check.py), signed with
+            # this miner's hotkey.
+            from MIID.miner import liveness_check
+            liveness_check.configure(self.wallet)
+            bt.logging.info(
+                f"Screen replay: /is_live check {'on' if liveness_check.available() else 'off'} "
+                f"({liveness_check.API_URL}, one call per {liveness_check.RATE_SECONDS:.0f}s)"
+            )
 
             forced_model = os.environ.get("MIID_MODEL", "").strip() or "(unset -> flux_klein)"
             inference_steps = os.environ.get("MIID_INFERENCE_STEPS", "6").strip()
@@ -728,6 +740,7 @@ class Miner(BaseMinerNeuron):
                 try:
                     voice_clip = self.clone_voice_request(
                         synapse, save_dir=self._archive_voice_dir(record),
+                        deadline=deadline - upload_reserve - VOICE_UPLOAD_SECONDS,
                     )
                     voice_summary["outcome"] = "generated" if voice_clip else "empty"
                     if not voice_clip:
@@ -743,6 +756,7 @@ class Miner(BaseMinerNeuron):
                     # MIID_VOICE_KEEP_LOADED is set.
                     release_voice_worker()
                 voice_summary["similarity"] = _voice_generator.last_similarity
+                voice_summary["words"] = _voice_generator.last_words
                 voice_summary["seconds"] = round(time.time() - voice_started, 2)
 
         # --- Nothing below needs the GPU: hand it to the next request ---
@@ -1034,6 +1048,7 @@ class Miner(BaseMinerNeuron):
 
     def clone_voice_request(
         self, synapse: IdentitySynapse, save_dir: Optional[str] = None,
+        deadline: Optional[float] = None,
     ) -> Optional[Tuple[bytes, bytes]]:
         """The GPU half of a voice request: decode, clone, check the speaker.
 
@@ -1049,6 +1064,8 @@ class Miner(BaseMinerNeuron):
                 is written as soon as it is generated, so a clip that is then
                 dropped by the identity check or fails to upload is still
                 there to listen to.
+            deadline: Wall-clock time the last take must end by (see
+                generate_voice_clone).
         """
         voice_request = synapse.voice_request
         if not voice_request:
@@ -1071,6 +1088,7 @@ class Miner(BaseMinerNeuron):
                 target_words=list(voice_request.target_words or []),
                 language=voice_request.language or "en",
                 target_text=getattr(voice_request, "target_text", "") or "",
+                deadline=deadline,
             )
             if not generated_wav:
                 bt.logging.info(

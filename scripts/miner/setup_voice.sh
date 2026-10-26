@@ -48,9 +48,10 @@ print('voice stack OK')
 "
 
 if [[ "${1:-}" == "--warmup" ]]; then
-    # Pull the weights (~3 GB) into the HF cache now. The miner also does this
-    # in the background at startup (MIID_VOICE_PRELOAD), but doing it here
-    # shows download problems before the miner is live.
+    # Pull the weights (~3 GB, plus ~1.6 GB of Whisper for the word check)
+    # into the HF cache now. The miner also does this in the background at
+    # startup (MIID_VOICE_PRELOAD), but doing it here shows download
+    # problems before the miner is live.
     "$PY" -W ignore - <<'EOF'
 import os
 from chatterbox.mtl_tts import ChatterboxMultilingualTTS
@@ -61,6 +62,9 @@ EncoderClassifier.from_hparams(
     savedir=os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache")),
                          "speechbrain", "spkrec-ecapa-voxceleb"),
 )
+from MIID.miner import word_check
+from huggingface_hub import snapshot_download
+snapshot_download(word_check.MODEL_ID, allow_patterns=["*.json", "*.safetensors", "*.txt"])
 print("voice models cached")
 EOF
 fi

@@ -15,10 +15,24 @@
 # --no-deps and adds what it actually needs from requirements-voice.txt. The
 # combination was verified on torch 2.14 / transformers 5.19 / diffusers 0.41.
 #
-# Up to MIID_VOICE_ATTEMPTS takes are generated and the one with the highest
-# ECAPA similarity to the reference is kept, stopping early once it reaches
-# MIID_VOICE_IDENTITY_TARGET. The validator counts a voice as identity-
-# preserving above 0.6 (speech_brain_compare enforces that floor).
+# A clone is graded twice: ECAPA similarity to the reference above 0.6
+# (speech_brain_compare enforces that floor), then a reviewer listens for
+# every target word, and one missing, swapped or garbled word fails it. Up
+# to MIID_VOICE_ATTEMPTS takes are generated; each is scored with ECAPA and
+# transcribed by Whisper (word_check), and the best take is the one over the
+# floor that says every word, then the one with fewest word errors, then the
+# highest similarity. Generation stops early once a take says every word at
+# MIID_VOICE_IDENTITY_TARGET.
+#
+# The model is not given the target text as is. Every prompt is wrapped in
+# the hotkey's first and last four characters ("5 H P O ... R D 8 L"), and
+# read raw the Spanish voice ran them into words ("Hachapo", "Rebocho
+# Locho"): Whisper heard every word of 0 of 57 archived Spanish clones
+# (2026-10-25/26) and 26 of 66 English ones. word_check.spoken_text names
+# each letter in the clip's language ("hache, pe, o") with a pause between
+# tokens; on the same references Spanish went from 0 of 4 takes to 3 of 4,
+# and English held level (7 of 10 either way), so English alternates the
+# two spellings between takes and lets the word check pick.
 #
 # Prompt text is already joined for you as target_text, e.g.
 #   "three orange six two nine apple table one"
@@ -42,12 +56,18 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import bittensor as bt
 
+from MIID.miner import word_check
 
-# Takes generated per request; the best by speaker similarity is kept.
-VOICE_ATTEMPTS = int(os.environ.get("MIID_VOICE_ATTEMPTS", "3"))
+
+# Takes generated per request at most (a take is ~2–3 s on the GPU). Raised
+# from 3 on 2026-10-26 with the word check: about a third of single takes
+# drop or garble a word.
+VOICE_ATTEMPTS = int(os.environ.get("MIID_VOICE_ATTEMPTS", "6"))
 # Stop re-rolling once a take reaches this similarity. Above the validator's
 # 0.6 floor so that scoring noise on their side does not tip it under.
 VOICE_IDENTITY_TARGET = float(os.environ.get("MIID_VOICE_IDENTITY_TARGET", "0.7"))
+# The validator's floor: a take under it is rejected whatever it says.
+VOICE_FLOOR = 0.6
 # The models hold ~3 GB of VRAM while loaded, on the GPU the FLUX image path
 # needs. Voice comes once per round, so by default they are parked in CPU
 # memory after each request; set 1 to keep them on the GPU.
@@ -68,9 +88,10 @@ ECAPA_SR = 16000
 COND_SR = 24000  # sample rate Chatterbox conditions on
 SUPPORTED_LANGUAGES = {"en", "es"}
 
-# Speaker similarity of the last clip generate_voice_clone returned, for logs
-# and the request archive.
+# Speaker similarity and word check of the last clip generate_voice_clone
+# returned, for logs and the request archive.
 last_similarity: Optional[float] = None
+last_words: Optional[Dict[str, Any]] = None
 
 _availability: Optional[bool] = None
 _import_error: Optional[str] = None
@@ -322,6 +343,7 @@ def preload_async() -> None:
     def _run() -> None:
         try:
             _MODELS.preload()
+            word_check.preload()
             bt.logging.info("Voice: models preloaded and parked in CPU memory")
         except Exception as e:
             bt.logging.warning(
@@ -403,13 +425,36 @@ def _wav_bytes(samples, sr: int) -> bytes:
 # Cloning
 # ---------------------------------------------------------------------------
 
-def _clone(base_wav: bytes, text: str, language: str) -> Tuple[float, bytes, int]:
-    """Best-of-N clone of ``base_wav`` saying ``text``: (similarity, wav bytes, takes)."""
+def _texts(words: List[str], text: str, language: str) -> List[str]:
+    """What the model reads, by attempt (cycled): the letters named for a
+    Spanish voice, both spellings in turn for an English one (see the top
+    of this module)."""
+    spoken = word_check.spoken_text(words, language)
+    if language == "es" or not text:
+        return [spoken]
+    return [spoken, text]
+
+
+def _rank(sim: float, words: Optional[Dict[str, Any]]) -> Tuple:
+    """Order of takes: over the ECAPA floor, every word heard, fewest word
+    errors, then similarity. An unchecked take (no Whisper) counts as
+    neither a pass nor a fail."""
+    errors = 0 if words is None else words["errors"]
+    return (sim >= VOICE_FLOOR, words is None or words["ok"], -errors, sim)
+
+
+def _clone(
+    base_wav: bytes, words: List[str], text: str, language: str,
+    deadline: Optional[float] = None,
+) -> Tuple[float, bytes, int, Optional[Dict[str, Any]]]:
+    """Best-of-N clone of ``base_wav`` saying ``words``:
+    (similarity, wav bytes, takes, word check of the kept take)."""
     import torch
     import torchaudio.functional as AF
 
     tts, ecapa = _MODELS.for_inference()
     ref16k = _load_wav(base_wav, ECAPA_SR)
+    texts = _texts(words, text, language)
 
     with tempfile.TemporaryDirectory(prefix="miid_voice_") as tmp:
         cond_path = os.path.join(tmp, "reference.wav")
@@ -425,32 +470,42 @@ def _clone(base_wav: bytes, text: str, language: str) -> Tuple[float, bytes, int
     attempts = max(1, VOICE_ATTEMPTS)
     best = None
     made = 0
+    take_seconds = 0.0
     for attempt in range(attempts):
+        if best is not None and deadline is not None and time.time() + take_seconds > deadline:
+            bt.logging.info(f"Voice: no time for take {attempt + 1}; keeping the best of {made}")
+            break
+        started = time.time()
         made = attempt + 1
         torch.manual_seed(int(time.time() * 1000) % 2**31 + attempt)
         # Later attempts lean harder on the reference: less exaggeration and
         # temperature keep the timbre closer to the speaker.
         with _drop_new_hooks(tts.t3):
             wav = tts.generate(
-                text,
+                texts[attempt % len(texts)],
                 language_id=language,
                 exaggeration=0.5 if attempt == 0 else 0.4,
                 cfg_weight=0.5,
                 temperature=0.8 if attempt == 0 else 0.6,
             )
         wav = wav.squeeze().float().cpu()
-        sim = _similarity(ecapa, ref16k, AF.resample(wav, tts.sr, ECAPA_SR))
-        bt.logging.info(f"Voice: take {made}/{attempts} — ECAPA similarity {sim:.3f}")
-        if best is None or sim > best[0]:
-            best = (sim, wav)
-        if sim >= VOICE_IDENTITY_TARGET:
+        wav16k = AF.resample(wav, tts.sr, ECAPA_SR)
+        sim = _similarity(ecapa, ref16k, wav16k)
+        heard = word_check.check(wav16k, words, language, device=_MODELS.device or "cpu")
+        bt.logging.info(
+            f"Voice: take {made}/{attempts} — ECAPA similarity {sim:.3f}, {word_check.describe(heard)}"
+        )
+        if best is None or _rank(sim, heard) > _rank(best[0], best[2]):
+            best = (sim, wav, heard)
+        take_seconds = max(take_seconds, time.time() - started)
+        if sim >= VOICE_IDENTITY_TARGET and (heard is None or heard["ok"]):
             break
 
-    sim, wav = best
+    sim, wav, heard = best
     peak = float(wav.abs().max())
     if peak > 1.0:
         wav = wav / peak
-    return sim, _wav_bytes(wav.numpy(), tts.sr), made
+    return sim, _wav_bytes(wav.numpy(), tts.sr), made, heard
 
 
 def decode_base_voice(base64_voice: str) -> bytes:
@@ -463,6 +518,7 @@ def generate_voice_clone(
     target_words: List[str],
     language: str,
     target_text: str = "",
+    deadline: Optional[float] = None,
 ) -> Optional[bytes]:
     """Generate a voice-cloned WAV speaking the target prompt.
 
@@ -472,12 +528,14 @@ def generate_voice_clone(
         language: ``"en"`` or ``"es"``.
         target_text: Ready-to-speak prompt string (preferred for TTS).
             Falls back to ``" ".join(target_words)`` if empty.
+        deadline: Wall-clock time the last take must end by; no new take is
+            started that would run past it (the first always runs).
 
     Returns:
         Generated WAV bytes (16-bit PCM, 24 kHz), or None if generation failed.
     """
-    global last_similarity
-    last_similarity = None
+    global last_similarity, last_words
+    last_similarity = last_words = None
 
     prompt = (target_text or " ".join(target_words or [])).strip()
     if not prompt or not base_wav_bytes:
@@ -494,6 +552,7 @@ def generate_voice_clone(
     if lang not in SUPPORTED_LANGUAGES:
         bt.logging.warning(f"Voice: unsupported language {language!r}; using English")
         lang = "en"
+    words = [w for w in (target_words or prompt.split()) if w.strip()]
 
     import torch
 
@@ -501,19 +560,19 @@ def generate_voice_clone(
     try:
         with _MODELS.lock, _preserve_root_logging():
             try:
-                sim, wav_bytes, takes = _clone(base_wav_bytes, prompt, lang)
+                sim, wav_bytes, takes, heard = _clone(base_wav_bytes, words, prompt, lang, deadline)
             except torch.cuda.OutOfMemoryError:
                 _MODELS.fall_back_to_cpu()
-                sim, wav_bytes, takes = _clone(base_wav_bytes, prompt, lang)
+                sim, wav_bytes, takes, heard = _clone(base_wav_bytes, words, prompt, lang, deadline)
     except Exception as e:
         bt.logging.warning(f"Voice: clone failed ({type(e).__name__}: {e})")
         return None
 
-    last_similarity = sim
+    last_similarity, last_words = sim, heard
     bt.logging.info(
-        f"Voice: cloned {len(prompt.split())} words (lang={lang}) in "
-        f"{time.time() - started:.1f}s — speaker similarity {sim:.3f} "
-        f"after {takes} take(s)"
+        f"Voice: cloned {len(words)} words (lang={lang}) in "
+        f"{time.time() - started:.1f}s — speaker similarity {sim:.3f}, "
+        f"{word_check.describe(heard)}, after {takes} take(s)"
     )
     return wav_bytes
 
@@ -544,6 +603,7 @@ def release_worker(force: bool = False) -> None:
         _MODELS.unload()
     elif not VOICE_KEEP_LOADED:
         _MODELS.park()
+    word_check.release()
 
 
 def hash_voice_bytes(wav_bytes: bytes) -> str:
@@ -590,7 +650,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"wrote {args.out} ({len(wav)} bytes) in {time.time() - started:.1f}s; "
         f"ECAPA similarity {last_similarity:.3f}"
         + (f" (re-measured on the file: {check:.3f})" if check is not None else "")
-        + " — validator floor 0.6"
+        + f" — validator floor 0.6; {word_check.describe(last_words)}"
     )
     return 0
 
