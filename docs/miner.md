@@ -688,6 +688,12 @@ python -m MIID.miner.voice_generator --reference some_voice.wav --text "three or
 
 Validators may also request **accessories** on background edits (head coverings, hats, etc.).
 
+### Variety on background slots
+
+The subnet owner (2026-10-28): outputs that look interchangeable with another miner's are penalised — vary the scenery, time of day, palette, clothing and the accessories' kind and colour, not one word of the prompt. The penalty is the duplicate flag (validation score −0.2, reputation −0.10), and on the 2026-10-28 stats snapshot it fell almost only on background slots: 48 of 269 `background_out` grades across all miners, 1 of 149 `background_in`, none of the 1,078 pose / lighting / expression ones. Every miner gets the same seed per challenge, most run FLUX.2 Klein 4B, and the reference miner prompts with the validator's own example places (park, street, plaza, waterfront; office, cafe, lobby, gallery) — which our phrases named too: nearly every `background_out` was the same lakeside promenade, every man wore the same white taqiyah, every subject the seed's grey t-shirt.
+
+So a background slot's prompt now deals (`MIID/miner/variety.py`, shuffled decks that do not repeat until used up) a scene for its environment and level away from those examples (a farmers' market, a snowy village street, a red-rock canyon; a bakery, a tailor's workshop, a theatre foyer), the light (morning, overcast, golden hour, after rain; lamps, tungsten, accent lighting), a palette and a lens, a change of clothes matched to the scene's weather, and the accessory's colour and cut (taqiyah / kufi colours and embroidery, hijab colours and drapes, fedora / panama / sun hat, beanie, cap and bandana colours) in the shapes the grader's classifier reads. The screen replay's content draws its outdoor setting and clothes the same way. Pose, expression and lighting slots keep the seed's backdrop and clothes: the edit is what they are graded on, and none of them drew a duplicate flag.
+
 ---
 
 ## How the Image Models Work

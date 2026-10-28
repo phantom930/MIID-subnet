@@ -135,6 +135,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from PIL import Image
 
+from MIID.miner import variety
+
 logger = logging.getLogger(__name__)
 
 # =============================================================================
@@ -254,14 +256,19 @@ _RELIGIOUS_MARKER = "religious head covering"
 # wrapped turban as a bandana: raw CLIP put "bandana" first on 9 of 9 of our
 # turbans, and the turban graded -1 by RoundTable21 on 2026-10-07 read 94%
 # bandana / 6% religious covering.
-RELIGIOUS_COVERINGS: Dict[str, Tuple[str, ...]] = {
+#
+# Colour and cut vary per request (variety.taqiyah / variety.hijab): one
+# white crocheted cap on every man was the same accessory in every round.
+RELIGIOUS_COVERINGS: Dict[str, Tuple[Callable[[], str], str]] = {
     "m": (
-        "a white Muslim prayer cap (taqiyah / kufi) with a fine crocheted "
-        "pattern, fitted on the crown of his head, with his ears, jawline and "
-        "neck left uncovered — not a headscarf, not a turban",
+        variety.taqiyah,
+        "{style}: a Muslim prayer cap (taqiyah / kufi) fitted on the crown of "
+        "his head, with his ears, jawline and neck left uncovered — not a "
+        "headscarf, not a turban",
     ),
     "f": (
-        "a hijab headscarf wrapped around her head that covers her hair, ears "
+        variety.hijab,
+        "{style}: a hijab headscarf around her head that covers her hair, ears "
         "and neck while her whole face stays visible",
     ),
 }
@@ -280,18 +287,22 @@ def subject_gender_from_filename(name: Optional[str]) -> Optional[str]:
 # confidence, and on 2026-10-07 the muted versions the bare text produced
 # failed it: CLIP with the validator's own wording read 7 of 9 snug grey
 # beanies and 3 of 12 dark caps as "no head accessory" (< 0.5). Contrast with
-# the hair and the item's defining shape are what carry the confidence.
-ACCESSORY_RENDERINGS: Tuple[Tuple[str, str], ...] = (
+# the hair and the item's defining shape are what carry the confidence, so
+# the shape stays pinned here while the colour and cut come from variety's
+# decks.
+ACCESSORY_RENDERINGS: Tuple[Tuple[str, Callable[[], str], str], ...] = (
     # First: the brim-hat text itself says "(not baseball cap)".
-    ("brim hat", "a wide-brim hat (a fedora or sun hat) with a clearly "
-                 "visible brim all the way round — not a baseball cap"),
-    ("knit hat", "a chunky cable-knit winter beanie in a bright solid colour, "
-                 "with a thick folded cuff, pulled down over the top of the "
-                 "head so it clearly sits above the hair"),
-    ("baseball cap", "a baseball cap in a bright solid colour with a curved "
-                     "visor pointing forward, clearly a sports cap"),
-    ("bandana", "a bandana with a bold paisley print tied over the top of the "
-                "head, knotted at the back"),
+    ("brim hat", variety.brim_hat,
+     "{style}, a hat with a clearly visible brim all the way round — not a "
+     "baseball cap"),
+    ("knit hat", variety.knit_hat,
+     "{style}, pulled down over the top of the head so it clearly sits above "
+     "the hair"),
+    ("baseball cap", variety.cap,
+     "{style} with a curved visor pointing forward, clearly a sports cap, "
+     "with no logo or text"),
+    ("bandana", variety.bandana,
+     "{style} tied over the top of the head, knotted at the back"),
 )
 
 
@@ -299,18 +310,19 @@ def _resolve_accessory(accessory: str, subject_gender: Optional[str]) -> str:
     """A concrete accessory to draw, gender-appropriate for a religious covering."""
     lowered = accessory.lower()
     if _RELIGIOUS_MARKER not in lowered:
-        for phrase, rendering in ACCESSORY_RENDERINGS:
+        for phrase, style, rendering in ACCESSORY_RENDERINGS:
             if phrase in lowered:
-                return rendering
+                return rendering.format(style=style())
         return accessory
-    options = RELIGIOUS_COVERINGS.get(subject_gender or "")
-    if not options:
+    covering = RELIGIOUS_COVERINGS.get(subject_gender or "")
+    if not covering:
         return (
             f"{accessory}; choose the covering that matches the subject's own "
             "gender — a hijab only for a woman, a taqiyah prayer cap only for "
             "a man"
         )
-    return random.choice(options)
+    style, rendering = covering
+    return rendering.format(style=style())
 
 # One handwritten instruction per (type, intensity) the validator can ask for.
 #
@@ -428,40 +440,49 @@ EDIT_PHRASES: Dict[Tuple[str, str], str] = {
     # a white-walled gallery graded -1 ("no background detected") on
     # 2026-10-07, so every level names concrete, visible furniture or scenery
     # and light blur only.
+    #
+    # {scene} is dealt per request by variety.background — the place, its
+    # light, palette and lens — away from the validator's own examples, which
+    # these phrases used to name and every default miner draws (see
+    # MIID/miner/variety.py for the duplicate flags that followed).
     ("background_in", "light"): (
-        "Replace the plain backdrop with a real indoor room behind the "
-        "subject — a coloured wall with a shelf, a plant or a framed picture, "
-        "slightly out of focus but clearly recognisable, never a blank or "
-        "white backdrop."
+        "Replace the plain backdrop with a real indoor room close behind the "
+        "subject: {scene}. Slightly out of focus but clearly recognisable, "
+        "never a blank or white backdrop."
     ),
     ("background_in", "medium"): (
-        "Place the subject in a different but plausible indoor setting — an "
-        "office with desks and shelves, a cafe with tables and warm lights, "
-        "or a hotel lobby with furniture — entirely indoors, with the room "
-        "clearly visible behind them."
+        "Place the subject in a different but plausible indoor setting: "
+        "{scene}. Entirely indoors, with the room clearly visible behind them."
     ),
     ("background_in", "far"): (
         "Place the subject in a clearly different indoor setting with its own "
-        "interior design and visible depth, such as a library with full "
-        "bookshelves, a busy open-plan office or a richly furnished hotel "
-        "lobby — colourful and detailed, not white walls. Keep the background "
-        "fully indoors, with no outdoor elements anywhere in the frame."
+        "interior design and visible depth: {scene}. Colourful and detailed, "
+        "not white walls, and fully indoors, with no windows, sky or outdoor "
+        "elements anywhere in the frame."
     ),
     ("background_out", "light"): (
-        "Replace the plain backdrop with a real outdoor scene in daylight — "
-        "trees, a path or building fronts behind the subject, slightly out of "
-        "focus but clearly recognisable as outdoors, never a blank backdrop."
+        "Replace the plain backdrop with a real outdoor scene close behind the "
+        "subject: {scene}. Slightly out of focus but clearly recognisable as "
+        "outdoors, never a blank backdrop."
     ),
     ("background_out", "medium"): (
-        "Place the subject in a different but plausible outdoor setting — a "
-        "park, a street corner, a waterfront."
+        "Place the subject in a different but plausible outdoor setting: "
+        "{scene}. The place is clearly visible behind them."
     ),
     ("background_out", "far"): (
         "Place the subject in a clearly different outdoor setting with its own "
-        "composition and depth, such as an urban street, a beach promenade, a "
-        "mountain overlook or a garden path."
+        "composition and depth: {scene}. The scene recedes into the distance "
+        "behind them."
     ),
 }
+
+# What a background slot dresses the subject in (variety.clothing). Every
+# validator seed wears the same plain grey t-shirt; changing the setting is
+# where a change of clothes is plausible, and the owner asks for it there.
+CLOTHING_CLAUSE = (
+    "The subject wears {garment} in place of the plain top in the reference "
+    "photo — plain fabric with no text or logos."
+)
 
 # Appended on a retry after image_generator measured the head turn outside
 # the requested range. Klein under-rotates far more often than it over-rotates:
@@ -557,7 +578,10 @@ ACCESSORY_HINTS: Dict[str, str] = {
 # What the screen shows decides /is_live's verdict more than anything drawn
 # around it: over 37 composites probed on 2026-10-26, 11 of 12 showing the
 # person outdoors passed, 6 of 11 indoors and 2 of 14 on a plain studio
-# backdrop. Hence outdoor daylight settings only.
+# backdrop. Hence outdoor daylight settings only, dealt without repeats
+# with the person's clothes (variety) so that consecutive screen replays do
+# not look alike. No beach: the bright sand-and-sky boardwalk was the
+# content in 3 of the 5 laptop replays /is_live flagged on 2026-10-27.
 SCREEN_REPLAY_TYPE = "screen_replay"
 SCREEN_CONTENT_SETTINGS: Tuple[str, ...] = (
     "a leafy park path in daylight",
@@ -566,7 +590,14 @@ SCREEN_CONTENT_SETTINGS: Tuple[str, ...] = (
     "a waterfront promenade on a clear day",
     "a sunny town square with old buildings",
     "a tree-lined avenue in the afternoon",
-    "a beach boardwalk with the sea behind",
+    "a canal-side path lined with bicycles",
+    "a residential street with front gardens",
+    "a university campus lawn with old buildings",
+    "a small harbour with moored boats",
+    "a cafe terrace on a sunny street",
+    "a park in autumn with fallen leaves",
+    "a market square with fruit stalls",
+    "a botanical garden path with tall palms",
 )
 SCREEN_REPLAY_NEGATIVE_PROMPT = (
     "different person, face swap, distorted or deformed face, asymmetric "
@@ -582,7 +613,7 @@ def _screen_replay_prompt(
     person in an ordinary photo, framed with room around the head so the
     screen edge stays clear of the face once screen_replay.compose has put
     it on the device."""
-    setting = random.choice(SCREEN_CONTENT_SETTINGS)
+    setting = variety.deal("screen_setting", SCREEN_CONTENT_SETTINGS)
     parts = [
         "An everyday photograph of the reference person, the kind of picture "
         "kept on a phone or shown on a screen: head and shoulders, facing the "
@@ -591,6 +622,7 @@ def _screen_replay_prompt(
         f"They are in {setting}, the place clearly visible behind them and "
         "softly out of focus, in natural light. The face is sharp, evenly lit "
         "and fully visible, with natural skin texture.",
+        CLOTHING_CLAUSE.format(garment=variety.clothing("any")),
         IDENTITY_CLAUSE,
     ]
     if identity_bias > 0:
@@ -1114,9 +1146,17 @@ def _edit_clause(
         phrase = EDIT_PHRASES.get((comp_type, level))
         if phrase is None:
             return None
-        phrases.append(phrase.replace("{side}", side))
+        phrase = phrase.replace("{side}", side)
+        if comp_type in _BACKGROUND_ENVIRONMENTS:
+            scene, climate = variety.background(_BACKGROUND_ENVIRONMENTS[comp_type], level)
+            phrase = phrase.replace("{scene}", scene)
+            phrase = f"{phrase} {CLOTHING_CLAUSE.format(garment=variety.clothing(climate))}"
+        phrases.append(phrase)
 
     return " ".join(phrases) if phrases else None
+
+
+_BACKGROUND_ENVIRONMENTS: Dict[str, str] = {"background_in": "indoor", "background_out": "outdoor"}
 
 
 def canonical_variation_type(req: Any) -> str:
@@ -1210,7 +1250,7 @@ def _get_prompt_from_request(
             parts.append(
                 f"The subject is wearing {_resolve_accessory(accessory, subject_gender)}. "
                 "This is the only accessory added — no other hat, scarf or "
-                "head covering — and the subject keeps their own clothing."
+                "head covering."
             )
     else:
         edit = ". ".join(
