@@ -344,37 +344,51 @@ def _landscape_panel(width: int, aspect: float, side: int, top: int, chin: int,
 
 
 def _laptop(width: int, rng: random.Random) -> _Device:
+    """The lid, and the keyboard deck as a camera at about screen height
+    sees it: a shallow trapezoid, narrower at the hinge, whose key rows and
+    trackpad grow toward the front edge. (A deck drawn as if from above took
+    a third of the device's height, and compose() then had to shrink the
+    whole laptop to fit the frame — see LADDERS.)"""
     lid, screen, w, h = _landscape_panel(width, 16 / 10, int(width * 0.018), int(width * 0.03), int(width * 0.045), (16, 16, 18))
-    deck_h = int(width * 0.36)
+    deck_h = int(width * 0.13)
     total = h + deck_h
     body = np.zeros((total, w, 3), dtype=np.float32)
     mask = np.zeros((total, w), dtype=np.float32)
     body[:h] = lid
     mask[:h] = _rounded((w, h), int(width * 0.015))
-    # Keyboard deck, catching more light toward the camera.
     metal = np.array(rng.choice([(176, 178, 182), (120, 122, 128), (60, 62, 66)]), dtype=np.float32)
-    shade = np.linspace(0.92, 1.04, deck_h, dtype=np.float32)[:, None, None]
-    body[h:] = metal * shade
-    mask[h:] = 1.0
+    inset = w * 0.03
+
+    def side(y: float, frac: float) -> float:
+        """x at ``frac`` (0..1) of the way across the deck at height y."""
+        t = (y - h) / deck_h
+        x0, x1 = inset * (1 - t), w - 1 - inset * (1 - t)
+        return x0 + (x1 - x0) * frac
+
+    def depth(d: float) -> float:
+        """y of the point ``d`` (0 hinge .. 1 front edge) of the way forward."""
+        return h + deck_h * d ** 1.35
+
+    xs = np.arange(w, dtype=np.float32)
+    for y in range(h, total):
+        # Antialiased sides; the deck catches more light toward the camera.
+        mask[y] = np.clip(xs - side(y, 0.0) + 1, 0, 1) * np.clip(side(y, 1.0) - xs + 1, 0, 1)
+        body[y] = metal * (0.88 + 0.16 * (y - h) / deck_h)
     img = Image.fromarray(np.clip(body, 0, 255).astype(np.uint8))
     d = ImageDraw.Draw(img)
-    d.rectangle((0, h, w, h + int(width * 0.012)), fill=(30, 30, 32))  # hinge
-    kx0, kx1 = int(w * 0.08), int(w * 0.92)
-    ky0, ky1 = h + int(deck_h * 0.12), h + int(deck_h * 0.62)
+    d.rectangle((inset, h, w - inset, h + max(2, int(width * 0.008))), fill=(30, 30, 32))  # hinge
     rows, cols = 5, 14
-    gap = max(2, int(w * 0.004))
-    kw = (kx1 - kx0 - gap * (cols - 1)) / cols
-    kh = (ky1 - ky0 - gap * (rows - 1)) / rows
     for r in range(rows):
+        ya = depth(0.10 + 0.54 * r / rows)
+        yb = depth(0.10 + 0.54 * (r + 0.78) / rows)
         for c in range(cols):
-            x = kx0 + c * (kw + gap)
-            y = ky0 + r * (kh + gap)
-            d.rounded_rectangle((x, y, x + kw, y + kh), radius=max(1, int(kh * 0.15)), fill=(24, 24, 26))
-    tw = int(w * 0.34)
-    d.rounded_rectangle((w // 2 - tw // 2, ky1 + int(deck_h * 0.08), w // 2 + tw // 2, total - int(deck_h * 0.04)),
-                        radius=int(w * 0.01), outline=tuple(int(v * 0.8) for v in metal), width=2)
-    body = np.asarray(img, dtype=np.float32)
-    return _Device(body, mask, screen)
+            fa, fb = 0.08 + 0.84 * c / cols, 0.08 + 0.84 * (c + 0.86) / cols
+            d.polygon([(side(ya, fa), ya), (side(ya, fb), ya), (side(yb, fb), yb), (side(yb, fa), yb)], fill=(24, 24, 26))
+    ta, tb = depth(0.72), depth(0.95)
+    d.polygon([(side(ta, 0.33), ta), (side(ta, 0.67), ta), (side(tb, 0.67), tb), (side(tb, 0.33), tb)],
+              outline=tuple(int(v * 0.8) for v in metal), width=2)  # trackpad
+    d.line((0, total - 2, w, total - 2), fill=tuple(int(v * 0.6) for v in metal), width=2)  # front lip
+    return _Device(np.asarray(img, dtype=np.float32), mask, screen)
 
 
 def _decorate_webcam(img: Image.Image, device: _Device, offset: Tuple[int, int], rng: random.Random) -> None:
@@ -570,10 +584,17 @@ def compose(
     # (0.09 of the width cost the face 0.05–0.15 identity on a phone.)
     k = (0.06 if "keystone" in cues else 0.015) * strength * tw
     lean = (0.02 if "keystone" in cues else 0.008) * strength * th * rng.choice((-1, 1))
+    # When both narrowing top corners are out of the frame (the close laptop)
+    # that narrowing cannot be seen, so keystone also turns the device: the
+    # side the top edge leans down toward recedes, and the bezel above the
+    # face and the hinge below it converge across the frame.
+    hidden = x0 + k < 0 and x0 + tw - k > W
+    turn = 0.05 * strength * th if "keystone" in cues and hidden else 0.0
+    right, left = (turn, 0.0) if lean < 0 else (0.0, turn)
     src = np.float32([[0, 0], [dw, 0], [dw, dh], [0, dh]])
     dst = np.float32([
-        [x0 + k, y0 + lean], [x0 + tw - k, y0 - lean],
-        [x0 + tw, y0 + th], [x0, y0 + th],
+        [x0 + k, y0 + lean + left], [x0 + tw - k, y0 - lean + right],
+        [x0 + tw, y0 + th - right], [x0, y0 + th - left],
     ])
     matrix = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(body, matrix, (W, H), flags=cv2.INTER_AREA)
@@ -622,17 +643,30 @@ LADDER: Tuple[Dict[str, Any], ...] = (
 )
 
 
-# Rung order by device. With outdoor content the first rung passed on all
-# six phone, tablet and tv probes, but on 0 of 2 laptops and 1 of 2
-# monitors, which then passed on the later rungs (laptop 2 of 3, monitor 4
-# of 4): a wide screen starts closer in.
-LADDER_ORDER: Dict[str, Tuple[int, ...]] = {
-    "laptop": (2, 1, 0),
-    "monitor": (1, 2, 0),
+# Rungs by device (LADDER for the rest). A monitor starts closer in.
+#
+# A laptop is drawn from close up: device_scale 1.5 makes the face about
+# 520 px tall instead of 420, nearer a tablet's. Live from 10-26 to 10-28
+# the old laptop rungs (LADDER from the closest in) passed /is_live on 23 of
+# 54 first rungs and rescued none of 48 later ones, while the tablet's first
+# rung passed 25 of 30. Recomposed from five flagged laptop screens, the
+# same content passed on 4 of 5 tablets (0.48–0.73) and on 4 of 5 close
+# laptops (0.48–0.69), but on none of 4 old laptops with the keyboard
+# thinned (0.995+) and on 1 of 5 tvs. On ten more laptop screens (three
+# flagged live, one unchecked, six passed at 0.96–0.98) the close laptop
+# passed all ten (0.46–0.93); without the camera simulation it scored lower
+# on each of the three flagged ones and passed the content every other
+# composite failed (0.91), so that rung goes first. The close laptop only
+# fits the frame with the deck seen from near screen height (_laptop).
+LADDERS: Dict[str, Tuple[Dict[str, Any], ...]] = {
+    "laptop": (
+        {"strength": 0.9, "clearance": 0.05, "device_scale": 1.5, "camera": False},
+        {"strength": 1.0, "clearance": 0.15, "device_scale": 1.5},
+    ),
+    "monitor": (LADDER[1], LADDER[2], LADDER[0]),
 }
 
 
 def variants(device: str, cues: Sequence[str]) -> List[Dict[str, Any]]:
-    """compose() settings to try, in order (see LADDER, LADDER_ORDER)."""
-    order = LADDER_ORDER.get(device, tuple(range(len(LADDER))))
-    return [dict(LADDER[i]) for i in order]
+    """compose() settings to try, in order (see LADDER, LADDERS)."""
+    return [dict(settings) for settings in LADDERS.get(device, LADDER)]
