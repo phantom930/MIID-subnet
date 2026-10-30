@@ -118,8 +118,13 @@ IDENTITY_RETRIES = int(os.environ.get("MIID_IDENTITY_RETRIES", "3"))
 # (one waited 204 s behind eight polish attempts). Lowest-identity slot
 # first, after every rescue retry, stopping at the goal.
 # MIID_POLISH_ATTEMPTS=0 switches it off.
-IDENTITY_GOAL = float(os.environ.get("MIID_IDENTITY_GOAL", "0.85"))
-POLISH_ATTEMPTS = int(os.environ.get("MIID_POLISH_ATTEMPTS", "2"))
+#
+# 0.85 and two attempts until 2026-10-29, when the user asked for identity
+# above 0.9. Polish had stopped on "every slot at the goal or polished out"
+# in 220 of 228 requests (2026-10-27/28) — time was never what ended it —
+# and a re-roll beat its incumbent on 30% of attempts, by +0.03.
+IDENTITY_GOAL = float(os.environ.get("MIID_IDENTITY_GOAL", "0.90"))
+POLISH_ATTEMPTS = int(os.environ.get("MIID_POLISH_ATTEMPTS", "3"))
 
 # Upper bound on one request's generation, retries included, counted from the
 # start of generation. The binding limit is usually the request's own

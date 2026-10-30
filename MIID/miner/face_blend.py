@@ -59,8 +59,12 @@ except Exception:
 
 
 ENABLED = os.environ.get("MIID_FACE_BLEND", "1").strip().lower() not in ("0", "false", "no")
-# Identity a background take is blended toward; a take already there is left alone.
-GOAL = float(os.environ.get("MIID_FACE_BLEND_GOAL", "0.88"))
+# Identity a take is blended toward; a take already there is left alone.
+# 0.88 until 2026-10-29, when the user asked for identity above 0.9: of 17
+# lighting takes shipped unblended at 0.85–0.92 (2026-10-28/29), the blend
+# passed every guard on 8 and lifted them by +0.036 on average — 11 of the
+# 17 at 0.9 or better instead of 8.
+GOAL = float(os.environ.get("MIID_FACE_BLEND_GOAL", "0.92"))
 # Strongest blend allowed. 1.0 would paste the base face. On 80 archived
 # takes 0.9 gained no identity over 0.8 (+0.113 vs +0.116) while pulling
 # CLIP's wanted-scene probability down twice as far (-0.14 vs -0.08): the
