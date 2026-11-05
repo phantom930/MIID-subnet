@@ -1,0 +1,1 @@
+{"cryptoType":1,"publicKey":"0x3a4b9744b8e0337ee9f1afaa11208d8c32bbebf1990c4c48c3524237c4f72379","ss58Address":"5DP969s94bX7sB6vDRH4dmJGrxHFKEsYKUUZiRVkwBYkhtsD","accountId":"0x3a4b9744b8e0337ee9f1afaa11208d8c32bbebf1990c4c48c3524237c4f72379"}
