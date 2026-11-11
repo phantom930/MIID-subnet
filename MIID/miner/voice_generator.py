@@ -35,12 +35,8 @@
 # two spellings between takes and lets the word check pick.
 #
 # Prompt text is already joined for you as target_text, e.g.
-#   "three orange six two nine apple table one"
-# (same as " ".join(target_words)).
-#
-# Smoke test from the command line:
-#   python -m MIID.miner.voice_generator --reference ref.wav \
-#       --text "three orange six two nine" --language en --out clone.wav
+#   "5 G U P three orange book apple table door light music phone school six K V D U"
+# (same as " ".join(target_words); includes hotkey bookends when present).
 
 import base64
 import contextlib

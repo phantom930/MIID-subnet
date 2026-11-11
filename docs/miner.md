@@ -21,9 +21,9 @@ Validators may also attach a **voice request** in the same round (reference WAV 
 
 | Date | Milestone |
 |------|-----------|
-| **Sep 24 – Oct 15, 2026** | **Phase 5 Cycle 1 Sandbox (current; first official Phase 5 cycle). Calibration + stability testing. Voice clone challenge (UAV post-graded only) + continued face image KAV path. Burn ratio 35%.** |
-| Oct 15 – Nov 16, 2026 | Phase 5 Cycle 1 Execution goes live (~1 month). Reward allocation uses validated reputation alongside the ongoing online flow. Burn ratio stays 35%. |
-| Nov 16 – Nov 30, 2026 | Phase 5 Cycle 2 Sandbox (calibration + stability testing). Normal KAV online flow unchanged. Burn ratio 35%. |
+| Sep 24 – Oct 19, 2026 | Phase 5 Cycle 1 Sandbox (first official Phase 5 cycle). Calibration + stability testing. Optional voice clone challenge (UAV post-graded only) + continued face image KAV path. |
+| **Oct 19 – Nov 19, 2026** | **Phase 5 Cycle 1 Execution (current; ~1 month). Reward allocation uses validated reputation alongside the ongoing online flow. Weight split: ~50% data-gen miners / ~50% dual-incentive (UID 14) / 0% burn (~5% KAV / ~45% UAV of total). Miner rewards slightly up overall — see [scoring](scoring.md).** |
+| Nov 19 – Dec 3, 2026 | Phase 5 Cycle 2 Sandbox (calibration + stability testing). Normal KAV online flow unchanged. Same 50/50 / zero-burn allocation. |
 
 For the full roadmap and detailed architecture, see [Yanez Identity Generation Bittensor Subnet (PDF)](Yanez%20Identity%20Generation%20Bittensor%20Subnet.pdf).
 
@@ -670,7 +670,7 @@ python -m MIID.miner.voice_generator --reference some_voice.wav --text "three or
 
 #### Updated Approach from `main` branch
 
-1. Validator fetches a reference WAV from the MIID API and draws target speech text (English or Spanish): **5 digit-words + 10 pool words = 15 tokens**, e.g. `target_text = "three orange six book two nine apple table one door light music phone school"` (also sent as `target_words` list). Clip length is not fixed — speak the prompt naturally.
+1. Validator fetches a reference WAV from the MIID API and draws target speech text (English or Spanish): **2 digit-words + 10 pool words = 12 base tokens**, then wraps the miner hotkey’s first/last 4 characters as individual tokens (20 personalized tokens), e.g. `target_text = "5 G U P three orange book apple table door light music phone school six K V D U"` (also sent as `target_words` list). Clip length is not fixed — speak the prompt naturally.
 2. Implement `MIID/miner/voice_generator.generate_voice_clone` to synthesize a WAV with the same speaker identity speaking `target_text`.
 3. The existing encrypt → S3 → `S3Submission(variation_type="voice")` path runs and fills `voice_s3_submissions`.
 4. Voice is collected for **UAV post-grading only** (no live KAV grade for voice).
@@ -740,7 +740,7 @@ Each validation round:
 3. Submissions go through automated pre-checks, identity preservation checks, and manual validation
 4. Validators set weights based on image variation scores
 
-**Important:** Phase 5 Cycle 1 Sandbox runs **Sep 24 – Oct 15, 2026** (voice clone for UAV post-grading + continued face image KAV path). Cycle 1 Execution goes live **Oct 15 – Nov 16, 2026**. Phase 5 Cycle 2 Sandbox follows **Nov 16 – Nov 30, 2026**.
+**Important:** Phase 5 Cycle 1 Sandbox ran **Sep 24 – Oct 19, 2026** (optional voice clone for UAV post-grading + continued face image KAV path). Cycle 1 Execution is live **Oct 19 – Nov 19, 2026**. Phase 5 Cycle 2 Sandbox follows **Nov 19 – Dec 3, 2026**.
 
 ### Face Variation Scoring
 
