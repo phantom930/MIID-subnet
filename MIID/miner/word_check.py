@@ -10,12 +10,22 @@
 # brought to one canonical form, and the two sequences are aligned token by
 # token. A take passes only with no missing, wrong or extra token.
 #
-# The targets are 3 digit words and 7 pool words (MIID/validator/
-# voice_words.py) in English or Spanish, wrapped in the first and last four
-# characters of the miner's hotkey as single tokens: "5 H P O ... R D 8 L".
-# A digit and its word ("8", "eight", "ocho") and a letter and its spoken
-# name ("H", "aitch", "hache") are the same token on both sides, so the
-# check does not depend on how Whisper chooses to write them.
+# The targets are 2 digit words and 10 words drawn from the validator's
+# word pools (MIID/validator/voice_words.py, word_pools/en.txt and es.txt:
+# ~1,170 English and ~960 Spanish words since 2026-11-11), wrapped in the
+# first and last four characters of the miner's hotkey as single tokens:
+# "5 H P O ... R D 8 L". A digit and its word ("8", "eight", "ocho") and a
+# letter and its spoken name ("H", "aitch", "hache") are the same token on
+# both sides, so the check does not depend on how Whisper chooses to write
+# them.
+#
+# The same goes for a homophone: Whisper writes the commoner spelling of a
+# sound ("pair" for a spoken "pear", "quire" for "choir", "silvato" for
+# "silbato"), and a reviewer who listens cannot tell them apart. English
+# homophones of every pool word come from the CMU dictionary
+# (homophones_en.json, built by scripts/miner/build_homophones.py); Spanish
+# spelling is phonemic, so a sound key (_spanish_sound) covers it. On the
+# first 56 takes of the bigger pools, 13 of 32 failures were homophones.
 #
 # spoken_text() is what the TTS model is given instead of the raw target
 # text: the same tokens, with the single characters written as the
@@ -27,12 +37,13 @@
 # loaded lazily in this process and parked in CPU memory between rounds like
 # the voice models. MIID_WORD_CHECK=0 switches the check off.
 
+import json
 import os
 import re
 import threading
 import time
 import unicodedata
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import bittensor as bt
 
@@ -93,6 +104,60 @@ def _lookup(language: str) -> Dict[str, str]:
     return table
 
 
+HOMOPHONES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "homophones_en.json")
+_english_homophones: Optional[Dict[str, List[str]]] = None
+
+
+def _homophones_en() -> Dict[str, List[str]]:
+    """Pool word -> other spellings that sound the same (loaded once)."""
+    global _english_homophones
+    if _english_homophones is None:
+        try:
+            with open(HOMOPHONES_PATH, encoding="utf-8") as f:
+                _english_homophones = json.load(f)
+        except (OSError, ValueError) as e:
+            bt.logging.warning(
+                f"Word check: homophone table unavailable ({e}); English homophones count as wrong words"
+            )
+            _english_homophones = {}
+    return _english_homophones
+
+
+def _spanish_sound(plain: str) -> str:
+    """A Spanish spelling (plain) reduced to how it sounds, for the mergers
+    every dialect shares: silent h, b = v, ll = y (yeísmo), c before e/i =
+    z, hard c = qu = k, g before e/i = j, gu before e/i = g, final y = i.
+    Seseo (s = z) is left out; Spain keeps them apart. A final "ll" is
+    Whisper borrowing an English spelling ("roll" for "rol"): no Spanish word
+    ends in it, so it reads as l."""
+    s = re.sub(r"(?<=.)ll$", "l", plain)
+    s = s.replace("ch", "1")
+    s = s.replace("h", "")
+    s = s.replace("ll", "y").replace("v", "b")
+    s = re.sub(r"gu(?=[ei])", "2", s)
+    s = re.sub(r"g(?=[ei])", "j", s)
+    s = re.sub(r"qu(?=[ei])", "k", s)
+    s = re.sub(r"c(?=[ei])", "z", s)
+    s = s.replace("c", "k").replace("2", "g").replace("1", "ch")
+    return re.sub(r"(?<=.)y$", "i", s)
+
+
+def _sounds_like(targets: Sequence[str], language: str) -> Callable[[str], Optional[str]]:
+    """For the plain target words, a function: a plain spelling -> the
+    target word it is a homophone of, or None."""
+    if language == "es":
+        keys: Dict[str, str] = {}
+        for target in targets:
+            keys.setdefault(_spanish_sound(target), target)
+        return lambda plain: keys.get(_spanish_sound(plain))
+    homophones = _homophones_en()
+    spellings: Dict[str, str] = {}
+    for target in targets:
+        for other in homophones.get(target, ()):
+            spellings.setdefault(other, target)
+    return spellings.get
+
+
 def canonical_targets(target_words: Sequence[str], language: str) -> List[str]:
     """The target tokens in canonical form: "#8" for a digit or digit word,
     "@H" for a single letter, the plain word otherwise."""
@@ -130,6 +195,13 @@ def canonical_heard(transcript: str, language: str, vocabulary: Sequence[str] = 
     words = {_plain(w) for w in vocabulary if len(w.strip()) > 1}
     words |= {_plain(w) for w in DIGIT_WORDS[lang][1:]}
     letters = {w.strip().lower() for w in vocabulary if len(w.strip()) == 1 and w.strip().isalpha()}
+    sounds_like = _sounds_like(sorted(words), lang)
+
+    def target_letter(plain: str) -> bool:
+        """``plain`` names one of the hotkey letters the clip has to say."""
+        canonical = table.get(plain, "")
+        return canonical.startswith("@") and canonical[1:].lower() in letters
+
     text = transcript
     for letter, names in LETTER_NAMES[lang].items():
         for name in names:
@@ -166,6 +238,9 @@ def canonical_heard(transcript: str, language: str, vocabulary: Sequence[str] = 
             out.append(word(plain))
         elif re.fullmatch(r"[A-Z0-9]{2,8}", raw):
             out.extend(char(c) for c in raw)
+        elif not target_letter(plain) and (same := sounds_like(plain)) is not None:
+            # "pair" for a spoken "pear": the same sound, the same token.
+            out.append(word(same))
         elif (parts := _split_run(plain, words, letters)) is not None:
             out.extend(char(p) if len(p) == 1 else word(p) for p in parts)
         else:

@@ -17,7 +17,8 @@
 #
 # A clone is graded twice: ECAPA similarity to the reference above 0.6
 # (speech_brain_compare enforces that floor), then a reviewer listens for
-# every target word, and one missing, swapped or garbled word fails it. Up
+# every target word: all of them heard is 5 points, a couple missing or
+# wrong is 3 (docs/scoring.md; voice is half of the P5 C1 UAV score). Up
 # to MIID_VOICE_ATTEMPTS takes are generated; each is scored with ECAPA and
 # transcribed by Whisper (word_check), and the best take is the one over the
 # floor that says every word, then the one with fewest word errors, then the

@@ -1,0 +1,2011 @@
+{
+"aisle": [
+"isle"
+],
+"alley": [
+"alie",
+"alli",
+"allie"
+],
+"altar": [
+"alter"
+],
+"anchor": [
+"anker"
+],
+"ant": [
+"aunt"
+],
+"apple": [
+"appel",
+"appell"
+],
+"arc": [
+"ark"
+],
+"arena": [
+"erina"
+],
+"armor": [
+"armer",
+"armour"
+],
+"arrow": [
+"aero",
+"eroh"
+],
+"ash": [
+"asch",
+"asche",
+"ashe"
+],
+"author": [
+"auther"
+],
+"axe": [
+"acts",
+"ax"
+],
+"axle": [
+"axel"
+],
+"back": [
+"backe",
+"bak",
+"bakke"
+],
+"bag": [
+"bagg",
+"bagge"
+],
+"ball": [
+"bawl"
+],
+"band": [
+"banned"
+],
+"bank": [
+"banc",
+"banke",
+"banque"
+],
+"bar": [
+"baar",
+"bahr",
+"bahre",
+"barr",
+"barre"
+],
+"barrel": [
+"baril",
+"behrle",
+"berrill",
+"beryl",
+"burel",
+"burell"
+],
+"base": [
+"bass"
+],
+"basil": [
+"bazzell",
+"bazzle"
+],
+"bat": [
+"batt",
+"batte",
+"bhatt"
+],
+"batch": [
+"bache"
+],
+"beach": [
+"beech"
+],
+"beam": [
+"beahm",
+"beem"
+],
+"bear": [
+"baehr",
+"baer",
+"bahr",
+"bair",
+"bare",
+"behr"
+],
+"bearing": [
+"baring",
+"behring",
+"bering"
+],
+"beat": [
+"beet"
+],
+"bee": [
+"b",
+"be",
+"bea"
+],
+"beer": [
+"beare",
+"bere"
+],
+"bell": [
+"behl",
+"bel",
+"belle"
+],
+"berry": [
+"barey",
+"barre",
+"barrie",
+"barry",
+"berrey",
+"berri",
+"berrie",
+"buerry",
+"bury"
+],
+"beverage": [
+"beveridge"
+],
+"bill": [
+"bihl",
+"bil"
+],
+"bird": [
+"burd",
+"byrd"
+],
+"bitter": [
+"bitar"
+],
+"blizzard": [
+"blizard"
+],
+"block": [
+"bloc",
+"bloch",
+"blok"
+],
+"blue": [
+"bleu",
+"blew"
+],
+"board": [
+"bored"
+],
+"body": [
+"boddie",
+"boddy"
+],
+"bolt": [
+"boldt",
+"bolte"
+],
+"bone": [
+"boan",
+"boehne",
+"boen",
+"bohn",
+"bohne",
+"bown",
+"bowne"
+],
+"boot": [
+"boote",
+"boutte"
+],
+"border": [
+"boarder"
+],
+"bottle": [
+"bottel"
+],
+"boulder": [
+"bolder"
+],
+"bow": [
+"bao",
+"beau",
+"beaux",
+"bo",
+"boe",
+"boeh",
+"bough",
+"bowe"
+],
+"bowl": [
+"boal",
+"boehl",
+"bohl",
+"bole",
+"boll",
+"buol"
+],
+"box": [
+"boxx"
+],
+"brake": [
+"break"
+],
+"branch": [
+"branche"
+],
+"brand": [
+"brande"
+],
+"brandy": [
+"brandi"
+],
+"brass": [
+"bras"
+],
+"bread": [
+"bred"
+],
+"break": [
+"brake"
+],
+"breaker": [
+"braker"
+],
+"brick": [
+"bric",
+"bryk"
+],
+"bright": [
+"brite"
+],
+"bronze": [
+"brons"
+],
+"bruise": [
+"brews",
+"bruse"
+],
+"buckle": [
+"buckel"
+],
+"bunch": [
+"bunche"
+],
+"bunk": [
+"bunke"
+],
+"buoy": [
+"booee",
+"bouie",
+"buie"
+],
+"bus": [
+"buss",
+"busse"
+],
+"bush": [
+"busch"
+],
+"busy": [
+"bizzy"
+],
+"cable": [
+"kable"
+],
+"cache": [
+"cachet",
+"cash",
+"kasch",
+"kash"
+],
+"calendar": [
+"calender",
+"callander"
+],
+"calorie": [
+"callery"
+],
+"camera": [
+"kamra"
+],
+"camp": [
+"kamp",
+"kampe"
+],
+"candle": [
+"kandel"
+],
+"candy": [
+"candee",
+"candie"
+],
+"cane": [
+"cain",
+"caine",
+"cayne",
+"kain",
+"kaine",
+"kane",
+"kayne"
+],
+"canvas": [
+"canvass"
+],
+"canyon": [
+"canion"
+],
+"carrot": [
+"carat",
+"karat",
+"karet"
+],
+"cart": [
+"carte"
+],
+"cash": [
+"cache",
+"kasch",
+"kash"
+],
+"castle": [
+"cassel",
+"kasel",
+"kasell",
+"kassel",
+"kastle"
+],
+"cat": [
+"catt",
+"kat",
+"katt"
+],
+"cedar": [
+"ceder",
+"seader"
+],
+"ceiling": [
+"sealing",
+"seeling",
+"sieling"
+],
+"cell": [
+"cel",
+"sel",
+"sell",
+"selle"
+],
+"cellar": [
+"seller"
+],
+"center": [
+"centerre",
+"centre",
+"senner",
+"senter"
+],
+"chain": [
+"cheyne"
+],
+"channel": [
+"channell"
+],
+"chapel": [
+"chappel",
+"chappell",
+"chapple"
+],
+"check": [
+"chek",
+"cheque",
+"czech"
+],
+"cherry": [
+"chery"
+],
+"choir": [
+"quire"
+],
+"chord": [
+"cord"
+],
+"chrome": [
+"krome"
+],
+"cider": [
+"seider",
+"sider"
+],
+"city": [
+"citi"
+],
+"clay": [
+"klay",
+"kley"
+],
+"clean": [
+"kleen"
+],
+"clear": [
+"cleere",
+"kleer"
+],
+"cliff": [
+"clif",
+"cliffe"
+],
+"clip": [
+"klipp"
+],
+"clock": [
+"kloc",
+"klock",
+"klocke"
+],
+"club": [
+"clubb"
+],
+"coal": [
+"coale",
+"cole",
+"colle",
+"koehl",
+"koelle",
+"kohl",
+"kol",
+"kole"
+],
+"coat": [
+"cote",
+"kote"
+],
+"coffee": [
+"coffey"
+],
+"coin": [
+"coyne"
+],
+"cola": [
+"colla"
+],
+"collar": [
+"coller",
+"collor",
+"kahler",
+"kollar",
+"koller"
+],
+"color": [
+"caller",
+"collor",
+"colour",
+"culler"
+],
+"column": [
+"collom",
+"collum",
+"colomb"
+],
+"comb": [
+"combe",
+"kolm"
+],
+"cool": [
+"coole",
+"kool"
+],
+"copper": [
+"kopper"
+],
+"coral": [
+"choral",
+"corle",
+"curle",
+"koral"
+],
+"cord": [
+"chord"
+],
+"corn": [
+"corne",
+"korn"
+],
+"corner": [
+"koerner",
+"korner"
+],
+"cot": [
+"caught",
+"cott",
+"khat",
+"kot",
+"kott"
+],
+"cotton": [
+"cotten"
+],
+"coupe": [
+"coop",
+"koop"
+],
+"course": [
+"coarse",
+"corse"
+],
+"cow": [
+"cao",
+"cau",
+"kao",
+"kau",
+"kough"
+],
+"crack": [
+"krack",
+"kracke"
+],
+"cream": [
+"creme"
+],
+"crest": [
+"chrest"
+],
+"crib": [
+"cribb"
+],
+"crystal": [
+"christal",
+"christel",
+"chrystal",
+"cristal",
+"kristall",
+"kristol",
+"krystal"
+],
+"cube": [
+"kube"
+],
+"cuff": [
+"cuffe"
+],
+"cup": [
+"cupp"
+],
+"cut": [
+"kut"
+],
+"daisy": [
+"dazey"
+],
+"dam": [
+"dahm",
+"damm",
+"damme",
+"damn"
+],
+"dark": [
+"darke"
+],
+"dash": [
+"dasch"
+],
+"dawn": [
+"daun"
+],
+"day": [
+"dae",
+"daye",
+"de",
+"dey"
+],
+"deck": [
+"dec",
+"dech"
+],
+"denim": [
+"denham",
+"denomme"
+],
+"desert": [
+"dessert"
+],
+"dessert": [
+"desert"
+],
+"dew": [
+"deux",
+"do",
+"doo",
+"douwe",
+"du",
+"due"
+],
+"diamond": [
+"dimond",
+"dymond"
+],
+"disk": [
+"disc",
+"disque"
+],
+"dock": [
+"doc"
+],
+"dome": [
+"dohme"
+],
+"door": [
+"doar",
+"doerr",
+"dohr",
+"dore",
+"dorr"
+],
+"dot": [
+"dott"
+],
+"dough": [
+"dau",
+"doe",
+"doh"
+],
+"drain": [
+"draine",
+"drane"
+],
+"drive": [
+"dr"
+],
+"drum": [
+"drumm"
+],
+"duct": [
+"ducked"
+],
+"dull": [
+"dulle"
+],
+"echo": [
+"eco",
+"ekco",
+"eko"
+],
+"eight": [
+"ate",
+"aydt"
+],
+"empty": [
+"mt"
+],
+"era": [
+"erra"
+],
+"fan": [
+"fann",
+"phan"
+],
+"fern": [
+"fearn"
+],
+"ferry": [
+"fairey",
+"fairy",
+"ferri",
+"ferrie",
+"fery"
+],
+"field": [
+"feild"
+],
+"firm": [
+"ferm"
+],
+"first": [
+"furst"
+],
+"fish": [
+"fisch",
+"phish"
+],
+"flag": [
+"flagg"
+],
+"flame": [
+"flaim"
+],
+"flare": [
+"flair"
+],
+"flash": [
+"flasch"
+],
+"flat": [
+"flatt"
+],
+"flood": [
+"flud",
+"fludd"
+],
+"floor": [
+"flaugher",
+"flor",
+"flore"
+],
+"flour": [
+"flower"
+],
+"flower": [
+"flour"
+],
+"flute": [
+"fluet"
+],
+"fog": [
+"fogg"
+],
+"foil": [
+"foyle"
+],
+"force": [
+"forse",
+"fourths"
+],
+"forest": [
+"forrest"
+],
+"fort": [
+"foret",
+"forte"
+],
+"four": [
+"faure",
+"for",
+"fore",
+"forr"
+],
+"fox": [
+"foxx"
+],
+"frame": [
+"fraim"
+],
+"fried": [
+"frede",
+"freed",
+"freid",
+"friede"
+],
+"frog": [
+"frogg",
+"frogge"
+],
+"funnel": [
+"funnell"
+],
+"gap": [
+"gapp"
+],
+"garlic": [
+"garlick"
+],
+"gas": [
+"gass"
+],
+"gate": [
+"gait"
+],
+"gauge": [
+"gage",
+"gaige"
+],
+"gear": [
+"geer",
+"gere"
+],
+"gel": [
+"gell",
+"jell"
+],
+"gin": [
+"ginn",
+"jin",
+"qian"
+],
+"glass": [
+"glas"
+],
+"glow": [
+"glo",
+"gloe"
+],
+"glue": [
+"glew"
+],
+"goal": [
+"gohl"
+],
+"gold": [
+"golde"
+],
+"granite": [
+"granat"
+],
+"gravel": [
+"gravell"
+],
+"grease": [
+"greece",
+"griess"
+],
+"green": [
+"greene"
+],
+"grill": [
+"grille"
+],
+"group": [
+"groupe",
+"grupe"
+],
+"gym": [
+"jim"
+],
+"hail": [
+"haile",
+"hale",
+"heyl"
+],
+"half": [
+"haff"
+],
+"hammer": [
+"hamer",
+"hammar",
+"hamor",
+"hamre"
+],
+"hammock": [
+"hammac",
+"hammack"
+],
+"harmony": [
+"harmonie"
+],
+"hat": [
+"hatt"
+],
+"hatch": [
+"hach"
+],
+"hawk": [
+"hauck",
+"hauk",
+"hauke",
+"hawke",
+"hok"
+],
+"heading": [
+"hedding"
+],
+"heap": [
+"heape"
+],
+"heart": [
+"hardt",
+"hart",
+"harte",
+"hartt"
+],
+"hearth": [
+"harth"
+],
+"heater": [
+"heeter"
+],
+"height": [
+"heit",
+"hiett",
+"hight",
+"hite"
+],
+"helmet": [
+"helmut"
+],
+"hem": [
+"hemm",
+"hemme"
+],
+"herb": [
+"erb",
+"erbe"
+],
+"highway": [
+"hiway"
+],
+"hill": [
+"hille"
+],
+"hole": [
+"hoel",
+"hoell",
+"hoelle",
+"hohl",
+"whole"
+],
+"holiday": [
+"holladay",
+"holliday"
+],
+"hollow": [
+"hollo"
+],
+"hook": [
+"hooke"
+],
+"horn": [
+"horne"
+],
+"horse": [
+"hoarse"
+],
+"hose": [
+"hoes"
+],
+"hot": [
+"hott"
+],
+"hour": [
+"auer",
+"our"
+],
+"house": [
+"haus",
+"hause",
+"hauss"
+],
+"human": [
+"heuman",
+"heumann",
+"humann",
+"youman"
+],
+"hut": [
+"haute",
+"hutt"
+],
+"icon": [
+"icahn",
+"ikon"
+],
+"idle": [
+"idol",
+"idyll"
+],
+"ink": [
+"inc"
+],
+"inn": [
+"in"
+],
+"island": [
+"eiland"
+],
+"jacket": [
+"jackett",
+"jacot"
+],
+"jet": [
+"jett",
+"jette"
+],
+"job": [
+"jobe"
+],
+"joint": [
+"joynt"
+],
+"kettle": [
+"kettell"
+],
+"key": [
+"kea",
+"kee",
+"ki",
+"kyi",
+"qi",
+"quai",
+"quay",
+"qui"
+],
+"knit": [
+"nit"
+],
+"label": [
+"laible"
+],
+"lamp": [
+"lampe",
+"lampp"
+],
+"latch": [
+"lach",
+"lache",
+"latsch"
+],
+"laugh": [
+"laff"
+],
+"lawn": [
+"laun"
+],
+"lead": [
+"led",
+"leed"
+],
+"leaf": [
+"leif",
+"lief"
+],
+"lean": [
+"leen",
+"lein",
+"lene",
+"lien"
+],
+"lemon": [
+"lemmon"
+],
+"lens": [
+"lenz"
+],
+"lever": [
+"leaver",
+"leever"
+],
+"light": [
+"lite"
+],
+"lily": [
+"liley",
+"lili",
+"lilley",
+"lilli",
+"lillie",
+"lilly"
+],
+"lime": [
+"lyme"
+],
+"line": [
+"lyne",
+"lysne"
+],
+"linen": [
+"linnane"
+],
+"link": [
+"linc",
+"linck",
+"linke",
+"lynk"
+],
+"lion": [
+"lyon"
+],
+"list": [
+"liszt"
+],
+"lock": [
+"laack",
+"laake",
+"loch",
+"locke",
+"lok"
+],
+"locker": [
+"laugher",
+"locher"
+],
+"loop": [
+"loup",
+"loupe",
+"lupe"
+],
+"loose": [
+"luce"
+],
+"lot": [
+"lat",
+"laut",
+"lott",
+"lotte"
+],
+"lump": [
+"lumpp"
+],
+"magnet": [
+"magnate"
+],
+"manor": [
+"manner"
+],
+"mantel": [
+"mantle"
+],
+"map": [
+"mapp"
+],
+"mark": [
+"marc",
+"marke",
+"marque",
+"merc"
+],
+"mass": [
+"masse"
+],
+"mast": [
+"massed"
+],
+"mat": [
+"matt",
+"matte"
+],
+"meal": [
+"meehl",
+"mele",
+"miele"
+],
+"medal": [
+"meddle",
+"medel"
+],
+"melon": [
+"mellen",
+"mellon"
+],
+"mesh": [
+"mesch"
+],
+"metal": [
+"mettle"
+],
+"milk": [
+"milke"
+],
+"mind": [
+"mined"
+],
+"minute": [
+"minot",
+"minott",
+"mynatt"
+],
+"mist": [
+"midst",
+"missed"
+],
+"money": [
+"munni"
+],
+"moon": [
+"moone"
+],
+"morning": [
+"mourning"
+],
+"moss": [
+"mauss",
+"mos"
+],
+"mud": [
+"mudd"
+],
+"muscle": [
+"mussel",
+"mussell"
+],
+"music": [
+"muzik"
+],
+"nail": [
+"naill",
+"nale"
+],
+"needle": [
+"nedel",
+"neidl"
+],
+"net": [
+"nett"
+],
+"new": [
+"gnu",
+"knew",
+"nu"
+],
+"nickel": [
+"nicholl",
+"nickell",
+"nickle",
+"nickol",
+"nicol",
+"nicoll",
+"nikkel"
+],
+"night": [
+"knight",
+"nite"
+],
+"node": [
+"knode",
+"knowed"
+],
+"noise": [
+"noyes"
+],
+"noon": [
+"noone"
+],
+"notch": [
+"knoche"
+],
+"nut": [
+"nutt"
+],
+"oak": [
+"olk"
+],
+"oar": [
+"hors",
+"ohr",
+"or",
+"ore",
+"orr"
+],
+"old": [
+"olde"
+],
+"one": [
+"won"
+],
+"pack": [
+"pac",
+"pak",
+"paque"
+],
+"packet": [
+"packett"
+],
+"page": [
+"paige"
+],
+"pair": [
+"pare",
+"pear"
+],
+"palace": [
+"pallas"
+],
+"palm": [
+"palme"
+],
+"panel": [
+"pannell"
+],
+"parcel": [
+"parsell"
+],
+"part": [
+"parte"
+],
+"party": [
+"partee",
+"parti"
+],
+"paste": [
+"paced"
+],
+"path": [
+"pathe"
+],
+"peace": [
+"pease",
+"piece"
+],
+"peach": [
+"piech",
+"pietsch"
+],
+"peak": [
+"paek",
+"peake",
+"peek",
+"pique"
+],
+"pear": [
+"pair",
+"pare"
+],
+"pearl": [
+"pearle",
+"perl",
+"perle"
+],
+"pen": [
+"penh",
+"penn"
+],
+"pepper": [
+"peper"
+],
+"pew": [
+"peugh",
+"pugh"
+],
+"phone": [
+"fone"
+],
+"photo": [
+"fauteux"
+],
+"phrase": [
+"frase",
+"fraze"
+],
+"piano": [
+"piana"
+],
+"piece": [
+"peace",
+"pease"
+],
+"pier": [
+"peer"
+],
+"pile": [
+"pyle"
+],
+"pillar": [
+"piller"
+],
+"pin": [
+"pinn"
+],
+"pine": [
+"pyne"
+],
+"pit": [
+"pitt"
+],
+"plane": [
+"plain"
+],
+"plank": [
+"planck"
+],
+"plant": [
+"plante"
+],
+"plate": [
+"plait"
+],
+"point": [
+"pointe"
+],
+"pole": [
+"poehl",
+"pohl",
+"poll"
+],
+"pool": [
+"poole",
+"poul"
+],
+"port": [
+"porte"
+],
+"pot": [
+"pott"
+],
+"potato": [
+"potatoe"
+],
+"pressed": [
+"prest"
+],
+"pressure": [
+"prescher"
+],
+"prism": [
+"prizm"
+],
+"prize": [
+"pries"
+],
+"purse": [
+"pearse",
+"perce",
+"pers",
+"perse"
+],
+"queue": [
+"cue",
+"kew",
+"kyu",
+"q",
+"que"
+],
+"quick": [
+"cwik",
+"kwik",
+"quik"
+],
+"rabbit": [
+"rabbitt"
+],
+"race": [
+"rais"
+],
+"rain": [
+"raine",
+"rayne",
+"reign",
+"rein",
+"reine"
+],
+"rank": [
+"ranck",
+"ranke"
+],
+"raw": [
+"ra",
+"rah",
+"rha"
+],
+"ray": [
+"rae",
+"raye",
+"re",
+"rea",
+"reay",
+"rey",
+"wray"
+],
+"reader": [
+"reeder",
+"reider",
+"rieder"
+],
+"rice": [
+"reiss",
+"wrice"
+],
+"ring": [
+"ringe",
+"wring"
+],
+"rip": [
+"ripp",
+"rippe"
+],
+"ripple": [
+"rippel"
+],
+"rise": [
+"ries"
+],
+"road": [
+"rhoad",
+"rhode",
+"rode",
+"roed",
+"rohde",
+"rowed"
+],
+"rock": [
+"roc",
+"roch",
+"rocke",
+"rocque"
+],
+"rod": [
+"raad",
+"rodd"
+],
+"role": [
+"roehl",
+"roell",
+"roelle",
+"rohl",
+"rol",
+"roll",
+"rolle"
+],
+"roof": [
+"ruef",
+"rueff",
+"rufe"
+],
+"root": [
+"route"
+],
+"rose": [
+"roes",
+"rohs",
+"rowes",
+"rows"
+],
+"rough": [
+"ruf",
+"ruff"
+],
+"route": [
+"raut",
+"root",
+"rout",
+"routt"
+],
+"router": [
+"rooter",
+"rueter",
+"ruiter",
+"ruter"
+],
+"ruby": [
+"hruby",
+"rubey",
+"rubi",
+"rubie"
+],
+"rug": [
+"rugg"
+],
+"sail": [
+"sale",
+"salle",
+"sayle"
+],
+"salt": [
+"sault"
+],
+"sand": [
+"sande"
+],
+"saucer": [
+"sausser"
+],
+"scar": [
+"skaar"
+],
+"scarf": [
+"scarff",
+"scharfe"
+],
+"scene": [
+"seen"
+],
+"score": [
+"scor"
+],
+"seal": [
+"cele",
+"ciel",
+"seale",
+"seel"
+],
+"seam": [
+"seem",
+"siem"
+],
+"seed": [
+"cede"
+],
+"set": [
+"sette"
+],
+"shake": [
+"schake",
+"shaik",
+"shaikh"
+],
+"share": [
+"cher",
+"schehr",
+"scherr",
+"sherr"
+],
+"shield": [
+"schield"
+],
+"ship": [
+"shipp"
+],
+"shoe": [
+"hsu",
+"schoo",
+"schou",
+"schue",
+"schuh",
+"shew",
+"shiu",
+"shoo",
+"shu",
+"shue"
+],
+"shore": [
+"schor",
+"schorr",
+"shor",
+"shorr"
+],
+"short": [
+"shortt"
+],
+"shot": [
+"schaadt",
+"schott",
+"shott",
+"szot",
+"szott"
+],
+"shower": [
+"schauer"
+],
+"side": [
+"seid",
+"seide",
+"sighed",
+"syed"
+],
+"sign": [
+"sein",
+"sine"
+],
+"sink": [
+"cinq",
+"cinque",
+"sync"
+],
+"siren": [
+"syron"
+],
+"sky": [
+"skye"
+],
+"skylight": [
+"skylite"
+],
+"sled": [
+"sledd"
+],
+"slot": [
+"slott"
+],
+"slow": [
+"sloe"
+],
+"smoke": [
+"smoak"
+],
+"snap": [
+"snapp"
+],
+"snow": [
+"snowe"
+],
+"soap": [
+"sope"
+],
+"soul": [
+"seoul",
+"sohl",
+"sol",
+"sole",
+"sowle"
+],
+"sour": [
+"sauer"
+],
+"spark": [
+"sparc"
+],
+"spicy": [
+"spicey"
+],
+"spike": [
+"speich"
+],
+"spire": [
+"speier",
+"spier"
+],
+"split": [
+"splitt"
+],
+"spring": [
+"spurring"
+],
+"stack": [
+"stac"
+],
+"staff": [
+"staph"
+],
+"stair": [
+"stare",
+"stehr",
+"sterr"
+],
+"stairs": [
+"stares"
+],
+"stake": [
+"steak"
+],
+"stale": [
+"staehle"
+],
+"star": [
+"staar",
+"starr"
+],
+"steel": [
+"steal",
+"steele",
+"steil",
+"stiehl"
+],
+"step": [
+"stepp",
+"steppe"
+],
+"stitch": [
+"stich"
+],
+"story": [
+"storey",
+"storie"
+],
+"street": [
+"st",
+"streett"
+],
+"style": [
+"stile"
+],
+"suede": [
+"swayed"
+],
+"summer": [
+"somer",
+"sommer",
+"summar"
+],
+"sun": [
+"son"
+],
+"surf": [
+"cerf",
+"serf"
+],
+"surface": [
+"searfoss"
+],
+"sweet": [
+"suite",
+"sweatt",
+"swete"
+],
+"sword": [
+"soard",
+"soared"
+],
+"symbol": [
+"cymbal"
+],
+"tack": [
+"ptak",
+"tac",
+"tacke",
+"tak"
+],
+"tag": [
+"tagg",
+"tagge"
+],
+"tall": [
+"taul",
+"tol"
+],
+"tank": [
+"tanke"
+],
+"tea": [
+"t",
+"te",
+"tee",
+"ti"
+],
+"team": [
+"teem"
+],
+"tear": [
+"teer",
+"terre"
+],
+"temple": [
+"tempel"
+],
+"theater": [
+"theatre"
+],
+"theme": [
+"thiem",
+"thieme"
+],
+"tide": [
+"tied"
+],
+"tiger": [
+"tyger"
+],
+"timber": [
+"timbre"
+],
+"tire": [
+"tyer",
+"tyre"
+],
+"title": [
+"teitel"
+],
+"tomato": [
+"tomatoe"
+],
+"towel": [
+"towle"
+],
+"tower": [
+"tauer"
+],
+"train": [
+"trane"
+],
+"tray": [
+"tre",
+"trey"
+],
+"tunnel": [
+"tunnell"
+],
+"two": [
+"tew",
+"thuy",
+"to",
+"too",
+"tu",
+"tue"
+],
+"urn": [
+"earn",
+"erne"
+],
+"valley": [
+"vallee",
+"vallely",
+"valli"
+],
+"van": [
+"vann"
+],
+"vein": [
+"vain",
+"vane",
+"veyne"
+],
+"wall": [
+"wahle",
+"wal",
+"walle"
+],
+"warehouse": [
+"wearhouse"
+],
+"watch": [
+"wach"
+],
+"wave": [
+"waive"
+],
+"wax": [
+"wacks",
+"whacks"
+],
+"weak": [
+"week",
+"weick",
+"weik",
+"wieck"
+],
+"week": [
+"weak",
+"weick",
+"weik",
+"wieck"
+],
+"weight": [
+"wait",
+"waite",
+"waitt",
+"wayt",
+"whate"
+],
+"whale": [
+"wail",
+"wale",
+"weyl"
+],
+"wheel": [
+"weil"
+],
+"whiskey": [
+"whisky"
+],
+"whistle": [
+"wissel"
+],
+"whole": [
+"hoel",
+"hoell",
+"hoelle",
+"hohl",
+"hole"
+],
+"wide": [
+"wyden"
+],
+"wind": [
+"wined"
+],
+"wine": [
+"whine",
+"wyne"
+],
+"winter": [
+"wynter"
+],
+"wire": [
+"wyer",
+"wyre"
+],
+"wolf": [
+"wolfe",
+"wolff",
+"woolf",
+"wulf",
+"wulff"
+],
+"wood": [
+"would"
+],
+"work": [
+"werk",
+"werke"
+],
+"world": [
+"whirled"
+],
+"yacht": [
+"yott"
+],
+"yard": [
+"yarde"
+],
+"young": [
+"yung"
+],
+"zinc": [
+"zinck",
+"zink",
+"zinke"
+]
+}

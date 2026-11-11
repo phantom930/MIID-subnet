@@ -196,6 +196,7 @@ try:
     from MIID.miner.s3_upload import upload_to_s3
     from MIID.miner.submission_builder import (
         build_image_submissions,
+        commitment_error,
         generate_image_variations,
         upload_image_variations,
         is_valid_image_bytes as _is_valid_image_bytes,
@@ -1171,6 +1172,14 @@ class Miner(BaseMinerNeuron):
                 variation_type="voice",
                 path_signature=path_signature,
             )
+            problem = commitment_error(
+                challenge_id, self.wallet.hotkey.ss58_address, submission, generated_wav
+            )
+            if problem:
+                bt.logging.error(
+                    f"Voice: submission fails the validator's commitment check ({problem}); "
+                    f"validators will mark it invalid"
+                )
             bt.logging.info(f"Voice: Created submission s3_key={s3_key}")
             return [submission]
 

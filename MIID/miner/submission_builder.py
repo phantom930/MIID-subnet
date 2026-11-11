@@ -26,6 +26,7 @@ from MIID.miner.image_generator import (
 from MIID.miner.generate_variations import subject_gender_from_filename
 from MIID.miner.drand_encrypt import encrypt_image_for_drand, is_timelock_available
 from MIID.miner.s3_upload import upload_to_s3
+from MIID.utils.submission_integrity import verify_commitment, verify_plaintext
 
 
 # AdaFace cosine-similarity a variation should reach. It is a *retry target*,
@@ -132,6 +133,32 @@ def sign_media_hash(hotkey: Any, challenge_id: str, image_hash: str) -> str:
     """Sign one media hash, proving this miner produced that exact file."""
     message = f"challenge:{challenge_id}:hash:{image_hash}"
     return hotkey.sign(message.encode()).hex()
+
+
+def commitment_error(
+    challenge_id: str, hotkey_ss58: str, submission: S3Submission,
+    plaintext: Optional[bytes] = None,
+) -> Optional[str]:
+    """Why a validator would reject this submission's commitment, or None.
+
+    Runs the validator's own check (MIID/utils/submission_integrity.py,
+    upstream #126): hash, signature and path-signature encoding, the S3 key
+    shape submissions/<challenge>/<hotkey>/<path_signature>/<seed>/<file>.tlock,
+    and the signature over "challenge:<id>:hash:<sha256>". Since then a
+    validator leaves a submission that fails it out of KAV grading, and after
+    the reveal it also checks that the decrypted bytes hash to image_hash
+    (``plaintext``, when given).
+    """
+    try:
+        verify_commitment(
+            challenge_id, hotkey_ss58, submission.image_hash, submission.signature,
+            submission.s3_key, submission.path_signature,
+        )
+        if plaintext is not None:
+            verify_plaintext(plaintext, submission.image_hash)
+    except ValueError as e:
+        return str(e)
+    return None
 
 
 def _record(
@@ -354,13 +381,22 @@ def upload_image_variations(
                 )
 
                 if s3_key:
-                    s3_submissions.append(S3Submission(
+                    submission = S3Submission(
                         s3_key=s3_key,
                         image_hash=var["image_hash"],
                         signature=signature,
                         variation_type=variation_type,
                         path_signature=path_signature,
-                    ))
+                    )
+                    problem = commitment_error(
+                        challenge_id, hotkey.ss58_address, submission, var["image_bytes"]
+                    )
+                    if problem:
+                        bt.logging.error(
+                            f"Phase 4: {variation_type} fails the validator's commitment "
+                            f"check ({problem}); validators will not grade it"
+                        )
+                    s3_submissions.append(submission)
                     bt.logging.debug(f"Phase 4: Created submission for {variation_type}")
                     _record(report, variation_type, "submitted", model=model_key,
                             s3_key=s3_key,
@@ -375,6 +411,7 @@ def upload_image_variations(
                             blend=var.get("blend"),
                             screen=var.get("screen"),
                             content_identity=var.get("content_identity"),
+                            commitment_error=problem,
                             bytes=len(encrypted_data))
                 else:
                     bt.logging.warning(
