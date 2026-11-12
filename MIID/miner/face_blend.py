@@ -31,7 +31,13 @@
 #   - the blend carries the seed's skin texture into the take (texture_corr
 #     rising by more than COPY_RISE_MAX): face pixels copied from the seed
 #     are a -5 on the score sheet;
-#   - a measured edit weakened (edit_check.preserved on scene and accessory).
+#   - a measured edit weakened (edit_check.preserved on scene and accessory;
+#     an accessory that still reads as a match may fall to ACCESSORY_FLOOR,
+#     since CLIP's reading of a hat moves when only the face under it does).
+#
+# A background blend refused over its accessory is tried once more with
+# ACCESSORY_FALLBACK_MASK, which always blends only the facial features and
+# keeps headwear reaching into the forehead or temples out of the mask.
 #
 # The smallest alpha in the ladder that reaches MIID_FACE_BLEND_GOAL wins and
 # a full copy is never used: the take keeps all of its own fine texture and
@@ -145,6 +151,23 @@ COPY_RISE_MAX = 0.4
 # a turned head or a changed expression does not.
 RESIDUAL_MAX = 0.12
 SCALE_RANGE = (0.7, 1.4)
+# A background take's accessory may read weaker after a blend without being
+# touched: CLIP judges the head as a whole, and the face it sees changed. On
+# 12 archived takes refused for "weakened the accessory" (2026-11-11) the hat,
+# cap or bandana was pixel-identical after the blend, yet CLIP's confidence
+# fell by 0.17 on average. edit_check.preserved's 0.10 rule (meant for
+# comparing two different takes) refused all twelve. A blend now keeps an
+# accessory that was a match and still reads as one at this confidence or
+# above, with margin over the 0.5 the grader is assumed to need.
+ACCESSORY_FLOOR = float(os.environ.get("MIID_FACE_BLEND_ACCESSORY_FLOOR", "0.6"))
+# A background blend refused over its accessory is tried once more with this
+# mask: only the eyes, brows, nose and mouth always blended, the rest of the
+# face only where it still looks like the base's skin, so a hat brim, a
+# bandana or a hijab's edge inside the inner face stays the take's own. It
+# moved CLIP's accessory reading half as much (−0.09 against −0.17, still a
+# match on 8 of 9 against 6) for ~0.03 less identity, so it is the fallback,
+# not the default. "" disables the fallback.
+ACCESSORY_FALLBACK_MASK = os.environ.get("MIID_FACE_BLEND_ACCESSORY_MASK", "skin_features").strip().lower()
 # dHash distance (of 256 bits) under which two images are the same picture
 # (the benchmark treats <= 12 as the same image).
 SEED_DHASH_BITS = 20
@@ -231,6 +254,35 @@ def face_ellipse(shape: Tuple[int, int], points: np.ndarray, feather: float = 0.
     return cv2.GaussianBlur(mask, (k, k), sigma)
 
 
+def features_ellipse(shape: Tuple[int, int], points: np.ndarray) -> np.ndarray:
+    """A hard mask (H×W float, 0 or 1) over the facial features only: from
+    the brows (0.3 of the eye-to-mouth distance above the eyes) to just under
+    the mouth (0.25 of it below), 0.85 eye distances to each side. Smaller
+    than face_ellipse, which reaches into the forehead and the temples where
+    headwear sits."""
+    h, w = shape
+    pts = np.asarray(points, dtype=np.float64)
+    left_eye, right_eye, _nose, mouth_l, mouth_r = pts
+    eye_c = (left_eye + right_eye) / 2.0
+    mouth_c = (mouth_l + mouth_r) / 2.0
+    d = float(np.linalg.norm(right_eye - left_eye))
+    if d < 2.0:
+        return np.zeros((h, w), dtype=np.float32)
+    ax = (right_eye - left_eye) / d
+    ay = np.array([-ax[1], ax[0]])
+    if np.dot(mouth_c - eye_c, ay) < 0:
+        ay = -ay
+    m = max(float(np.dot(mouth_c - eye_c, ay)), 0.8 * d)
+    centre = eye_c + 0.475 * m * ay
+    rx, ry = 0.85 * d, 0.775 * m
+    ys, xs = np.mgrid[:h, :w]
+    px, py = xs - centre[0], ys - centre[1]
+    u = px * ax[0] + py * ax[1]
+    v = px * ay[0] + py * ay[1]
+    radius = (np.abs(u) / rx) ** MASK_EXPONENT + (np.abs(v) / ry) ** MASK_EXPONENT
+    return (radius <= 1.0).astype(np.float32)
+
+
 # ── pixels ───────────────────────────────────────────────────────────────
 
 
@@ -243,7 +295,7 @@ RESTORE_DELTA_E = 16.0
 
 def skin_mask(
     take_rgb: np.ndarray, points: np.ndarray, reference: Optional[np.ndarray] = None,
-    feather: float = 0.05,
+    feather: float = 0.05, forced: str = "core",
 ) -> np.ndarray:
     """A soft mask over the take's visible face skin: the inner-face superellipse
     always, plus the connected skin-coloured area around it (forehead below a
@@ -253,18 +305,24 @@ def skin_mask(
     colour-matched base) is given, what still resembles the base there — so
     hair, a backdrop and any fabric worn over the base's hair or forehead
     stay the take's own, and the mask adapts to whatever headwear it wears.
+
+    ``forced="features"`` always blends only the facial features
+    (features_ellipse) instead of the whole inner-face superellipse; the rest
+    of the inner face then has to pass the skin test like the outer area, so
+    headwear reaching into the forehead or temples drops out of the mask.
     """
     import cv2
 
     h, w = take_rgb.shape[:2]
     core = face_ellipse((h, w), points, feather=0.0)
+    always = features_ellipse((h, w), points) if forced == "features" else core
     pts = np.asarray(points, dtype=np.float64)
     left_eye, right_eye, nose, mouth_l, mouth_r = pts
     eye_c = (left_eye + right_eye) / 2.0
     mouth_c = (mouth_l + mouth_r) / 2.0
     d = float(np.linalg.norm(right_eye - left_eye))
     if d < 2.0:
-        return core
+        return always
     ax = (right_eye - left_eye) / d
     ay = np.array([-ax[1], ax[0]])
     if np.dot(mouth_c - eye_c, ay) < 0:
@@ -281,9 +339,12 @@ def skin_mask(
     outer = ((np.abs(u) / rx) ** MASK_EXPONENT + (np.abs(v) / ry) ** MASK_EXPONENT) <= 1.0
 
     ycc = cv2.cvtColor(take_rgb, cv2.COLOR_RGB2YCrCb).astype(np.float32)
-    sample = core > 0.5
+    # The skin colour is sampled where it is surely face: with only the
+    # features forced, headwear may fill part of the inner-face ellipse, and
+    # sampling it there would let the fabric pass as skin.
+    sample = always > 0.5
     if sample.sum() < 100:
-        return cv2.GaussianBlur(core, (0, 0), max(1.0, feather * d))
+        return cv2.GaussianBlur(always, (0, 0), max(1.0, feather * d))
     feats = ycc[sample][:, 1:]  # Cr, Cb of the inner face
     mu = feats.mean(axis=0)
     cov = np.cov(feats.T) + np.eye(2) * 2.0
@@ -307,7 +368,7 @@ def skin_mask(
     n, labels = cv2.connectedComponents(skin)
     seed = labels[int(round(nose[1])), int(round(nose[0]))] if 0 <= int(round(nose[1])) < h and 0 <= int(round(nose[0])) < w else 0
     region = (labels == seed) if seed > 0 else np.zeros_like(skin, dtype=bool)
-    mask = np.maximum(core, region.astype(np.float32))
+    mask = np.maximum(always, region.astype(np.float32))
     return cv2.GaussianBlur(mask, (0, 0), max(1.0, feather * d))
 
 
@@ -569,8 +630,9 @@ def build_mask(
     mode: Optional[str] = None,
 ) -> np.ndarray:
     """The blend region for a take: ``ellipse`` (the inner-face superellipse),
-    ``upper`` (brows, eyes and nose only) or ``skin`` (default: the take's
-    visible face skin judged against the warped base)."""
+    ``upper`` (brows, eyes and nose only), ``skin`` (default: the take's
+    visible face skin judged against the warped base) or ``skin_features``
+    (the same, with only the facial features blended unconditionally)."""
     mode = MASK if mode is None else mode
     if mode == "ellipse":
         return face_ellipse(take_rgb.shape[:2], take_points)
@@ -580,7 +642,8 @@ def build_mask(
     if base_rgb is not None and matrix is not None:
         core = face_ellipse(take_rgb.shape[:2], take_points)
         reference = match_colour(warp_base(base_rgb, matrix, take_rgb.shape[:2]), take_rgb, core)
-    return skin_mask(take_rgb, take_points, reference)
+    forced = "features" if mode == "skin_features" else "core"
+    return skin_mask(take_rgb, take_points, reference, forced=forced)
 
 
 def eye_distance(points: np.ndarray) -> float:
@@ -645,84 +708,100 @@ def apply(
         return done(f"face scale {scale:.2f} outside {SCALE_RANGE[0]}–{SCALE_RANGE[1]}")
     if residual > RESIDUAL_MAX:
         return done(f"the take's face sits differently (landmark residual {residual:.2f} > {RESIDUAL_MAX})")
-    mask = build_mask(take_rgb, take_points, base_rgb, matrix, mode=mask_mode)
-    info["mask_share"] = round(float((mask > 0.5).mean()), 4)
     d = eye_distance(take_points)
-
-    best: Optional[Tuple[float, float, Image.Image]] = None
-    tried: List[Tuple[float, Optional[float]]] = []
-    for alpha in ALPHAS:
-        candidate = Image.fromarray(composite(
-            base_rgb, take_rgb, matrix, mask, alpha, poisson=POISSON, match=match_mode, eye_distance=d,
-        ))
-        identity = similarity_to_embedding(base_embedding, candidate)
-        tried.append((alpha, None if identity is None else round(identity, 4)))
-        if identity is None:
-            continue
-        if best is None or identity > best[0]:
-            best = (identity, alpha, candidate)
-        if identity >= goal:
-            break
-    info["tried"] = tried
-    if best is None:
-        return done("no face readable in any blend")
-    identity, alpha, image = best
-    info["identity"] = round(identity, 4)
-    info["alpha"] = alpha
-    if identity < raw_identity + MIN_GAIN:
-        return done(f"identity gain too small ({raw_identity:.3f} → {identity:.3f})")
-
-    seed_bits = hamming(seed_hash, dhash_bits(np.asarray(image)))
-    info["seed_bits"] = seed_bits
-    if seed_bits < SEED_DHASH_BITS:
-        return done(f"would read as a copy of the seed (dHash {seed_bits} bits)")
     texture_raw = texture_corr(base_rgb, take_rgb, matrix, take_points)
-    texture_new = texture_corr(base_rgb, np.asarray(image), matrix, take_points)
-    if texture_raw is not None and texture_new is not None:
-        info["texture_rise"] = round(texture_new - texture_raw, 3)
-        if texture_new - texture_raw > COPY_RISE_MAX:
-            return done(f"would carry the seed's skin texture (texture correlation +{texture_new - texture_raw:.2f})")
 
-    # The scene cannot change — only the face did — so the scene check is a
-    # plain miss test on the blended image, not the 0.10-point "no weaker
-    # than the incumbent" rule for two different takes (CLIP's indoor/outdoor
-    # reading wobbles by that much when the face changes). The accessory can
-    # be damaged by the mask, so for it the incumbent rule stands.
-    environment = environment_probs(image) if scene else result.get("environment")
-    if scene and background_miss(result["variation_type"], environment):
-        return done("the blended image reads as the wrong kind of scene")
-    if scene and environment and result.get("environment"):
-        before, after = result["environment"].get(scene, 0.0), environment.get(scene, 0.0)
-        info["scene_before"], info["scene_after"] = round(before, 3), round(after, 3)
-        if after < before - SCENE_DROP_MAX:
-            return done(f"the face no longer sits in the scene ({scene} {before:.2f} → {after:.2f})")
-    try:
-        # The blended take keeps the take's landmarks, so no second detection.
-        edit = measure_edit(edit_context or {}, image, levels, accessory, geometry=take_geometry)
-    except Exception as e:  # measured on the raw take; unmeasurable here is not a pass
-        return done(f"edit measurement failed after the blend ({e})")
-    candidate = {"pose_yaw": result.get("pose_yaw"), "environment": result.get("environment"), "edit": edit}
-    kept, lost = edit_preserved(levels, result, candidate, scene)
-    if not kept:
-        return done(f"the blend weakened the {lost}")
-    # Nor may the blend turn a landed edit into a gross miss (a lighting
-    # change that now reads as none, an expression that now reads neutral).
-    new_misses = set(edit_misses(levels, edit)) - set(edit_misses(levels, result.get("edit")))
-    if new_misses:
-        return done("the blend undid the " + ", ".join(sorted(c for c, _ in new_misses)))
-    lighting_raw, lighting_new = (result.get("edit") or {}).get("lighting"), (edit or {}).get("lighting")
-    if lighting_raw and lighting_new:
-        info["lighting_before"], info["lighting_after"] = lighting_raw["magnitude"], lighting_new["magnitude"]
-        # The 85% rule above allows a small loss; it must not be the loss
-        # that takes the lighting down an intensity level (a far read that
-        # becomes medium), which is what the grader bins on.
-        order = ("none", "light", "medium", "far")
-        if (lighting_raw.get("level") in order and lighting_new.get("level") in order
-                and order.index(lighting_new["level"]) < order.index(lighting_raw["level"])):
-            return done(f"the blend took the lighting from {lighting_raw['level']} to {lighting_new['level']}")
-    expr_raw, expr_new = (result.get("edit") or {}).get("expression"), (edit or {}).get("expression")
-    if expr_raw and expr_new:
-        info["expression_before"], info["expression_after"] = expr_raw["change"], expr_new["change"]
+    def attempt(mode: str) -> Tuple[Optional[str], Optional[Tuple]]:
+        """One blend with mask ``mode`` through every guard: (why it was
+        refused, None) or (None, (image, identity, environment, edit))."""
+        mask = build_mask(take_rgb, take_points, base_rgb, matrix, mode=mode)
+        info["mask"] = mode
+        info["mask_share"] = round(float((mask > 0.5).mean()), 4)
+        best: Optional[Tuple[float, float, Image.Image]] = None
+        tried: List[Tuple[float, Optional[float]]] = []
+        for alpha in ALPHAS:
+            candidate = Image.fromarray(composite(
+                base_rgb, take_rgb, matrix, mask, alpha, poisson=POISSON, match=match_mode, eye_distance=d,
+            ))
+            identity = similarity_to_embedding(base_embedding, candidate)
+            tried.append((alpha, None if identity is None else round(identity, 4)))
+            if identity is None:
+                continue
+            if best is None or identity > best[0]:
+                best = (identity, alpha, candidate)
+            if identity >= goal:
+                break
+        info["tried"] = tried
+        if best is None:
+            return "no face readable in any blend", None
+        identity, alpha, image = best
+        info["identity"] = round(identity, 4)
+        info["alpha"] = alpha
+        if identity < raw_identity + MIN_GAIN:
+            return f"identity gain too small ({raw_identity:.3f} → {identity:.3f})", None
+
+        seed_bits = hamming(seed_hash, dhash_bits(np.asarray(image)))
+        info["seed_bits"] = seed_bits
+        if seed_bits < SEED_DHASH_BITS:
+            return f"would read as a copy of the seed (dHash {seed_bits} bits)", None
+        texture_new = texture_corr(base_rgb, np.asarray(image), matrix, take_points)
+        if texture_raw is not None and texture_new is not None:
+            info["texture_rise"] = round(texture_new - texture_raw, 3)
+            if texture_new - texture_raw > COPY_RISE_MAX:
+                return (f"would carry the seed's skin texture (texture correlation "
+                        f"+{texture_new - texture_raw:.2f})"), None
+
+        # The scene cannot change — only the face did — so the scene check is a
+        # plain miss test on the blended image, not the 0.10-point "no weaker
+        # than the incumbent" rule for two different takes (CLIP's indoor/outdoor
+        # reading wobbles by that much when the face changes). The accessory's
+        # reading wobbles the same way, so it may fall as far as ACCESSORY_FLOOR
+        # while it still reads as a match (see there).
+        environment = environment_probs(image) if scene else result.get("environment")
+        if scene and background_miss(result["variation_type"], environment):
+            return "the blended image reads as the wrong kind of scene", None
+        if scene and environment and result.get("environment"):
+            before, after = result["environment"].get(scene, 0.0), environment.get(scene, 0.0)
+            info["scene_before"], info["scene_after"] = round(before, 3), round(after, 3)
+            if after < before - SCENE_DROP_MAX:
+                return f"the face no longer sits in the scene ({scene} {before:.2f} → {after:.2f})", None
+        try:
+            # The blended take keeps the take's landmarks, so no second detection.
+            edit = measure_edit(edit_context or {}, image, levels, accessory, geometry=take_geometry)
+        except Exception as e:  # measured on the raw take; unmeasurable here is not a pass
+            return f"edit measurement failed after the blend ({e})", None
+        candidate = {"pose_yaw": result.get("pose_yaw"), "environment": result.get("environment"), "edit": edit}
+        kept, lost = edit_preserved(levels, result, candidate, scene, accessory_floor=ACCESSORY_FLOOR)
+        if not kept:
+            return f"the blend weakened the {lost}", None
+        # Nor may the blend turn a landed edit into a gross miss (a lighting
+        # change that now reads as none, an expression that now reads neutral).
+        new_misses = set(edit_misses(levels, edit)) - set(edit_misses(levels, result.get("edit")))
+        if new_misses:
+            return "the blend undid the " + ", ".join(sorted(c for c, _ in new_misses)), None
+        lighting_raw, lighting_new = (result.get("edit") or {}).get("lighting"), (edit or {}).get("lighting")
+        if lighting_raw and lighting_new:
+            info["lighting_before"], info["lighting_after"] = lighting_raw["magnitude"], lighting_new["magnitude"]
+            # The 85% rule above allows a small loss; it must not be the loss
+            # that takes the lighting down an intensity level (a far read that
+            # becomes medium), which is what the grader bins on.
+            order = ("none", "light", "medium", "far")
+            if (lighting_raw.get("level") in order and lighting_new.get("level") in order
+                    and order.index(lighting_new["level"]) < order.index(lighting_raw["level"])):
+                return f"the blend took the lighting from {lighting_raw['level']} to {lighting_new['level']}", None
+        expr_raw, expr_new = (result.get("edit") or {}).get("expression"), (edit or {}).get("expression")
+        if expr_raw and expr_new:
+            info["expression_before"], info["expression_after"] = expr_raw["change"], expr_new["change"]
+        return None, (image, identity, environment, edit)
+
+    refused, kept_blend = attempt(mask_mode)
+    if (refused and "accessory" in refused and accessory and mask_mode == "skin"
+            and ACCESSORY_FALLBACK_MASK and ACCESSORY_FALLBACK_MASK != mask_mode):
+        info["first_try"] = {"mask": mask_mode, "reason": refused, "identity": info.get("identity")}
+        refused, kept_blend = attempt(ACCESSORY_FALLBACK_MASK)
+    if refused:
+        return done(refused)
+    image, identity, environment, edit = kept_blend
 
     result["image"] = image
     result["identity_similarity"] = identity
@@ -738,5 +817,7 @@ def describe(info: Optional[Dict[str, Any]]) -> str:
         return ""
     return (
         f"face blend {info['raw_identity']:.3f} → {info['identity']:.3f} "
-        f"(alpha {info['alpha']:.2f})"
+        f"(alpha {info['alpha']:.2f}"
+        + (", features-only mask after the accessory" if info.get("first_try") else "")
+        + ")"
     )

@@ -445,6 +445,7 @@ def preserved(
     incumbent: Dict[str, Any],
     candidate: Dict[str, Any],
     scene: Optional[str] = None,
+    accessory_floor: Optional[float] = None,
 ) -> Tuple[bool, str]:
     """Does ``candidate`` keep every measured edit of ``incumbent``?
 
@@ -454,6 +455,11 @@ def preserved(
     safe replacement. A head turn or lighting change inside its requested
     range is kept whatever the incumbent's strength — weaker within the
     range is not worse, and stronger past it is. Returns (kept, what was lost).
+
+    ``accessory_floor`` is for a candidate that is the incumbent's own pixels
+    with only the face changed (face_blend): an accessory that was a match
+    and still is, at this confidence or above, counts as kept however far
+    the confidence fell. Two different takes are compared without it.
     """
     inc_edit = incumbent.get("edit") or {}
     cand_edit = candidate.get("edit") or {}
@@ -478,7 +484,12 @@ def preserved(
     inc = inc_edit.get("accessory")
     if inc:
         cand = cand_edit.get("accessory")
-        if not cand or cand["confidence"] < inc["confidence"] - ACCESSORY_KEEP:
+        still_clear = (
+            accessory_floor is not None and cand is not None
+            and inc["status"] == "match" and cand["status"] == "match"
+            and cand["confidence"] >= accessory_floor
+        )
+        if not still_clear and (not cand or cand["confidence"] < inc["confidence"] - ACCESSORY_KEEP):
             return False, "accessory"
         if inc["status"] == "match" and cand["status"] != "match":
             return False, "accessory"
