@@ -28,6 +28,9 @@ from MIID.utils.config import add_miner_args
 
 from typing import Union
 
+# Pause before retrying after a failed sync (chain connection errors).
+SYNC_RETRY_SECONDS = 60
+
 
 class BaseMinerNeuron(BaseNeuron):
     """
@@ -113,32 +116,41 @@ class BaseMinerNeuron(BaseNeuron):
         bt.logging.info(f"Miner starting at block: {self.block}")
 
         # This loop maintains the miner's operations until intentionally stopped.
+        # A failed chain call (the public endpoint refusing connections, a
+        # dropped websocket) is logged and retried after SYNC_RETRY_SECONDS:
+        # with the try outside the loop one such error ended syncing for good
+        # while the axon kept serving (2026-11-12, "too many concurrent
+        # connections" from this host).
         try:
             while not self.should_exit:
-                while (
-                    self.block - self.metagraph.last_update[self.uid]
-                    < self.config.neuron.epoch_length
-                ):
-                    # Wait before checking again.
-                    time.sleep(1)
+                try:
+                    while (
+                        self.block - self.metagraph.last_update[self.uid]
+                        < self.config.neuron.epoch_length
+                    ):
+                        # Wait before checking again.
+                        time.sleep(1)
 
-                    # Check if we should exit.
-                    if self.should_exit:
-                        break
+                        # Check if we should exit.
+                        if self.should_exit:
+                            break
 
-                # Sync metagraph and potentially set weights.
-                self.sync()
-                self.step += 1
+                    # Sync metagraph and potentially set weights.
+                    self.sync()
+                    self.step += 1
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    bt.logging.error(
+                        f"Chain sync failed; retrying in {SYNC_RETRY_SECONDS}s:\n{traceback.format_exc()}"
+                    )
+                    time.sleep(SYNC_RETRY_SECONDS)
 
         # If someone intentionally stops the miner, it'll safely terminate operations.
         except KeyboardInterrupt:
             self.axon.stop()
             bt.logging.success("Miner killed by keyboard interrupt.")
             exit()
-
-        # In case of unforeseen errors, the miner will log the error and continue operations.
-        except Exception as e:
-            bt.logging.error(traceback.format_exc())
 
     def run_in_background_thread(self):
         """

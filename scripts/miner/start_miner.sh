@@ -21,8 +21,14 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PYTHON="${MINER_PYTHON:-$REPO/miner_env/bin/python}"
 COLDKEY="${MIID_COLDKEY:-phantom_coldkey}"
 NETUID="${MIID_NETUID:-54}"
-NETWORK="${MIID_NETWORK:-finney}"
+# bittensor resolves --subtensor.network after --subtensor.chain_endpoint and
+# the network always has a value, so a chain endpoint on its own is ignored
+# (the miner kept dialling entrypoint-finney). With MIID_CHAIN_ENDPOINT set,
+# the network is that URL too. Use one when the public entrypoint answers
+# "Too many concurrent connections from this source" (HTTP 429), e.g.
+#   MIID_CHAIN_ENDPOINT=wss://archive.chain.opentensor.ai:443
 ENDPOINT="${MIID_CHAIN_ENDPOINT:-wss://entrypoint-finney.opentensor.ai:443}"
+NETWORK="${MIID_NETWORK:-${MIID_CHAIN_ENDPOINT:-finney}}"
 EXTERNAL_IP="${MIID_EXTERNAL_IP:-${PUBLIC_IPADDR:-}}"
 NAME="${MIID_PM2_NAME:-miid_miner}"
 
