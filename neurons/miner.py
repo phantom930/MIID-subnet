@@ -113,6 +113,7 @@ from MIID.miner.request_archive import (
 
 # One GPU shared by every validator's request: earliest deadline first.
 from MIID.miner.gpu_scheduler import SCHEDULER, Turn, queue_cutoff
+from MIID.miner.response_budget import BUDGETS as RESPONSE_BUDGETS, budget_for
 from MIID.miner import gpu_health
 
 # The image model keeps its weights on the GPU between attempts and between
@@ -310,6 +311,10 @@ class Miner(BaseMinerNeuron):
         self.output_path = os.path.join(self.config.logging.logging_dir, "mining_results")
         os.makedirs(self.output_path, exist_ok=True)
         bt.logging.info(f"Mining results will be saved to: {self.output_path}")
+        bt.logging.info(
+            "Response budgets (s from the validator's send time, MIID_VALIDATOR_BUDGETS): "
+            + (", ".join(f"{k} {v:.0f}" for k, v in RESPONSE_BUDGETS.items()) or "none")
+        )
 
         # Every validator approach is archived here: what was asked, what was
         # submitted, and why anything was dropped. Lands in the checkout at
@@ -508,19 +513,23 @@ class Miner(BaseMinerNeuron):
         """(deadline, sent_at) for a request, both wall-clock seconds.
 
         The validator stamps its send time into the nonce (time.time_ns()) and
-        stops waiting synapse.timeout seconds later. Its clock and ours agreed
-        within ~2 s over a week of logs; a nonce that is missing, from the
-        future or older than two timeouts falls back to "now + timeout".
+        stops waiting synapse.timeout seconds later, or sooner for validators
+        with a budget in response_budget (Yuma, Rizzo). Its clock and ours
+        agreed within ~2 s over a week of logs; a nonce that is missing, from
+        the future or older than two timeouts falls back to "now + timeout".
         """
         timeout = float(getattr(synapse, "timeout", None) or 120.0)
-        nonce = getattr(getattr(synapse, "dendrite", None), "nonce", None)
+        dendrite = getattr(synapse, "dendrite", None)
+        budget = budget_for(getattr(dendrite, "hotkey", None), self.WHITELISTED_VALIDATORS)
+        limit = timeout if budget is None else min(timeout, budget)
+        nonce = getattr(dendrite, "nonce", None)
         try:
             sent_at = int(nonce) / 1e9
         except (TypeError, ValueError):
             sent_at = None
         if sent_at is None or sent_at > now + 5.0 or sent_at < now - 2 * timeout:
-            return now + timeout, None
-        return sent_at + timeout, sent_at
+            return now + limit, None
+        return sent_at + limit, sent_at
 
     def _post_generation_reserve(self, synapse: IdentitySynapse) -> float:
         """Seconds the response needs after image generation ends."""
@@ -565,7 +574,7 @@ class Miner(BaseMinerNeuron):
             bt.logging.info(
                 f"Request sent {started - (sent_at or received):.0f}s ago "
                 f"(waited {turn.waited:.0f}s for the GPU); "
-                f"{deadline - started:.0f}s left before the validator's timeout."
+                f"{deadline - started:.0f}s left before its deadline."
             )
             return self._forward_body(synapse, deadline, timing, turn)
 
@@ -722,7 +731,7 @@ class Miner(BaseMinerNeuron):
                 # late response scores nothing.
                 bt.logging.warning(
                     f"Voice: skipped, only {deadline - time.time():.0f}s left "
-                    "before the validator's timeout."
+                    "before its deadline."
                 )
                 voice_summary["outcome"] = "skipped_deadline"
             elif (
@@ -800,7 +809,7 @@ class Miner(BaseMinerNeuron):
         rss_gb = _trim_heap()
         bt.logging.info(
             f"Request completed in {total_time:.2f}s of {timeout:.1f}s allowed "
-            f"({deadline - time.time():.0f}s before the validator's timeout); "
+            f"({deadline - time.time():.0f}s before its deadline); "
             f"process RSS {rss_gb:.1f} GB."
         )
 
