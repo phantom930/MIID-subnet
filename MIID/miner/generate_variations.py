@@ -227,6 +227,68 @@ IDENTITY_CLAUSE = (
     "hair, same apparent age and gender. Do not restyle or beautify the face."
 )
 
+# A close-up of the seed's face, given to FLUX.2 klein as a second reference
+# image next to the seed itself. In the seed (a passport photo, resized by
+# the pipeline to at most 1 MP) the face is ~250 px wide; the close-up gives
+# the model the same face at several times that, and the prompt says what
+# it is. Offline on 2026-11-13 (12 archived combo slots, same prompt and
+# seed with and without it): identity of a first attempt 0.633 → 0.678, higher
+# on 12 of 12, head turn, lighting and expression measured as strong.
+# Generation costs more (the reference tokens): 13.5 s → 21 s per attempt
+# with a 1024 px close-up on the A4000.
+# MIID_SEED_CLOSEUP is the close-up's side in pixels (0 switches it off);
+# MIID_SEED_CLOSEUP_SLOTS lists the slot types that get it.
+SEED_CLOSEUP_SIZE = int(os.environ.get("MIID_SEED_CLOSEUP", "1024"))
+SEED_CLOSEUP_SLOTS = frozenset(
+    s.strip() for s in os.environ.get(
+        "MIID_SEED_CLOSEUP_SLOTS",
+        "lighting_edit+expression_edit,lighting_edit+pose_edit,pose_edit+expression_edit,"
+        "lighting_edit,pose_edit,expression_edit",
+    ).split(",") if s.strip()
+)
+# The square cut around the face: SEED_CLOSEUP_SCALE times the face box's
+# larger side, centred a little above the box (forehead and hairline in).
+SEED_CLOSEUP_SCALE = 1.8
+SEED_CLOSEUP_LIFT = 0.12
+SEED_CLOSEUP_SUFFIX = (
+    " Image 2 is a close-up of the reference person's face: reproduce those exact facial "
+    "features (eyes, eyebrows, nose, lips, jawline, face proportions, skin) on the subject."
+)
+
+
+def seed_closeup(base_image: Image.Image, geometry: Optional[Tuple]) -> Optional[Image.Image]:
+    """The close-up of the seed's face (see SEED_CLOSEUP_SIZE), or None when
+    it is switched off or the face was not found (``geometry`` is
+    ada_face_compare.face_geometry's (box, landmarks))."""
+    if SEED_CLOSEUP_SIZE <= 0 or not geometry:
+        return None
+    (x0, y0, x1, y1), _ = geometry
+    width, height = base_image.size
+    side = min(SEED_CLOSEUP_SCALE * max(x1 - x0, y1 - y0), width, height)
+    if side < 32:
+        return None
+    cx = (x0 + x1) / 2
+    cy = (y0 + y1) / 2 - SEED_CLOSEUP_LIFT * (y1 - y0)
+    left = int(round(min(max(cx - side / 2, 0), width - side)))
+    top = int(round(min(max(cy - side / 2, 0), height - side)))
+    crop = base_image.convert("RGB").crop((left, top, left + int(side), top + int(side)))
+    return crop.resize((SEED_CLOSEUP_SIZE, SEED_CLOSEUP_SIZE), Image.LANCZOS)
+
+
+def uses_seed_closeup(req: Any) -> bool:
+    """Should this slot's attempts get the seed close-up? FLUX.2 klein only
+    (the other backends take a single reference image)."""
+    if SEED_CLOSEUP_SIZE <= 0:
+        return False
+    try:
+        model_key = _cached_model_key or _select_model()
+    except Exception:  # noqa: BLE001
+        return False
+    return (
+        AVAILABLE_MODELS.get(model_key, {}).get("type") == "flux_klein"
+        and canonical_variation_type(req) in SEED_CLOSEUP_SLOTS
+    )
+
 # The validator joins a combined slot's components with this, in both `type`
 # ("lighting_edit+expression_edit") and `intensity` ("light+far").  See
 # COMBINED_VARIATION_SEPARATOR in MIID/validator/image_variations.py.
@@ -955,6 +1017,7 @@ def build_prompt(
     hints: Optional[Dict[str, str]] = None,
     pose_hint: Optional[str] = None,
     background_hint: Optional[str] = None,
+    closeup: bool = False,
 ) -> str:
     """The prompt generate_one would build for these arguments.
 
@@ -962,16 +1025,19 @@ def build_prompt(
     together (PromptCache) and the same text re-used for a polish re-roll.
     The scene, colour and accessory choices inside are random per call, so
     the text is passed back to generate_one rather than rebuilt.
+    ``closeup``: the attempt gets the seed close-up as image 2 (seed_closeup),
+    and the prompt says so.
     """
     var_type, intensity = _get_type_and_intensity(req)
     if identity_bias is None:
         # Each attempt steps 40% further toward "hold the face, soften the
         # edit", capped at 0.8 so a variation never collapses into a copy.
         identity_bias = min(0.8, 0.4 * attempt)
-    return _get_prompt_from_request(
+    text = _get_prompt_from_request(
         req, var_type, intensity, identity_bias, subject_gender=subject_gender,
         pose_hint=pose_hint, background_hint=background_hint, hints=hints,
     )
+    return text + SEED_CLOSEUP_SUFFIX if closeup else text
 
 
 # =============================================================================
