@@ -32,9 +32,12 @@ from MIID.miner.generate_variations import (
     prepare_prompt_cache,
     requested_accessory,
     requested_levels,
+    seed_closeup,
+    uses_seed_closeup,
 )
 from MIID.miner.ada_face_compare import (
     embed_image,
+    face_geometry,
     face_yaw_delta,
     face_yaw_signature,
     similarity_to_embedding,
@@ -804,6 +807,21 @@ def generate_variations(
     slots = [_Slot(i, req) for i, req in enumerate(variation_requests)]
     first_attempt = [True]
 
+    # The seed's face, cropped and scaled up, as a second reference image on
+    # the slots that take one (generate_variations.seed_closeup): every
+    # attempt of such a slot gets it, and its prompt says what image 2 is.
+    closeups: Dict[int, Image.Image] = {}
+    if any(uses_seed_closeup(slot.req) for slot in slots):
+        try:
+            geometry = edit_context.get("geometry") or face_geometry(base_image)
+            closeup = seed_closeup(base_image, geometry)
+        except Exception as e:  # noqa: BLE001 — generation works without it
+            bt.logging.warning(f"Seed close-up unavailable ({e}); generating without it.")
+            closeup = None
+        if closeup is not None:
+            closeups = {slot.index: closeup for slot in slots if uses_seed_closeup(slot.req)}
+            bt.logging.debug(f"Seed close-up on {len(closeups)} slot(s)")
+
     # The request's prompts, built ahead so FLUX.2 klein can encode them in
     # one text-encoder pass (generate_variations.PromptCache) instead of one
     # per attempt — the 8 GB text encoder then leaves the GPU to the
@@ -815,6 +833,7 @@ def generate_variations(
         try:
             first_prompts[slot.index] = build_prompt(
                 slot.req, attempt=0, identity_bias=0.0, subject_gender=subject_gender,
+                closeup=slot.index in closeups,
             )
         except Exception as e:  # noqa: BLE001 — generate_one builds its own then
             bt.logging.warning(f"Could not build slot {slot.index}'s prompt ahead: {e}")
@@ -1019,6 +1038,7 @@ def generate_variations(
             attempt=slot.generated, subject_gender=subject_gender,
             identity_bias=identity_bias, hints=hints,
             prompt=prompt, prompt_cache=prompt_cache,
+            closeup_image=closeups.get(slot.index),
         )
         generated_at = time.time()
         slot.generated += 1

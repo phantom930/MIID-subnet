@@ -236,6 +236,8 @@ IDENTITY_CLAUSE = (
 # on 12 of 12, head turn, lighting and expression measured as strong.
 # Generation costs more (the reference tokens): 13.5 s → 21 s per attempt
 # with a 1024 px close-up on the A4000.
+# image_generator builds it once per request and passes it to every attempt
+# (first pass, retries, polish) of the slots listed below.
 # MIID_SEED_CLOSEUP is the close-up's side in pixels (0 switches it off);
 # MIID_SEED_CLOSEUP_SLOTS lists the slot types that get it.
 SEED_CLOSEUP_SIZE = int(os.environ.get("MIID_SEED_CLOSEUP", "1024"))
@@ -1423,6 +1425,7 @@ def generate_one(
     hints: Optional[Dict[str, str]] = None,
     prompt: Optional[str] = None,
     prompt_cache: Optional[PromptCache] = None,
+    closeup_image: Optional[Image.Image] = None,
 ) -> Dict[str, Any]:
     """Generate a single variation for one validator request.
 
@@ -1452,6 +1455,10 @@ def generate_one(
         prompt_cache: This request's PromptCache; with it a FLUX.2 klein
             attempt runs on prompt embeddings and leaves the text encoder
             off the GPU.
+        closeup_image: The seed close-up (seed_closeup) to give FLUX.2 klein
+            as image 2; ignored by the other backends. A prompt built here
+            then carries SEED_CLOSEUP_SUFFIX; a ``prompt`` passed in must have
+            been built with ``closeup=True`` to match.
 
     Returns:
         Dict with ``image``, ``variation_type``, ``model_key``, ``model_id``,
@@ -1471,12 +1478,15 @@ def generate_one(
         )
 
     var_type, intensity = _get_type_and_intensity(req)
+    if model_type != "flux_klein":
+        closeup_image = None
     if identity_bias is None:
         identity_bias = min(0.8, 0.4 * attempt)
     if prompt is None:
         prompt = build_prompt(
             req, attempt, identity_bias, subject_gender=subject_gender,
             hints=hints, pose_hint=pose_hint, background_hint=background_hint,
+            closeup=closeup_image is not None,
         )
     seed = random.randint(0, 2**31 - 1)
     negative_prompt = (
@@ -1490,6 +1500,8 @@ def generate_one(
 
         device, _ = parse_request(_req_field(req, "description"), _req_field(req, "detail"))
         kwargs["width"], kwargs["height"] = content_size(device)
+    if closeup_image is not None:
+        kwargs["extra_images"] = [closeup_image]
     if prompt_cache is not None and model_type == "flux_klein" and prompt_cache.pipe is pipe:
         try:
             kwargs["prompt_embeds"] = prompt_cache.get(prompt)

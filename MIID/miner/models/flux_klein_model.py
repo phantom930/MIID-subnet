@@ -124,6 +124,7 @@ def generate(
     identity_bias: float = 0.0,
     negative_prompt: Optional[str] = None,
     prompt_embeds: Optional[torch.Tensor] = None,
+    extra_images: Optional[List[Image.Image]] = None,
 ) -> Image.Image:
     """Generate a single variation and return the PIL Image.
 
@@ -131,6 +132,8 @@ def generate(
     prompt off so the result drifts less far from the reference face.
     ``prompt_embeds`` (from encode_prompts) stands in for ``prompt`` and
     keeps the text encoder off the GPU.
+    ``extra_images`` are further reference images after ``image`` (image 2,
+    3, ... in the prompt's terms), e.g. generate_variations.seed_closeup.
     """
     try:
         from ._common import fit_to_target, generation_size, make_generator, supported_kwargs
@@ -148,7 +151,7 @@ def generate(
     else:
         text = {"prompt": prompt}
     out = pipe(
-        image=[image],
+        image=[image, *(extra_images or [])],
         num_inference_steps=steps,
         guidance_scale=guidance,
         **text,
