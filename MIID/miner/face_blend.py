@@ -87,16 +87,24 @@ SCENE_DROP_MAX = 0.25
 # take's lighting direction, cast and contrast stay on the restored face. An
 # expression slot restores only the upper face — brows, eyes, nose — and
 # leaves the mouth, cheeks and chin, which carry the expression, as
-# generated. Pose slots are never blended: the face has turned, so the
-# landmarks do not fit. The lighting+expression combo is not blended either:
-# on 10 archived takes every mask/match variant lost identity (−0.05 to
-# −0.07), the relit, re-expressed face being too far from the base for a
-# landmark-aligned paste.
+# generated. A turned head or a combo's re-expressed face does not fit the
+# five-point similarity transform (on 10 archived lighting+expression takes
+# every mask/match variant of it lost identity, −0.05 to −0.07), so those
+# slots go through the face mesh instead ("mesh", face_mesh.py and
+# _apply_mesh below).
 BLEND_MODES: Dict[str, Tuple[str, str]] = {
     "background_in": ("skin", "global"),
     "background_out": ("skin", "global"),
     "lighting_edit": ("skin", "local"),
     "expression_edit": ("upper", "global"),
+    # The combo slots, and a lone pose slot: the base face is warped onto
+    # the take along MediaPipe's face mesh instead (face_mesh.py), which
+    # follows a turned head and a moved mouth where the five-point fit
+    # above cannot. Always with a local colour match.
+    "lighting_edit+expression_edit": ("mesh", "local"),
+    "lighting_edit+pose_edit": ("mesh", "local"),
+    "pose_edit+expression_edit": ("mesh", "local"),
+    "pose_edit": ("mesh", "local"),
 }
 SLOTS = frozenset(
     s.strip() for s in os.environ.get(
@@ -691,6 +699,11 @@ def apply(
         return done("no identity signal")
     if base_geom is None:
         return done("no face in the base image")
+    if mask_mode == "mesh":
+        return _apply_mesh(
+            base_image, base_embedding, base_geom, result, info, done,
+            edit_context=edit_context, levels=levels,
+        )
     if take_geometry is None:
         take_geometry = face_geometry(result["image"])
     if take_geometry is None:
@@ -811,6 +824,173 @@ def apply(
     return done(None)
 
 
+# The base image's mesh, for the request's other slots: (weak reference to
+# the image, its size, the landmarks).
+_base_mesh: List[Any] = [None, None, None]
+
+
+def _mesh_of_base(base_image: Image.Image) -> Optional[np.ndarray]:
+    import weakref
+
+    from MIID.miner import face_mesh
+
+    ref, size, points = _base_mesh
+    if ref is not None and ref() is base_image and size == base_image.size:
+        return points
+    points = face_mesh.landmarks(base_image)
+    _base_mesh[:] = [weakref.ref(base_image), base_image.size, points]
+    return points
+
+
+def _apply_mesh(
+    base_image: Image.Image,
+    base_embedding: Any,
+    base_geom: Tuple,
+    result: Dict[str, Any],
+    info: Dict[str, Any],
+    done,
+    *,
+    edit_context: Optional[Dict[str, Any]],
+    levels: Dict[str, str],
+) -> Dict[str, Any]:
+    """apply() for the "mesh" slots (face_mesh.py): the base face warped onto
+    the take's face mesh. Same guards as the five-point blend — identity must
+    rise, no copy of the seed or of its texture, every measured edit kept —
+    and the head turn is measured again on the blended image."""
+    from MIID.miner import face_mesh
+    from MIID.miner.ada_face_compare import yaw_between, yaw_signature_from_landmarks
+    from MIID.miner.edit_check import measure as measure_edit, misses as edit_misses, preserved as edit_preserved
+
+    raw_identity = result["identity_similarity"]
+    if not face_mesh.available():
+        return done(f"face mesh unavailable ({face_mesh.unavailable_reason()})")
+    base_points = _mesh_of_base(base_image)
+    if base_points is None:
+        return done("no face mesh in the base image")
+    take_points = face_mesh.landmarks(result["image"])
+    if take_points is None:
+        return done("no face mesh in the take")
+    scale = face_mesh.eye_distance(take_points) / max(face_mesh.eye_distance(base_points), 1.0)
+    info["scale"] = round(scale, 3)
+    if not (SCALE_RANGE[0] <= scale <= SCALE_RANGE[1]):
+        return done(f"face scale {scale:.2f} outside {SCALE_RANGE[0]}–{SCALE_RANGE[1]}")
+
+    base_rgb = np.asarray(base_image.convert("RGB"))
+    take_rgb = np.asarray(result["image"].convert("RGB"))
+    seed_hash = dhash_bits(base_rgb)
+    keep_mouth = "expression_edit" not in levels
+    base_signature = yaw_signature_from_landmarks(base_geom[1]) if "pose_edit" in levels else None
+    lighting_raw = (result.get("edit") or {}).get("lighting")
+    expr_raw = (result.get("edit") or {}).get("expression")
+    order = ("none", "light", "medium", "far")
+
+    def check(alpha: float, step: Dict[str, Any]) -> Tuple[Optional[str], Optional[Tuple]]:
+        """One blend at ``alpha`` through every guard: (why it was refused,
+        None) or (None, (image, identity, edit, head turn))."""
+        composed = face_mesh.compose(
+            base_rgb, take_rgb, base_points, take_points,
+            alpha=alpha, keep_mouth=keep_mouth, detail_sigma=face_mesh.DETAIL_SIGMA,
+        )
+        if composed is None:
+            return "the take's face is too small or turned too far for the mesh", None
+        step["mask_share"] = round(float((composed["mask"] > 0.5).mean()), 4)
+        blended = composed["image"]
+        image = Image.fromarray(blended)
+        identity = similarity_to_embedding(base_embedding, image)
+        step["identity"] = None if identity is None else round(identity, 4)
+        if identity is None:
+            return "no face readable in the blend", None
+        if identity < raw_identity + MIN_GAIN:
+            return f"identity gain too small ({raw_identity:.3f} → {identity:.3f})", None
+
+        seed_bits = hamming(seed_hash, dhash_bits(blended))
+        step["seed_bits"] = seed_bits
+        if seed_bits < SEED_DHASH_BITS:
+            return f"would read as a copy of the seed (dHash {seed_bits} bits)", None
+        x0, y0, x1, y1 = composed["box"]
+        texture_raw = face_mesh.texture_corr(composed["warped"], take_rgb[y0:y1, x0:x1], composed["mask"])
+        texture_new = face_mesh.texture_corr(composed["warped"], blended[y0:y1, x0:x1], composed["mask"])
+        if texture_raw is not None and texture_new is not None:
+            step["texture_rise"] = round(texture_new - texture_raw, 3)
+            if texture_new - texture_raw > COPY_RISE_MAX:
+                return (f"would carry the seed's skin texture (texture correlation "
+                        f"+{texture_new - texture_raw:.2f})"), None
+
+        # The blend changes what the face looks like, not where its features
+        # are, but the head turn is read off landmarks found on the pixels:
+        # measure it again rather than assume it.
+        geometry = face_geometry(image)
+        if geometry is None:
+            return "no face found in the blended image", None
+        pose_yaw = result.get("pose_yaw")
+        if base_signature is not None and pose_yaw is not None:
+            signature = yaw_signature_from_landmarks(geometry[1])
+            pose_yaw = None if signature is None else yaw_between(base_signature, signature)
+            step["head_turn"] = None if pose_yaw is None else round(pose_yaw, 1)
+        try:
+            edit = measure_edit(edit_context or {}, image, levels, None, geometry=geometry)
+        except Exception as e:  # measured on the raw take; unmeasurable here is not a pass
+            return f"edit measurement failed after the blend ({e})", None
+        lighting_new = (edit or {}).get("lighting")
+        if lighting_new:
+            step["lighting"] = lighting_new["magnitude"]
+        expr_new = (edit or {}).get("expression")
+        if expr_new:
+            step["expression"] = expr_new["change"]
+        kept, lost = edit_preserved(levels, result, {"pose_yaw": pose_yaw, "environment": None, "edit": edit})
+        if not kept:
+            return f"the blend weakened the {lost}", None
+        new_misses = set(edit_misses(levels, edit)) - set(edit_misses(levels, result.get("edit")))
+        if new_misses:
+            return "the blend undid the " + ", ".join(sorted(c for c, _ in new_misses)), None
+        if (lighting_raw and lighting_new and lighting_raw.get("level") in order
+                and lighting_new.get("level") in order
+                and order.index(lighting_new["level"]) < order.index(lighting_raw["level"])):
+            return f"the blend took the lighting from {lighting_raw['level']} to {lighting_new['level']}", None
+        return None, (image, identity, edit, pose_yaw)
+
+    # Strongest first. A weaker blend gains less identity but disturbs the
+    # take's shading less, so it is the fallback when the strong one costs
+    # an edit — and pointless when the strong one did not gain enough.
+    if lighting_raw:
+        info["lighting_before"] = lighting_raw["magnitude"]
+    if expr_raw:
+        info["expression_before"] = expr_raw["change"]
+    if result.get("pose_yaw") is not None and base_signature is not None:
+        info["head_turn_before"] = round(result["pose_yaw"], 1)
+    tried: List[Dict[str, Any]] = []
+    info["tried"] = tried
+    refused: Optional[str] = None
+    kept_blend: Optional[Tuple] = None
+    for alpha in sorted(face_mesh.ALPHAS, reverse=True):
+        step: Dict[str, Any] = {"alpha": alpha}
+        tried.append(step)
+        refused, kept_blend = check(alpha, step)
+        step["reason"] = refused
+        if kept_blend is not None or (refused and refused.startswith(("identity gain", "no face", "the take's face"))):
+            break
+    if kept_blend is None:
+        last = tried[-1]
+        info["identity"], info["alpha"] = last.get("identity"), last["alpha"]
+        return done(refused)
+    image, identity, edit, pose_yaw = kept_blend
+    step = tried[-1]
+    info["identity"], info["alpha"] = round(identity, 4), step["alpha"]
+    for key in ("mask_share", "seed_bits", "texture_rise"):
+        info[key] = step.get(key)
+    info["lighting_after"] = step.get("lighting")
+    info["expression_after"] = step.get("expression")
+    info["head_turn_after"] = step.get("head_turn")
+
+    result["image"] = image
+    result["identity_similarity"] = identity
+    result["edit"] = edit
+    if base_signature is not None and result.get("pose_yaw") is not None:
+        result["pose_yaw"] = pose_yaw
+    info["applied"] = True
+    return done(None)
+
+
 def describe(info: Optional[Dict[str, Any]]) -> str:
     """Short log form: "face blend 0.712 → 0.891 (alpha 0.65)" or ""."""
     if not info or not info.get("applied"):
@@ -819,5 +999,6 @@ def describe(info: Optional[Dict[str, Any]]) -> str:
         f"face blend {info['raw_identity']:.3f} → {info['identity']:.3f} "
         f"(alpha {info['alpha']:.2f}"
         + (", features-only mask after the accessory" if info.get("first_try") else "")
+        + (", along the face mesh" if info.get("mask") == "mesh" else "")
         + ")"
     )

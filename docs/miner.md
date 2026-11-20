@@ -505,11 +505,16 @@ Environment variables:
 | `MIID_IDENTITY_RETRIES` | Extra attempts per slot that misses the identity target or a measured edit (identity rescues hold the edit back; edit retries carry a hint naming the miss). They only run on GPU time no queued first pass needs. Set `0` on a card whose first passes fill it: the time left then goes to polish, which also re-rolls the slots that missed a target (see `MIID_POLISH_ATTEMPTS`) | 3 |
 | `MIID_IDENTITY_GOAL` | Identity a slot that already meets its targets is polished toward: while no other request is queued, it is re-rolled at full edit strength and a higher-identity take is kept **only if every measured edit (head turn, lighting, expression, scene, accessory) is at least as strong as the incumbent's** — a higher-identity take is usually a weaker edit, and the validator ranks on the edit first, identity second | 0.90 |
 | `MIID_POLISH_ATTEMPTS` | Full-strength re-rolls allowed per slot (never for `screen_replay`, only on GPU time no first pass or rescue needs): the satisfied slots short of `MIID_IDENTITY_GOAL`, lowest identity first, re-rolled on their first-pass prompt so that on FLUX.2 klein they upload no weights; and, when `MIID_IDENTITY_RETRIES` is 0, before them every slot that missed a target — a new seed at full strength (never the edit held back), a hint when an edit measured short, the better take kept by the usual ranking. `0` disables polishing | 3 |
-| `MIID_FACE_BLEND` | Blend the base image's face back into a take whose identity is under `MIID_FACE_BLEND_GOAL`: the base face is warped onto the take's five MTCNN landmarks, colour-matched to the take, and blended in — over the visible face skin on background slots, with a local colour match that keeps the take's lighting on lighting slots, and over the brows, eyes and nose only on expression slots. The scene, hair, ears, headwear, lighting and mouth stay the take's own. The result is kept only if identity rose, no measured edit weakened (scene, accessory, lighting magnitude, expression), and the image is not a copy of the seed (dHash) and does not carry the seed's skin texture. Only the face's coarse structure is taken from the base (`MIID_FACE_BLEND_DETAIL_SIGMA`); the fine texture stays the take's own. Pose slots and any take whose face moved are left alone. During the first pass the blend runs in a background thread while the next slot generates. `0` disables it. See "Face blend" below | on |
+| `MIID_FACE_BLEND` | Blend the base image's face back into a take whose identity is under `MIID_FACE_BLEND_GOAL`: the base face is warped onto the take's five MTCNN landmarks, colour-matched to the take, and blended in — over the visible face skin on background slots, with a local colour match that keeps the take's lighting on lighting slots, and over the brows, eyes and nose only on expression slots. The scene, hair, ears, headwear, lighting and mouth stay the take's own. The result is kept only if identity rose, no measured edit weakened (scene, accessory, lighting magnitude, expression), and the image is not a copy of the seed (dHash) and does not carry the seed's skin texture. Only the face's coarse structure is taken from the base (`MIID_FACE_BLEND_DETAIL_SIGMA`); the fine texture stays the take's own. Combo and pose slots are blended along MediaPipe's face mesh instead, which follows a turned head and a moved mouth. During the first pass the blend runs in a background thread while the next slot generates. `0` disables it. See "Face blend" below | on |
 | `MIID_FACE_BLEND_GOAL` | Identity the blend aims for; a take already at it is left alone | 0.92 |
 | `MIID_FACE_BLEND_DETAIL_SIGMA` | Detail finer than this Gaussian sigma (pixels) stays the take's own; only coarser structure comes from the base face. Blending the base's skin texture too read as a copy-paste risk (texture correlation with the seed ≥ 0.5 in the benchmark) on 31% of background and 48% of lighting blends; at 2 px none did, for nearly the same identity gain (+0.113 against +0.120 on 48 archived background takes). `0` restores the full-texture blend | 2.0 |
 | `MIID_FACE_BLEND_MAX` | Strongest blend allowed (1.0 would paste the base face). 0.9 gained no identity over 0.8 on 80 archived takes but pulled the CLIP scene reading down twice as far; a blend that drops the wanted-scene probability by more than 0.25 is refused in any case | 0.8 |
-| `MIID_FACE_BLEND_SLOTS` | Slot types the blend applies to (pose slots cannot be blended; the lighting+expression combo lost identity on every variant and is left out) | `background_in,background_out,lighting_edit,expression_edit` |
+| `MIID_FACE_BLEND_SLOTS` | Slot types the blend applies to. The combo slots and a lone pose slot are blended along the face mesh (see `MIID_FACE_MESH_*` and "Face blend" below) | `background_in,background_out,lighting_edit,expression_edit,lighting_edit+expression_edit,lighting_edit+pose_edit,pose_edit+expression_edit,pose_edit` |
+| `MIID_FACE_MESH_EYES` | On mesh-blended slots, what of the eyes stays the take's own: `iris` (a disc 1.3× the iris — the lids, lashes and the eye's shape are blended) or `eye` (the whole eye opening). A turned head still looks at the camera, so the base's iris would land on the take's sclera | `iris` |
+| `MIID_FACE_MESH_DETAIL_SIGMA` | Around the eyes and brows of a mesh-blended slot, detail finer than this Gaussian sigma (pixels) stays the take's own. Finer than `MIID_FACE_BLEND_DETAIL_SIGMA` because the mesh lines the features up to a pixel or two | 1.0 |
+| `MIID_FACE_MESH_SKIN_SIGMA` | The same on the rest of the face (cheeks, nose, chin), so the take's pores and freckles survive; at 1 px everywhere the face read as airbrushed | 2.5 |
+| `MIID_FACE_MESH_CLIP` | Soft limit (8-bit levels) on how far a pixel moves toward the base, so glasses frames, hard shadow edges and catchlights the base does not share are kept rather than ghosted. `0` disables it | 40 |
+| `MIID_FACE_MESH_ALPHAS` | Mesh blend strengths, strongest first; a weaker one is tried only when the stronger one weakened a measured edit | `0.8,0.5` |
 | `MIID_FACE_BLEND_ACCESSORY_FLOOR` | A background blend keeps an accessory that was a match and still reads as one at this CLIP confidence or above, however far the confidence fell. CLIP's reading of a hat moves when only the face under it changes: on 12 archived takes refused for "weakened the accessory" the headwear was pixel-identical after the blend, yet confidence fell by 0.17 on average and the old 0.10-drop rule refused all of them. With the floor and the fallback mask below, 7 of the 12 blend (identity 0.71 → 0.84); the other 5 had no accessory match to begin with or stop reading as one | 0.6 |
 | `MIID_FACE_BLEND_ACCESSORY_MASK` | Mask for a second try when a background blend is refused over its accessory: only the eyes, brows, nose and mouth are always blended, the rest of the face only where it still looks like the base's skin, so headwear reaching into the temples or a hijab wrapped round the jaw stays the take's own. It moves CLIP's accessory reading half as much as the default mask for ~0.03 less identity. Empty disables the second try | `skin_features` |
 | `MIID_FACE_BLEND_MASK` | Region the base face is blended into: `skin` — the inner face (just above the brows to the chin, cheek to cheek) plus the connected skin around it that still resembles the base there (forehead below a brim, cheeks beside a hijab, jaw and chin), so fabric or a hat worn over the base's hair is never painted over; `ellipse` — the inner face only | `skin` |
@@ -582,10 +587,11 @@ matters: the grader's lighting delta on these slots is nearly always the left/ri
 step at the nose line, and a window of half an eye distance turned it into a ramp (69% of the
 magnitude kept, 2 of 18 takes passed); a fifth keeps 88% and passes 17 of 18. Expression slots
 restore only the brows, eyes and nose; the mouth, cheeks and chin keep the generated expression,
-and the CLIP expression reading must not fall. Pose slots are never blended: the face has turned,
-and the landmark fit refuses it. Nor is the lighting+expression combo: the relit, re-expressed
-face sits too far from the base, and every mask and match variant lost identity on it (−0.05 to
-−0.07 on 10 archived takes). During the first pass each blend runs in a background thread while the next slot
+and the CLIP expression reading must not fall. A turned head or a combo's re-expressed face does
+not fit the five-point transform (every mask and match variant lost identity on 10 archived
+lighting+expression takes, −0.05 to −0.07), so those slots — the three combos the validators send,
+half of every request and its lowest-identity half — are blended along the face mesh instead (see
+"Face mesh blend" below). During the first pass each blend runs in a background thread while the next slot
 generates, so the GPU does not wait for it; retries and polish blend inline. The archive records
 each blend under `variation_report[].blend` (raw and final identity, strength, mask, match, the
 lighting or expression measure before and after, or why it was declined). Measured offline on 80 archived
@@ -598,6 +604,36 @@ takes: 24 blended, identity 0.77 → 0.86 (takes at 0.85 or better from 4% to 58
 magnitude 4.1 → 3.6, three refused for weakening the lighting. On 28 expression takes: 13 blended,
 0.66 → 0.71; the rest refused because the fit was poor (the expression moved the mouth corners)
 or identity did not rise.
+
+**Face mesh blend** (`MIID/miner/face_mesh.py`). The validators' three combo slots
+(lighting+expression, lighting+pose, pose+expression) are half of every request and were its
+lowest-identity half — 0.66–0.72 on average against 0.80–0.83 for the blended background and
+screen slots (103 requests, 2026-11-19/20) — because none of them could be blended. They now are,
+along MediaPipe's 468-point face mesh: the base face is warped onto the take one mesh triangle at a
+time, so every feature of the base lands on the same feature of the take however far the head
+turned or the mouth moved. Triangles that fold over or shrink to a sliver (the far side of a turned
+face) are left out, and so is anything in the base that is not skin (hair, background at the face's
+edge). The take keeps its own irises (a turned head still looks at the camera, so the base's iris
+would land on the take's sclera), its mouth on expression slots, and its forehead above a band over
+the brows. Colour is matched locally, as on lighting slots, so the take's light and shadows stay;
+only structure is mixed in — finer than 1 px stays the take's own around the eyes and brows, finer
+than 2.5 px on the cheeks, nose and chin so pores and freckles survive — and each pixel's move
+toward the base is soft-limited to about 40 levels, which keeps a glasses frame, a hard shadow edge
+or a catchlight the base does not share instead of ghosting it. Strength 0.8, then 0.5 when 0.8
+weakens a measured edit. The guards are the five-point blend's — identity must rise by 0.02, no
+copy of the seed (dHash) or of its skin texture (on the mesh's own alignment), and the head turn
+(measured again on the blend), lighting level and expression must hold. Measured offline through
+`face_blend.apply` on 64 archived combo takes not used to tune it (2026-11-20, the takes that
+were submitted): 45 blended, identity 0.693 → 0.739 on average (+0.046, se 0.005; lighting+expression
+0.713 → 0.758, lighting+pose 0.701 → 0.740, pose+expression 0.664 → 0.717), takes at 0.7 or better
+34 → 47; the rest refused, mostly for a gain under 0.02, five for the lighting, one as too close to the
+seed. MediaPipe's own head pose, blendshape expression and the benchmark's lighting bins were unchanged
+on 33 of 36 takes in the tuning set (one better, two worse). 4–8 s per take offline with AdaFace and
+CLIP on the CPU; live, where AdaFace runs on the GPU, it runs in the judging thread like the other
+blends. Fine detail
+at 1 px everywhere gained +0.007 more but read as airbrushed skin and ghosted glasses frames. A second
+mesh pass on background takes after their five-point blend added only +0.004 (5 of 40 blended) and was
+dropped. Needs `mediapipe` in `miner_env`; without it these slots are generated as before.
 
 To compare a change against what was actually submitted, replay archived requests (miner
 stopped, GPU free) and benchmark the result:

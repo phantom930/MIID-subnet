@@ -446,6 +446,11 @@ def face_yaw_delta(base_signature, variation_image):
     signature = face_yaw_signature(variation_image)
     if signature is None:
         return None
+    return yaw_between(base_signature, signature)
+
+
+def yaw_between(base_signature, signature) -> float:
+    """Absolute head turn in degrees between two yaw signatures."""
     return abs(
         _YAW_PER_EYE_SHIFT * (signature[0] - base_signature[0])
         + _YAW_PER_MOUTH_SHIFT * (signature[1] - base_signature[1])

@@ -13,6 +13,11 @@ pytorch-lightning>=2.0.0  # required to load AdaFace .ckpt checkpoints (PyTorch 
 safetensors
 gdown
 pillow-heif>=0.13.0 # for HEIC image support
+# Face mesh for the combo-slot face blend (MIID/miner/face_mesh.py). It pulls
+# opencv-contrib-python, which installs into the same cv2/ package as
+# opencv-python: keep the two at the same version (5.0.0.93 on the reference
+# miner). Without mediapipe the combo slots are simply not blended.
+mediapipe>=0.10.14
 
 # Drand timelock encryption is provided by bittensor itself via
 # `bittensor.timelock` (backed by the `bittensor_drand` Rust extension that
