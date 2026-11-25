@@ -350,8 +350,13 @@ class Miner(BaseMinerNeuron):
             liveness_check.configure(self.wallet)
             bt.logging.info(
                 f"Screen replay: /is_live check {'on' if liveness_check.available() else 'off'} "
-                f"({liveness_check.API_URL}, one call per {liveness_check.RATE_SECONDS:.0f}s)"
+                f"({liveness_check.API_URL}, one call per {liveness_check.spacing():.0f}s)"
             )
+            # P5 C2: the owner's exact face grade (/face_grade) — each face
+            # slot's takes are graded and the best graded one ships
+            # (MIID/miner/grade_check.py). Access is probed in the background.
+            from MIID.miner import grade_check
+            grade_check.configure(self.wallet)
 
             forced_model = os.environ.get("MIID_MODEL", "").strip() or "(unset -> flux_klein)"
             inference_steps = os.environ.get("MIID_INFERENCE_STEPS", "6").strip()

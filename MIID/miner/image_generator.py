@@ -57,7 +57,7 @@ from MIID.miner.edit_check import (
     misses as edit_misses,
     preserved as edit_preserved,
 )
-from MIID.miner import face_blend, liveness_check, screen_replay
+from MIID.miner import face_blend, grade_check, liveness_check, screen_replay
 
 
 # AdaFace similarity a variation should reach before it is accepted as-is.
@@ -156,6 +156,43 @@ POSE_RANGE_DEG = POSE_TARGET_DEG
 # for new content after a flagged take, as long as no other request is
 # queued for the GPU. Three rungs and one new take need about four minutes.
 PL_WAIT_SECONDS = float(os.environ.get("MIID_PL_WAIT_SECONDS", "240"))
+
+# P5 C2: the owner's exact face grade (grade_check, POST /face_grade) is the
+# UAV score of a face — 5 only when Deepfake V1 breaks and the ask was met,
+# at most 3 when it holds, negative for a duplicate or spam. While the API
+# accepts this hotkey every face slot's takes are graded in the background
+# and the best graded take ships: one that breaks the detector over one that
+# does not, a 3 over an ungraded take, an ungraded take over a 2 or less.
+# A slot whose best take grades under GRADE_FLOOR is retried; one that holds
+# at the floor gets BREAK_POLISH_ATTEMPTS re-rolls to look for a break.
+GRADE_FLOOR = float(os.environ.get("MIID_GRADE_FLOOR", "3"))
+# Grade calls per slot per request (one per rate window, shared by the process).
+GRADES_PER_SLOT = int(os.environ.get("MIID_GRADES_PER_SLOT", "3"))
+BREAK_POLISH_ATTEMPTS = int(os.environ.get("MIID_BREAK_POLISH_ATTEMPTS", "1"))
+# Longest a request whose slots are all settled waits on face grades, while
+# no other request is queued for the GPU.
+GRADE_WAIT_SECONDS = float(os.environ.get("MIID_GRADE_WAIT_SECONDS", "300"))
+# Where an ungraded take ranks against graded ones: under a take the grader
+# scored 3 (the best a face gets while the detector holds), over a 2.
+UNGRADED_RANK = 2.5
+# A grade call takes ~10–20 s; a call that cannot come back before the
+# response is due is not made.
+GRADE_CALL_SECONDS = 25.0
+# Retry value of a slot graded under the floor, against the identity-rescue
+# odds in _IDENTITY_RETRY_ODDS: the grade is the score itself, so it ranks
+# with a near identity miss.
+GRADE_RETRY_VALUE = 0.45
+# Polish priority of a slot that holds at the floor: ahead of any identity
+# headroom (at most ~0.3), since a break is worth +0.10 reputation to a 3's +0.03.
+BREAK_POLISH_PRIORITY = 0.5
+
+
+def _grade_rank(grade: Optional[Dict[str, Any]]) -> float:
+    """Where a take ranks by its grade: the score, a break a half point up
+    (a 4 that breaks over a 4 that does not), UNGRADED_RANK when ungraded."""
+    if not grade:
+        return UNGRADED_RANK
+    return float(grade["score"]) + (0.5 if grade.get("breaks") else 0.0)
 
 
 def decode_base_image(base64_image: str) -> Image.Image:
@@ -472,6 +509,24 @@ class _Slot:
         self.pose_direction: Optional[str] = None
         self.bg_miss: Optional[str] = None
         self.edit_misses: List[Tuple[str, str]] = []
+        # Every judged take of a face slot (the screen slot keeps only its
+        # best): a graded take can overtake the best after the fact.
+        self.takes: List[Dict] = []
+        # Only while this request is graded; otherwise just the best is kept,
+        # as before, so ungraded rounds hold no extra images.
+        self.keep_takes = False
+        self.grades_asked = 0
+        self.break_polished = 0
+
+    @property
+    def grade(self) -> Optional[Dict[str, Any]]:
+        """The owner's grade of the best take, if it has one."""
+        return (self.best or {}).get("grade")
+
+    @property
+    def grade_low(self) -> bool:
+        grade = self.grade
+        return grade is not None and grade["score"] < GRADE_FLOOR
 
     @property
     def satisfied(self) -> bool:
@@ -479,7 +534,35 @@ class _Slot:
             self.best is not None and self.identity_ok
             and self.pose_miss == 0.0 and self.bg_miss is None
             and not self.edit_misses and not self.screen_flagged
+            and not self.grade_low
         )
+
+    def could_overtake(self, take: Dict) -> bool:
+        """Could a grade put this ungraded take ahead of the best? Only while
+        the best has not broken the detector (a break is the goal), and only
+        for a take that clears the identity gate as the best does."""
+        if self.best is None or take is self.best or take.get("_rejected") or take.get("grade"):
+            return False
+        best_grade = self.best.get("grade")
+        if best_grade is not None and best_grade["breaks"]:
+            return False
+        return take["_judgement"]["gate_ok"] >= self.best["_judgement"]["gate_ok"]
+
+    def grade_wanted(self, take: Dict) -> bool:
+        """Is a grade of this take still worth a call?"""
+        return (take is self.best and take.get("grade") is None) or self.could_overtake(take)
+
+    def challenger(self) -> Optional[Dict]:
+        """The ungraded take worth grading next: the best if it has no grade,
+        else the highest-ranked take that could overtake it."""
+        if self.best is None or self.screen_replay:
+            return None
+        if self.best.get("grade") is None and not self.best.get("_grade_tried"):
+            return self.best
+        options = [
+            t for t in self.takes if not t.get("_grade_tried") and self.could_overtake(t)
+        ]
+        return max(options, key=self.take_key) if options else None
 
     @property
     def screen_flagged(self) -> bool:
@@ -494,11 +577,17 @@ class _Slot:
         )
 
     def restore(self, snapshot: Tuple) -> None:
-        """Put a snapshot() back as the best take (a polish take that lost an edit)."""
+        """Put a snapshot() back as the best take (a polish take that lost an
+        edit). On a face slot the take that displaced it is set aside for
+        good, so a later grade cannot bring it back."""
+        if not self.screen_replay and self.best is not None and self.best is not snapshot[0]:
+            self.best["_rejected"] = True
         (
             self.best, self.best_key, self.identity_ok, self.gate_ok, self.pose_miss,
             self.pose_direction, self.bg_miss, self.edit_misses,
         ) = snapshot
+        if not self.screen_replay:
+            self.select()
 
     def polish_priority(
         self, goal: float, polish_allowed: int, include_unsatisfied: bool = False,
@@ -514,6 +603,18 @@ class _Slot:
         its composites are judged by /is_live, not polished for identity.
         """
         if self.best is None or self.screen_replay or self.polished >= polish_allowed:
+            return None
+        grade = self.grade
+        if grade is not None and self.satisfied:
+            # Graded at or over the floor. Holding there, a re-roll that
+            # breaks the detector is worth more than any identity headroom;
+            # an identity-only re-roll could not displace a graded take
+            # without a grade of its own, so there is none.
+            if (
+                not grade["breaks"] and self.break_polished < BREAK_POLISH_ATTEMPTS
+                and self.grades_asked < GRADES_PER_SLOT and self.challenger() is None
+            ):
+                return BREAK_POLISH_PRIORITY
             return None
         similarity = self.best["identity_similarity"]
         if not self.satisfied:
@@ -559,19 +660,54 @@ class _Slot:
         # A screen take /is_live flagged in every rung ranks below one it
         # has not (yet) flagged; for every other slot this is always True.
         screen_ok = not (result.get("screen") or {}).get("failed")
-        key = (
-            screen_ok,
-            gate_ok,
-            -penalty if gate_ok else 0.0,
-            -1.0 if similarity is None else similarity,
-        )
-        if self.best is None or key > self.best_key:
-            self.best, self.best_key = result, key
-            self.identity_ok, self.gate_ok, self.pose_miss, self.pose_direction = (
-                identity_ok, gate_ok, miss, direction,
-            )
-            self.bg_miss = bg_miss
-            self.edit_misses = misses
+        result["_judgement"] = {
+            "key": (
+                screen_ok,
+                gate_ok,
+                -penalty if gate_ok else 0.0,
+                -1.0 if similarity is None else similarity,
+            ),
+            "identity_ok": identity_ok, "gate_ok": gate_ok, "miss": miss,
+            "direction": direction, "bg_miss": bg_miss, "misses": misses,
+        }
+        if self.screen_replay:
+            key = self.take_key(result)
+            if self.best is None or key > self.best_key:
+                self._adopt(result, key)
+            return
+        if not any(t is result for t in self.takes):
+            self.takes.append(result)
+        self.select()
+
+    @staticmethod
+    def take_key(result: Dict) -> Tuple:
+        """Rank of a judged take: screen verdict, identity gate, then the
+        owner's grade (UNGRADED_RANK without one), then the measured misses
+        and similarity. Without grades every take ranks UNGRADED_RANK and
+        the order is the measured one."""
+        screen_ok, gate_ok, penalty, similarity = result["_judgement"]["key"]
+        return (screen_ok, gate_ok, _grade_rank(result.get("grade")), penalty, similarity)
+
+    def select(self) -> None:
+        """Make the highest-ranked take the best (the earliest on a tie)."""
+        if self.screen_replay:
+            return
+        live = [t for t in self.takes if not t.get("_rejected")]
+        if self.best is not None and not self.best.get("_rejected") and all(t is not self.best for t in live):
+            live.append(self.best)   # restored from a snapshot after pruning
+        if live:
+            best = max(live, key=self.take_key)
+            self._adopt(best, self.take_key(best))
+        if not self.keep_takes:
+            self.takes = [self.best] if self.best is not None else []
+
+    def _adopt(self, result: Dict, key: Tuple) -> None:
+        judgement = result["_judgement"]
+        self.best, self.best_key = result, key
+        self.identity_ok, self.gate_ok = judgement["identity_ok"], judgement["gate_ok"]
+        self.pose_miss, self.pose_direction = judgement["miss"], judgement["direction"]
+        self.bg_miss = judgement["bg_miss"]
+        self.edit_misses = judgement["misses"]
 
     def rerecord(self, result: Dict, target: float) -> None:
         """Re-judge a take whose measurements changed after it was recorded
@@ -580,6 +716,11 @@ class _Slot:
         other take is simply recorded again and wins if it now ranks higher."""
         if self.best is not result:
             self.record(result, target)
+            return
+        if not self.screen_replay:
+            misses_before = self.identity_misses
+            self.record(result, target)
+            self.identity_misses = misses_before
             return
         self.best, self.best_key = None, None
         misses_before = self.identity_misses
@@ -597,6 +738,9 @@ class _Slot:
         if self.screen_flagged and self.identity_ok:
             # New content, a new setting: the composite's verdict hangs on it.
             return BACKGROUND_RETRY_ODDS * BACKGROUND_RETRY_WEIGHT
+        if self.grade_low and self.identity_ok:
+            # The owner's grader scored the best take under the floor.
+            return GRADE_RETRY_VALUE
         if self.identity_ok and (
             self.bg_miss is not None
             or any(component == "accessory" for component, _ in self.edit_misses)
@@ -650,6 +794,8 @@ class _Slot:
         parts = []
         if self.screen_flagged:
             parts.append("/is_live called every composite a screen replay")
+        if self.grade_low:
+            parts.append(f"graded {grade_check.describe_grade(self.grade)}")
         if self.bg_miss is not None:
             parts.append(
                 f"background reads as an {self.bg_miss} scene, {self.scene} scene requested "
@@ -1008,6 +1154,88 @@ def generate_variations(
                 f"(confidence {verdict['confidence']:.3f})"
             )
 
+    # Face grades (grade_check): each face slot's best take, then any
+    # ungraded take that could overtake it, is sent to the owner's grader
+    # while the GPU carries on; the answers are applied on this thread at
+    # every decision point (pump_grades), so slots only change here.
+    grade_end = min([budget_end] + ([deadline] if deadline is not None else [])) - GRADE_CALL_SECONDS
+    grade_priority = deadline if deadline is not None else budget_end
+    grading_closed = threading.Event()
+    seed_b64: Optional[str] = None
+    if grade_check.available() and any(not s.screen_replay for s in slots):
+        try:
+            seed_b64 = grade_check.png_b64(base_image)
+        except Exception as e:  # noqa: BLE001
+            bt.logging.warning(f"Grade check: could not encode the seed ({e}); takes ship ungraded.")
+    for slot in slots:
+        slot.keep_takes = seed_b64 is not None
+    def pump_grades() -> None:
+        """Apply finished grades, then queue the next take of each settled
+        face slot that has no grade call in flight."""
+        if seed_b64 is None:
+            return
+        for slot in slots:
+            if slot.screen_replay:
+                continue
+            future = pending.get(slot.index)
+            if future is not None:
+                if not future.done():
+                    continue  # still being judged on the other thread
+                settle(slot)
+            changed = False
+            in_flight = False
+            for take in slot.takes:
+                job = take.get("_grade_job")
+                if job is None:
+                    continue
+                if not job.done.is_set():
+                    in_flight = True
+                    continue
+                take["_grade_job"] = None
+                if job.result is not None:
+                    take["grade"] = job.result
+                    changed = True
+                else:
+                    bt.logging.debug(f"{take['variation_type']}: attempt {take['winning_attempt']} not graded ({job.reason})")
+            if changed:
+                before = slot.best
+                slot.select()
+                if slot.best is not before:
+                    bt.logging.info(
+                        f"{slot.best['variation_type']}: attempt {slot.best['winning_attempt']} "
+                        f"now ranks first ({grade_check.describe_grade(slot.best.get('grade'))})"
+                    )
+            if in_flight or grading_closed.is_set() or slot.grades_asked >= GRADES_PER_SLOT:
+                continue
+            take = slot.challenger()
+            if take is None or time.time() > grade_end:
+                continue
+            req_type = canonical_variation_type(slot.req) or take["variation_type"]
+            intensity = str(
+                getattr(slot.req, "intensity", None)
+                or (slot.req.get("intensity") if isinstance(slot.req, dict) else None)
+                or "medium"
+            ).strip().lower()
+
+            def wanted(take: Dict = take, slot: _Slot = slot) -> bool:
+                return not grading_closed.is_set() and slot.grade_wanted(take)
+
+            job = grade_check.submit_face(
+                take["image"], seed_b64, req_type, intensity,
+                priority=grade_priority, latest_start=grade_end, wanted=wanted,
+                label=f"{req_type} ({intensity}) attempt {take['winning_attempt']}",
+            )
+            take["_grade_tried"] = True
+            if job is not None:
+                take["_grade_job"] = job
+                slot.grades_asked += 1
+
+    def grades_pending() -> bool:
+        return any(
+            take.get("_grade_job") is not None
+            for slot in slots for take in slot.takes
+        )
+
     def settle(slot: _Slot) -> None:
         """Wait for the slot's deferred judgement, if any. A judgement that
         failed loses that one take, not the request."""
@@ -1087,8 +1315,10 @@ def generate_variations(
             continue
         if not attempt(slot, 0.0, None, defer=True, prompt=first_prompts.get(slot.index)):
             failed.append(slot)
+        pump_grades()
     settle_all()
     judge_pool.shutdown(wait=True)
+    pump_grades()
     first_pass_seconds = time.time() - started
     if prompt_cache is not None:
         bt.logging.debug(prompt_cache.describe())
@@ -1136,18 +1366,32 @@ def generate_variations(
         return False
 
     waited_for_pl = [0.0]
+    waited_for_grades = [0.0]
 
     def wait_for_screen_verdict() -> bool:
-        """Wait two seconds for a pending verdict; False when there is none
-        to wait for, or no time or GPU to wait with."""
-        if not (screen_thread and screen_thread[0].is_alive() and screen_pending()):
-            return False
-        if waited_for_pl[0] >= PL_WAIT_SECONDS or time.time() + 2.0 > liveness_end:
+        """Wait two seconds for a pending /is_live verdict or face grade;
+        False when there is none to wait for, or no time or GPU to wait with."""
+        pump_grades()
+        screen = bool(
+            screen_thread and screen_thread[0].is_alive() and screen_pending()
+            and waited_for_pl[0] < PL_WAIT_SECONDS and time.time() + 2.0 <= liveness_end
+        )
+        grades = (
+            grades_pending() and waited_for_grades[0] < GRADE_WAIT_SECONDS
+            and time.time() + 2.0 <= grade_end
+        )
+        if not (screen or grades):
             return False
         if retry_cutoff_fn is not None and retry_cutoff_fn() is not None:
             return False
-        screen_thread[0].join(timeout=2.0)
-        waited_for_pl[0] += 2.0
+        if screen:
+            screen_thread[0].join(timeout=2.0)
+            waited_for_pl[0] += 2.0
+        else:
+            time.sleep(2.0)
+        if grades:
+            waited_for_grades[0] += 2.0
+        pump_grades()
         return True
 
     # ── phase 2: retries, most valuable first, while time allows ──
@@ -1155,6 +1399,7 @@ def generate_variations(
     stop_reason = "every slot met its targets"
     gpu_lost = False  # set when a hand-over never came back: no more GPU work
     while True:
+        pump_grades()
         candidates = [
             (priority, slot) for slot in slots
             if (priority := slot.retry_priority(attempts_allowed)) is not None
@@ -1223,6 +1468,7 @@ def generate_variations(
     polish_kept = 0
     polish_stop = "every slot at the goal or polished out"
     while polish_allowed > 0 and not gpu_lost:
+        pump_grades()
         candidates = [
             (headroom, slot) for slot in slots
             if (headroom := slot.polish_priority(goal, polish_allowed, polish_unsatisfied)) is not None
@@ -1273,6 +1519,13 @@ def generate_variations(
         incumbent_satisfied = slot.satisfied
         before = incumbent[0]["identity_similarity"]
         slot.polished += 1
+        for_break = incumbent_satisfied and slot.grade is not None and not slot.grade["breaks"]
+        if for_break:
+            slot.break_polished += 1
+            bt.logging.info(
+                f"{slot.best['variation_type']}: graded {grade_check.describe_grade(slot.grade)} "
+                "— re-rolling to look for a break."
+            )
         hints: Optional[Dict[str, str]] = None
         if incumbent_satisfied:
             # Full strength, no hints: the edit landed, only the face is being
@@ -1296,7 +1549,7 @@ def generate_variations(
             break
         polish_run += 1
         if slot.best is incumbent[0]:
-            verdict = "kept the earlier take"
+            verdict = "kept the earlier take" + (" until the new one is graded" if for_break else "")
         elif not incumbent_satisfied:
             polish_kept += 1
             verdict = "kept the new take" + ("" if slot.satisfied else f" ({slot.reason(target)})")
@@ -1322,9 +1575,13 @@ def generate_variations(
         pass
     if waited_for_pl[0]:
         bt.logging.info(f"screen_replay: waited {waited_for_pl[0]:.0f}s for /is_live")
+    if waited_for_grades[0]:
+        bt.logging.info(f"Grade check: waited {waited_for_grades[0]:.0f}s for face grades")
 
     # ── assemble, in request order ──
     screen_stop.set()
+    pump_grades()
+    grading_closed.set()   # queued grade calls for this request are dropped
     variations = []
     for slot in slots:
         with screen_lock:
@@ -1355,6 +1612,11 @@ def generate_variations(
             "blend": best.get("blend"),
             "screen": screen,
             "content_identity": best.get("content_identity"),
+            "grade": best.get("grade"),
+            "grades": [
+                {"attempt": t["winning_attempt"], **t["grade"]}
+                for t in slot.takes if t.get("grade")
+            ] or None,
         })
         best.pop("screen_images", None)
 
@@ -1373,6 +1635,7 @@ def generate_variations(
             + (f", {measured}" if measured else "")
             + (f", {blended}" if blended else "")
             + (f", {_describe_screen(screen)}" if screen else "")
+            + (f", graded {grade_check.describe_grade(best.get('grade'))}" if best.get("grade") else "")
             + (f", {slot.reason(target)}" if not slot.satisfied and slot.identity_ok else "")
             + f", kept attempt {best['winning_attempt']} of {slot.generated})"
             f", hash: {image_hash[:16]}..."

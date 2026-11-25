@@ -411,6 +411,8 @@ def upload_image_variations(
                             blend=var.get("blend"),
                             screen=var.get("screen"),
                             content_identity=var.get("content_identity"),
+                            grade=var.get("grade"),
+                            grades=var.get("grades"),
                             commitment_error=problem,
                             bytes=len(encrypted_data))
                 else:

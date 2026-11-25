@@ -681,6 +681,17 @@ python neurons/miner.py --netuid 54 --wallet.name your_wallet_name --wallet.hotk
 
 3. The miner returns signed S3 submission references to the validator.
 
+### Face grade check (Phase 5 Cycle 2)
+
+A face's UAV score is the owner's rubric (docs/scoring.md): **5** only when Deepfake V1 breaks and the ask was met, at most **3** while the detector holds, negative for a duplicate, misleading or spam image. `POST /face_grade` with the seed, the variation type and the intensity returns that exact score (`miner_api/api_white_paper.md`), so the miner asks it about its own takes before shipping (`MIID/miner/grade_check.py`):
+
+- While the GPU works on the other slots, each face slot's best take is graded, then any ungraded take that could overtake it. One worker thread per process makes every call at the server's rate (one per 60 s per hotkey), earliest request deadline first; a call that could not return before the response is due is not made.
+- The best graded take ships: one that breaks the detector over one that does not, a 3 over an ungraded take, an ungraded take over a 2 or less. A slot whose best take grades under `MIID_GRADE_FLOOR` (3) is retried at full strength; one that holds at 3 gets `MIID_BREAK_POLISH_ATTEMPTS` (1) re-roll to look for a break, and its grade decides. Identity-only polish is skipped on graded slots.
+- With every slot settled, a request waits up to `MIID_GRADE_WAIT_SECONDS` (300) for grades still in flight, but only while no other request is queued for the GPU.
+- The grade of each shipped take and of every graded attempt is in the request archive (`variation_report[].grade`, `.grades`).
+
+On 2026-11-25 the API answered `403 Unauthorized hotkey` for hotkey_0 (uid 25). A refusal switches the check off; it is asked again every `MIID_GRADE_PROBE_SECONDS` (600) with the free `/rate-limit/status` call and comes on by itself once the hotkey is allowed. Until then takes ship ungraded and the miner behaves as before. `MIID_GRADE_CHECK=0` turns it off.
+
 ### Screen Replay
 
 The sixth slot asks for the face shown on a named device (phone, tablet, laptop, monitor, tv) with two named visual cues. The subnet owner's bar (2026-10-26): it must break Passive Liveness v3 — `/is_live` must answer "not a screen replay" — while the device type and both cues stay visible and the face keeps its identity (≥ 0.7).

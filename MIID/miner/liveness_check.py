@@ -7,10 +7,11 @@
 #
 # The screen_replay slot has to break PL v3 — /is_live must call it "not a
 # screen replay" — so the miner checks its composite before submitting it
-# (image_generator). The API allows one call per hotkey per rate window (60 s
-# on 2026-10-26; the white paper still says 300): calls are serialised in
-# this process and spaced by the window, and a 429 pushes the next one back
-# by what /rate-limit/status reports.
+# (image_generator). The API allows max_requests calls per hotkey per
+# rate_limit_seconds (1 per 60 s on 2026-10-26, 5 per 60 s on 2026-11-25):
+# calls are serialised in this process and spaced by window / max_requests
+# as /rate-limit/status reports it at startup, and a 429 pushes the next one
+# back by what it reports then.
 #
 # MIID_PL_CHECK=0 switches the check off; MIID_PL_URL points elsewhere.
 
@@ -31,17 +32,29 @@ API_URL = os.environ.get("MIID_PL_URL", "http://98.90.28.118:5001").rstrip("/")
 # Seconds between calls from this hotkey, until the server says otherwise.
 RATE_SECONDS = float(os.environ.get("MIID_PL_RATE_SECONDS", "61"))
 TIMEOUT_SECONDS = 30.0
+# Never closer than this, whatever the server reports.
+MIN_SPACING_SECONDS = float(os.environ.get("MIID_PL_MIN_SPACING_SECONDS", "13"))
 
 _lock = threading.Lock()
 _keypair: Any = None
 _next_allowed = 0.0
+_spacing = RATE_SECONDS   # seconds between calls; from the server's window once synced
 _disabled_reason: Optional[str] = None
 
 
 def configure(wallet: Any) -> None:
-    """Sign calls with this wallet's hotkey (the miner calls it at startup)."""
+    """Sign calls with this wallet's hotkey (the miner calls it at startup),
+    and space them by the server's window: on 2026-11-25 /rate-limit/status
+    reported 5 requests per 60 s, so a call every ~13 s instead of every 61 s."""
     global _keypair
     _keypair = wallet.hotkey
+    if ENABLED:
+        _sync_rate_limit()
+
+
+def spacing() -> float:
+    """Seconds between calls from this hotkey."""
+    return _spacing
 
 
 def available() -> bool:
@@ -66,17 +79,22 @@ def _png_b64(image: Image.Image) -> str:
 
 
 def _sync_rate_limit() -> None:
-    """After a 429: ask the server when the next call is allowed (free)."""
-    global _next_allowed
+    """At startup and after a 429: ask the server for its window and when
+    the next call is allowed (free)."""
+    global _next_allowed, _spacing
     import requests
 
     try:
         status = requests.post(
             f"{API_URL}/rate-limit/status", json={"signature": _signature()}, timeout=TIMEOUT_SECONDS,
         ).json()
-        _next_allowed = time.time() + float(status.get("seconds_until_allowed", RATE_SECONDS)) + 1.0
+        window = float(status.get("rate_limit_seconds") or RATE_SECONDS)
+        per_window = max(1, int(status.get("max_requests") or 1))
+        _spacing = max(MIN_SPACING_SECONDS, window / per_window + 1.0)
+        if not status.get("can_request", True):
+            _next_allowed = time.time() + float(status.get("seconds_until_allowed", _spacing)) + 1.0
     except Exception:  # noqa: BLE001
-        _next_allowed = time.time() + RATE_SECONDS
+        _next_allowed = time.time() + _spacing
 
 
 def check(image: Image.Image, latest_start: Optional[float] = None) -> Optional[Dict[str, Any]]:
@@ -99,7 +117,7 @@ def check(image: Image.Image, latest_start: Optional[float] = None) -> Optional[
         if wait > 0:
             time.sleep(wait)
         started = time.time()
-        _next_allowed = started + RATE_SECONDS
+        _next_allowed = started + _spacing
         try:
             response = requests.post(
                 f"{API_URL}/is_live",
