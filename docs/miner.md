@@ -1,19 +1,29 @@
 # Yanez Miner
 
-This document explains how to run a Yanez miner on the Bittensor network. The Yanez subnet (Subnet 54) focuses on **identity-preserving face image variations** for KYC and fraud-detection research, with a **voice clone** challenge collected for UAV post-grading.
+This document explains how to run a Yanez miner on the Bittensor network. The Yanez subnet (Subnet 54) asks miners to break **deepfake detection** with face variations and **passive liveness** with screen replay, and to submit a voice clone alongside those images.
 
 ## Overview
+
+The goal is to **break two models** so the weak spots can be fixed.
+
+- **Face variations** should break **deepfake detection**. Send the image to **Face grade** (`POST /face_grade`). The response says whether Deepfake broke, and it returns the grade.
+- **Screen replay** should break **passive liveness**. Send that image to **Screen replay grade** (`POST /screen_replay_grade`). The response says whether Passive Liveness broke, and it returns the grade.
+
+Both calls are at `https://api.yanez.ai:5000`. The response is whether it broke, a score from -5 to 5, and a short comment. That score is the new rubric in [scoring](scoring.md). The validator's live grade (`/grade_v3`) uses the same score and comment. What the validator sends and gets back is the same shape as `/grade_v2`: one random face slot, not the screen replay.
+
+- **Break check:** put the picture in `miner_api/variation/`, then `python miner_api/miner_api.py`. Or skip the questions: `python miner_api/miner_api.py --face gamma`.
+- **Exact grade:** put the variation in `miner_api/variation/` and the seed in `miner_api/seed/`, then `python miner_api/exact_grade.py`. The face prompt is the variation type and intensity. The screen prompt is the cues (`--cue1` through `--cue5`). Fill in `miner_api/case.txt`, pass the flags, or leave it blank and answer the questions.
 
 Yanez miners receive **face image variation requests** from validators:
 
 - Receive a base face image and variation requirements
-- **Variation types (current):** `background_in`, `background_out`, three combined edits (`lighting_edit+expression_edit`, `lighting_edit+pose_edit`, `pose_edit+expression_edit`), and synthetic **`screen_replay`** (device named + ≥2 visual cues; iterate against Passive Liveness v3 `/is_live`)
+- **Variation types (current):** `background_in`, `background_out`, three combined edits (`lighting_edit+expression_edit`, `lighting_edit+pose_edit`, `pose_edit+expression_edit`), and synthetic **`screen_replay`** (device named + ≥2 visual cues)
 - Generate identity-preserving image variations using a diffusion model
 - Encrypt and upload results to S3
 - Return signed submission references to the validator
 
 Real IOTD / physical screen-replay is paused for this cycle (protocol fields commented out).
-Validators may also attach a **voice request** in the same round (reference WAV + target speech text). Implement `generate_voice_clone` in `MIID/miner/voice_generator.py` to submit a cloned WAV. Voice is UAV post-graded only (not part of live KAV image rewards).
+Validators also attach a **voice request** in the same round: a reference WAV, the challenge text, and **five** variation prompts. Each prompt is one of `neutral`, `surprised`, `excited`, `angry`, or `whisper`, plus a random background-noise level (`none`, `light`, or `high`). Implement `generate_voice_clone` in `MIID/miner/voice_generator.py` once per variation. Sandbox stores the clips. It does not score them. Rewards right now are KAV only.
 
 **Image generation is the KAV-scored task.** You need a GPU and the image-generation stack to earn live image rewards. Voice does not replace that path.
 
@@ -21,9 +31,9 @@ Validators may also attach a **voice request** in the same round (reference WAV 
 
 | Date | Milestone |
 |------|-----------|
-| Sep 24 – Oct 19, 2026 | Phase 5 Cycle 1 Sandbox (first official Phase 5 cycle). Calibration + stability testing. Optional voice clone challenge (UAV post-graded only) + continued face image KAV path. |
-| **Oct 19 – Nov 19, 2026** | **Phase 5 Cycle 1 Execution (current; ~1 month). Reward allocation uses validated reputation alongside the ongoing online flow. Weight split: ~50% data-gen miners / ~50% dual-incentive (UID 14) / 0% burn (~5% KAV / ~45% UAV of total). Miner rewards slightly up overall — see [scoring](scoring.md).** |
-| Nov 19 – Dec 3, 2026 | Phase 5 Cycle 2 Sandbox (calibration + stability testing). Normal KAV online flow unchanged. Same 50/50 / zero-burn allocation. |
+| Oct 19 – Nov 19, 2026 | Phase 5 Cycle 1 Execution. Reward allocation uses validated reputation alongside the ongoing online flow. Weight split: ~50% data-gen miners / ~50% dual-incentive (UID 14) / 0% burn (~5% KAV / ~45% UAV of total). |
+| **Nov 19 – Dec 3, 2026** | **Phase 5 Cycle 2 Sandbox (current). Goal: break deepfake detection and passive liveness. Five voice variations, each with a random background-noise level. No UAV rewards. See [scoring](scoring.md).** |
+| Dec 3, 2026 – Jan 3, 2027 | Phase 5 Cycle 2 Execution. Reward allocation uses validated reputation alongside the ongoing online flow. Weight split: ~50% data-gen miners / ~50% dual-incentive (UID 14) / 0% burn (~5% KAV / ~45% UAV of total). |
 
 For the full roadmap and detailed architecture, see [Yanez Identity Generation Bittensor Subnet (PDF)](Yanez%20Identity%20Generation%20Bittensor%20Subnet.pdf).
 
@@ -660,7 +670,7 @@ python neurons/miner.py --netuid 54 --wallet.name your_wallet_name --wallet.hotk
 1. The miner receives an image request containing:
    - A base face image (base64-encoded)
    - A list of variation requests, each specifying a **type** and **intensity**
-   - The schema supports multiple variation requests, but current validator runtime sends **one variation per request** and cycles sequentially
+   - The current validator sends **six** variation requests in that one image request: five face edits and one screen replay
 
 2. For each requested variation, the miner:
    - Decodes the base image
@@ -671,7 +681,7 @@ python neurons/miner.py --netuid 54 --wallet.name your_wallet_name --wallet.hotk
 
 3. The miner returns signed S3 submission references to the validator.
 
-### Screen Replay (Phase 5 Cycle 1)
+### Screen Replay
 
 The sixth slot asks for the face shown on a named device (phone, tablet, laptop, monitor, tv) with two named visual cues. The subnet owner's bar (2026-10-26): it must break Passive Liveness v3 — `/is_live` must answer "not a screen replay" — while the device type and both cues stay visible and the face keeps its identity (≥ 0.7).
 
@@ -685,35 +695,29 @@ A laptop is photographed from close up (`device_scale` 1.5, the screen wider tha
 
 The archive keeps the device, cues, each rung's identity and verdict under `variation_report[].screen`. The composites are drawn, not photographed; a reviewer sees an unmistakable device and both cues, but not a photo of a real one — a FLUX-drawn real-looking device is what `/is_live` catches.
 
-### Voice Clone (Phase 5 Cycle 1)
+### Voice (Phase 5 Cycle 2)
 
 Same round as images when the validator attaches a `voice_request`:
 
-#### Current Approach
-
-1. Validator fetches a reference WAV from the MIID API and draws target speech text (English or Spanish), e.g. `target_text = "three orange six two nine apple table one"` (also sent as `target_words` list).
-2. `MIID/miner/voice_generator.generate_voice_clone` synthesizes a WAV with the same speaker identity speaking `target_text`, using Chatterbox Multilingual (zero-shot cloning, English + Spanish). It runs **inside the miner process**, on the same GPU as the image path. Install it into `miner_env` once with `bash scripts/miner/setup_voice.sh --warmup` (see the note on packages below). Without those packages the miner simply returns no voice submission.
-3. A clip is graded twice: SpeechBrain ECAPA similarity to the reference (`speechbrain/spkrec-ecapa-voxceleb`) above **0.6**, then a reviewer listens for every target word — one missing, swapped or garbled word fails it. Up to `MIID_VOICE_ATTEMPTS` (6) takes are generated; each is scored with ECAPA and transcribed with Whisper (`MIID/miner/word_check.py`), and the kept take is the one over 0.6 that says every word, then the one with fewest word errors, then the most similar. Generation stops once a take says every word at `MIID_VOICE_IDENTITY_TARGET` (0.7). A clip below 0.6 is dropped.
-   The model is not given `target_text` as is. The prompt is wrapped in the hotkey's first and last four characters (`5 H P O … R D 8 L`), and read raw the Spanish voice ran them into words ("Hachapo", "Rebocho Locho"): Whisper heard every word in 0 of 57 archived Spanish clones and 26 of 66 English ones (2026-10-25/26). `word_check.spoken_text` names each letter in the clip's language (`cinco, hache, pe, o, …, erre, de, ocho, ele.`) with a pause between tokens — Spanish went from 0 of 4 takes to 3 of 4 on the same references — and English alternates that spelling with the raw text between takes (7 of 10 either way). The kept take's word check is in the request archive under `voice.words`.
-4. The existing encrypt → S3 → `S3Submission(variation_type="voice")` path runs and fills `voice_s3_submissions`.
-5. Voice is collected for **UAV post-grading only** (no live KAV grade for voice).
+1. Validator fetches a reference WAV and draws the challenge text (English or Spanish): **2 digit-words + 10 pool words = 12 base tokens**, then wraps the miner hotkey’s first/last 4 characters as individual tokens (20 tokens), e.g. `target_text = "5 G U P three orange book apple table door light music phone school six K V D U"` (also sent as `target_words`). Every clip speaks that same `target_text`.
+2. The request includes five `variation_requests`. The types are always `neutral`, `surprised`, `excited`, `angry`, and `whisper`. Each one has its own `noise` (`none`, `light`, or `high`), `description`, and `detail` (the style prompt plus the noise prompt).
+3. `MIID/miner/voice_generator.generate_voice_clone` is called once per variation and synthesizes a WAV with the same speaker identity speaking `target_text`, using Chatterbox Multilingual (zero-shot cloning, English + Spanish). It runs **inside the miner process**, on the same GPU as the image path. Install it into `miner_env` once with `bash scripts/miner/setup_voice.sh --warmup` (see the note on packages below). Without those packages the miner simply returns no voice submission.
+4. Each clip is scored out of 5: every token spoken, SpeechBrain ECAPA similarity to the reference (`speechbrain/spkrec-ecapa-voxceleb`) at least **0.6**, and the named style audible. The five scores are averaged into one delta (25 % of UAV once UAV is collected; the Cycle 2 Sandbox stores the clips and does not score them).
+   Up to `MIID_VOICE_ATTEMPTS` (6) takes are generated per clip; each is scored with ECAPA and transcribed with Whisper (`MIID/miner/word_check.py`) *after* its style and noise are applied, and the kept take is the one over 0.6 that says every word, then the one with fewest word errors, then the most similar. Generation stops once a take says every word at `MIID_VOICE_IDENTITY_TARGET` (0.7). A clip below 0.6 is dropped. The time left for voice is shared evenly between the clips still to come, and a clip that no longer fits before the deadline is skipped.
+   The model is not given `target_text` as is. The prompt is wrapped in the hotkey's first and last four characters (`5 H P O … R D 8 L`), and read raw the Spanish voice ran them into words ("Hachapo", "Rebocho Locho"): Whisper heard every word in 0 of 57 archived Spanish clones and 26 of 66 English ones (2026-10-25/26). `word_check.spoken_text` names each letter in the clip's language (`cinco, hache, pe, o, …, erre, de, ocho, ele.`) with a pause between tokens — Spanish went from 0 of 4 takes to 3 of 4 on the same references — and English alternates that spelling with the raw text between takes (7 of 10 either way).
+5. **Styles.** Chatterbox reads aloud whatever text it is given, so the validator's `detail` prompt is logged, not spoken. Each style is a preset (`VOICE_STYLES`): Chatterbox's `exaggeration` (neutral 0.5, surprised 0.8, excited 1.0, angry 1.2, whisper 0.3), a lower `cfg_weight` for the expressive ones, and the prompt's closing punctuation (`?!` surprised, `!` excited and angry). A whisper is rendered from a calm take: each frame's spectral envelope over noise, blended with the voiced take and played quiet. A full whisper loses the speaker (ECAPA 0.80 → 0.39 on 12 archived clones, 2026-11-25), so the strongest blend from 50 % down to 20 % breath that keeps ECAPA at 0.7 is used (30 % kept 0.73 on average).
+6. **Background noise** is mixed into each take after its style: pink noise for `light` (20 dB under the speech), pink over brown (a busy room, traffic, wind) for `high` (10 dB). On the same clones `light` cost 0.05 ECAPA on average and `high` 0.10 (down to 0.59), so the level backs off (`light` 26 dB; `high` 14, then 18 dB) when the clip would drop under 0.7.
+7. The clips are encrypted in turn and uploaded to S3 in parallel; each `S3Submission` carries its style as `variation_type` (`neutral`, `surprised`, `excited`, `angry`, `whisper`). A validator that sends no `variation_requests` gets one plain clip with `variation_type="voice"`, as in Cycle 1. Each clip's style, noise, similarity, word check and what was applied is in the request archive under `voice.clips`.
 
 The models take roughly 3 GB of VRAM while a voice request is being served. Afterwards they are parked in CPU memory (about 3 GB of RAM) so the VRAM is free for the next round's image generation, and moved back in about a second when the next voice request arrives. At startup the miner loads them into CPU memory in the background (`MIID_VOICE_PRELOAD=0` to load on first use instead). Set `MIID_VOICE_KEEP_LOADED=1` to keep them on the GPU between rounds, or `MIID_VOICE_DEVICE=cpu` to keep voice off the GPU entirely (slower; a CUDA out-of-memory also falls back to the CPU on its own). Smoke-test the stack with:
 
 ```bash
-python -m MIID.miner.voice_generator --reference some_voice.wav --text "three orange six two nine" --language en --out clone.wav
+python -m MIID.miner.voice_generator --reference some_voice.wav --text "three orange six two nine" --language en --style whisper --noise high --out clone.wav
 ```
 
 **About the packages.** `chatterbox-tts` publishes pins (`torch==2.6`, `transformers==5.2`, `diffusers==0.29`, `numpy<2`) that would downgrade and break the FLUX image stack, so `setup_voice.sh` installs it with `--no-deps` and takes its real runtime dependencies from `requirements-voice.txt`. The combination was verified on torch 2.14 / transformers 5.19 / diffusers 0.41. `pip check` will keep listing those pins as conflicts; that is expected.
 
-#### Updated Approach from `main` branch
-
-1. Validator fetches a reference WAV from the MIID API and draws target speech text (English or Spanish): **2 digit-words + 10 pool words = 12 base tokens**, then wraps the miner hotkey’s first/last 4 characters as individual tokens (20 personalized tokens), e.g. `target_text = "5 G U P three orange book apple table door light music phone school six K V D U"` (also sent as `target_words` list). Clip length is not fixed — speak the prompt naturally.
-2. Implement `MIID/miner/voice_generator.generate_voice_clone` to synthesize a WAV with the same speaker identity speaking `target_text`.
-3. The existing encrypt → S3 → `S3Submission(variation_type="voice")` path runs and fills `voice_s3_submissions`.
-4. Voice is collected for **UAV post-grading only** (no live KAV grade for voice).
-
-**Variation types and intensities (Cycle 2):**
+**Face variation types and intensities.** The goal of these edits is to break **deepfake detection**. Face grade says whether Deepfake broke and what the grade is.
 
 | Type | Light | Medium | Far |
 |------|-------|--------|-----|
@@ -722,7 +726,7 @@ python -m MIID.miner.voice_generator --reference some_voice.wav --text "three or
 | **Lighting edit** | Subtle brightness/contrast change | Directional light, noticeable shadows | Strong shadows, dramatic contrast |
 | **Background edit** | Color shift, blur adjustment | Different environment type | Dramatic/contrasting environment |
 
-**Screen replay (Cycle 2 only):** Simulate the face as shown on a device screen (e.g. photo on phone/tablet/laptop/monitor/TV). At least **two** of these visual cues must be clearly visible: moiré/pixel grid, screen glare hotspots, perspective/keystone distortion, gamma or contrast shift typical of display capture, or edge/crop cues (screen borders, bezel reflections).
+**Screen replay:** The goal is to break **passive liveness**. Simulate the face as shown on a device screen (e.g. photo on phone/tablet/laptop/monitor/TV). At least **two** of these visual cues must be clearly visible: moiré/pixel grid, screen glare hotspots, perspective/keystone distortion, gamma or contrast shift typical of display capture, or edge/crop cues (screen borders, bezel reflections). Screen replay grade says whether Passive Liveness broke and what the grade is.
 
 Validators may also request **accessories** on background edits (head coverings, hats, etc.).
 
@@ -766,8 +770,6 @@ These are already wired in code and can be enabled by setting `MIID_MODEL`:
 
 ## Reward System
 
-**Validators score miners exclusively on face image variation quality.** There is no separate reward path for name, DOB, or address variations.
-
 You can view your live scores and cycle rewards on the [Yanez Dashboard & Leaderboard](https://tao-ui-dashboard.yanez.ai/).
 
 ### How Rewards Are Calculated
@@ -778,7 +780,7 @@ Each validation round:
 3. Submissions go through automated pre-checks, identity preservation checks, and manual validation
 4. Validators set weights based on image variation scores
 
-**Important:** Phase 5 Cycle 1 Sandbox ran **Sep 24 – Oct 19, 2026** (optional voice clone for UAV post-grading + continued face image KAV path). Cycle 1 Execution is live **Oct 19 – Nov 19, 2026**. Phase 5 Cycle 2 Sandbox follows **Nov 19 – Dec 3, 2026**.
+**Important:** Phase 5 Cycle 2 Sandbox is current (Nov 19 – Dec 3, 2026). Cycle 2 Execution follows from Dec 3, 2026 through Jan 3, 2027. The goal is to break deepfake detection and passive liveness. Face grade and Screen replay grade say whether an image broke and what the grade is. See [scoring](scoring.md).
 
 ### Face Variation Scoring
 

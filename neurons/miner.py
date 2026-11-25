@@ -84,6 +84,7 @@ import typing
 import base64
 import bittensor as bt
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
@@ -213,19 +214,24 @@ except ImportError as _phase4_err:
 
 # Time a response needs after generation ends, taken off the validator's
 # deadline before generation is given its share: encrypt + S3 upload per image
-# (~3 s, plus room for upload retries), the voice clone when one is requested
-# (~44 s measured), and a margin for clock skew and the response itself.
+# (~3 s, plus room for upload retries), the voice clips when they are
+# requested, and a margin for clock skew and the response itself.
 UPLOAD_SECONDS_PER_SLOT = 4.0
-VOICE_RESERVE_SECONDS = 60.0
-# The clone itself, the only part of the voice work that needs the GPU
-# (~11 s measured on 2026-10-14, before the word check added a Whisper pass
-# and up to six takes); the rest of the reserve is upload and margin.
-VOICE_GPU_SECONDS = 25.0
-# What the voice upload needs after the last take (encrypt + S3, measured ~3 s).
-VOICE_UPLOAD_SECONDS = 8.0
-# Latest the clone may start: it plus its own upload have to end before the
-# image uploads and the margin. VOICE_RESERVE_SECONDS keeps room for it while
-# generation runs; this is the tighter figure the clone itself is held to.
+# Voice asks for five clips a round since P5 C2 (one per style; a validator
+# from before sends none and gets one plain clip). The clone is the only part
+# of the voice work that needs the GPU: one take with its word check was
+# 7.4–9.2 s on 2026-11-25. Retakes run only in the time left over.
+VOICE_GPU_SECONDS_PER_CLIP = 9.0
+# Held back from image generation per clip: its first take and a retake.
+VOICE_RESERVE_SECONDS_PER_CLIP = 12.0
+# What the voice upload needs after the last take: encrypt, then the clips'
+# S3 PUTs in parallel (one PUT took 2–8 s on 2026-11-25).
+VOICE_UPLOAD_SECONDS = 10.0
+# Latest the voice work may start: the models' move to the GPU, the first
+# clip and the upload have to end before the image uploads and the margin.
+# The per-clip reserve keeps room for every clip while generation runs; this
+# is the tighter figure the start is held to, and clips that no longer fit
+# are skipped (clone_voice_request).
 VOICE_LATE_SECONDS = 35.0
 DEADLINE_MARGIN_SECONDS = float(os.environ.get("MIID_DEADLINE_MARGIN_SECONDS", "30"))
 
@@ -535,18 +541,28 @@ class Miner(BaseMinerNeuron):
         """Seconds the response needs after image generation ends."""
         slots = len(getattr(synapse.image_request, "variation_requests", None) or []) \
             if synapse.image_request is not None else 0
-        voice = VOICE_RESERVE_SECONDS if synapse.voice_request is not None else 0.0
+        voice = (
+            self._voice_clip_count(synapse) * VOICE_RESERVE_SECONDS_PER_CLIP + VOICE_UPLOAD_SECONDS
+            if synapse.voice_request is not None else 0.0
+        )
         return slots * UPLOAD_SECONDS_PER_SLOT + voice + DEADLINE_MARGIN_SECONDS
 
+    @staticmethod
+    def _voice_clip_count(synapse: IdentitySynapse) -> int:
+        """Voice clips this request asks for (one per variation, or one plain clip)."""
+        if synapse.voice_request is None:
+            return 0
+        return max(1, len(getattr(synapse.voice_request, "variation_requests", None) or []))
+
     def _workload_estimate(self, synapse: IdentitySynapse) -> float:
-        """Minimum GPU time this request needs: one attempt per slot, plus the voice clone.
+        """Minimum GPU time this request needs: one attempt per slot, plus one take per voice clip.
 
         Encryption and upload run after the GPU has been handed back, so they
         are not part of what the queue waits for.
         """
         slots = len(getattr(synapse.image_request, "variation_requests", None) or []) \
             if synapse.image_request is not None else 0
-        voice = VOICE_GPU_SECONDS if synapse.voice_request is not None else 0.0
+        voice = self._voice_clip_count(synapse) * VOICE_GPU_SECONDS_PER_CLIP
         return slots * cycle_estimate() + voice
 
     def _forward_on_gpu(
@@ -640,7 +656,7 @@ class Miner(BaseMinerNeuron):
         outcome = None
         voice_summary = None
         batch = None       # generated variations, uploaded once the GPU is released
-        voice_clip = None  # (base_wav, clone_wav), likewise
+        voice_clips: List[Tuple[str, bytes]] = []  # (variation_type, clone_wav), likewise
 
         # --- Image path (unchanged when image_request present) ---
         if synapse.image_request is not None:
@@ -702,18 +718,24 @@ class Miner(BaseMinerNeuron):
         else:
             outcome = "no_image_request"
 
-        # --- Voice clone: the last thing that needs the GPU ---
+        # --- Voice clones: the last thing that needs the GPU ---
         if synapse.voice_request is not None:
+            voice_variations = [
+                f"{v.type}({v.noise})"
+                for v in synapse.voice_request.variation_requests or []
+            ]
             bt.logging.info(
                 f"Received voice request: file='{synapse.voice_request.voice_filename}', "
                 f"lang={synapse.voice_request.language}, "
-                f"text={synapse.voice_request.target_text!r}"
+                f"text={synapse.voice_request.target_text!r}, "
+                f"variations=[{', '.join(voice_variations)}]"
             )
             voice_summary = {
                 "voice_filename": synapse.voice_request.voice_filename,
                 "language": synapse.voice_request.language,
                 "target_text": synapse.voice_request.target_text,
                 "challenge_id": synapse.voice_request.challenge_id,
+                "variations": voice_variations,
             }
             # The image uploads still have to fit in after the clone.
             upload_reserve = (
@@ -747,17 +769,19 @@ class Miner(BaseMinerNeuron):
             else:
                 free_gpu_models()  # the image weights make room for the voice models
                 voice_started = time.time()
+                voice_summary["clips"] = []
                 try:
-                    voice_clip = self.clone_voice_request(
+                    voice_clips = self.clone_voice_request(
                         synapse, save_dir=self._archive_voice_dir(record),
                         deadline=deadline - upload_reserve - VOICE_UPLOAD_SECONDS,
+                        clips_report=voice_summary["clips"],
                     )
-                    voice_summary["outcome"] = "generated" if voice_clip else "empty"
-                    if not voice_clip:
+                    voice_summary["outcome"] = "generated" if voice_clips else "empty"
+                    if not voice_clips:
                         bt.logging.info("Voice: no submission this round.")
                 except Exception as e:
                     bt.logging.error(f"Voice: Failed to clone the voice: {e}")
-                    voice_clip = None
+                    voice_clips = []
                     voice_summary["outcome"] = "error"
                     voice_summary["error"] = f"{type(e).__name__}: {e}"
                 finally:
@@ -765,8 +789,6 @@ class Miner(BaseMinerNeuron):
                     # free for the next round's FLUX run, unless
                     # MIID_VOICE_KEEP_LOADED is set.
                     release_voice_worker()
-                voice_summary["similarity"] = _voice_generator.last_similarity
-                voice_summary["words"] = _voice_generator.last_words
                 voice_summary["seconds"] = round(time.time() - voice_started, 2)
 
         # --- Nothing below needs the GPU: hand it to the next request ---
@@ -787,9 +809,9 @@ class Miner(BaseMinerNeuron):
                 s3_submissions = []
             synapse.s3_submissions = s3_submissions
 
-        if voice_clip is not None and voice_summary is not None:
+        if voice_clips and voice_summary is not None:
             try:
-                voice_subs = self.upload_voice_clone(synapse, voice_clip)
+                voice_subs = self.upload_voice_clone(synapse, voice_clips)
                 if voice_subs:
                     bt.logging.info(f"Voice: Generated {len(voice_subs)} S3 submissions")
                 else:
@@ -1058,154 +1080,208 @@ class Miner(BaseMinerNeuron):
 
     def clone_voice_request(
         self, synapse: IdentitySynapse, save_dir: Optional[str] = None,
-        deadline: Optional[float] = None,
-    ) -> Optional[Tuple[bytes, bytes]]:
-        """The GPU half of a voice request: decode, clone, check the speaker.
+        deadline: Optional[float] = None, clips_report: Optional[List[dict]] = None,
+    ) -> List[Tuple[str, bytes]]:
+        """The GPU half of a voice request: decode, then clone and check the
+        speaker once per requested variation.
 
-        Returns ``(base_wav, clone_wav)`` for upload_voice_clone, or None when
-        there is nothing to submit. The clone and the SpeechBrain check are
-        the only parts that need the GPU; the live miner hands it back before
-        encrypting and uploading.
+        Returns ``[(variation_type, clone_wav), ...]`` for upload_voice_clone,
+        one per clip worth submitting (empty when there is none). The clones
+        and the SpeechBrain checks are the only parts that need the GPU; the
+        live miner hands it back before encrypting and uploading.
 
         Args:
             synapse: IdentitySynapse with voice_request
             save_dir: Optional directory for the unencrypted reference and
-                clone WAVs (set only when MIID_ARCHIVE_IMAGES is on). The clone
-                is written as soon as it is generated, so a clip that is then
-                dropped by the identity check or fails to upload is still
+                clone WAVs (set only when MIID_ARCHIVE_IMAGES is on). Each
+                clone is written as soon as it is generated, so a clip that is
+                then dropped by the identity check or fails to upload is still
                 there to listen to.
-            deadline: Wall-clock time the last take must end by (see
-                generate_voice_clone).
+            deadline: Wall-clock time the last clip's last take must end by.
+                A clip that could not make it is skipped, and the time left is
+                shared evenly between the clips still to come, so retakes on
+                the first ones cannot cost the last ones their turn.
+            clips_report: Optional list that receives one summary per
+                requested clip (for the request archive).
         """
         voice_request = synapse.voice_request
-        if not voice_request:
-            return None
-
-        if not VOICE_AVAILABLE:
-            return None
+        if not voice_request or not VOICE_AVAILABLE:
+            return []
 
         try:
             bt.logging.info(f"Voice: Decoding base voice: {voice_request.voice_filename}")
             base_wav = decode_base_voice(voice_request.base_voice)
-            self._archive_voice_clip(
-                save_dir,
-                f"voice_reference__{voice_request.voice_filename or 'reference.wav'}",
-                base_wav,
-            )
+        except Exception as e:
+            bt.logging.error(f"Voice: could not decode the reference: {e}")
+            return []
+        self._archive_voice_clip(
+            save_dir,
+            f"voice_reference__{voice_request.voice_filename or 'reference.wav'}",
+            base_wav,
+        )
 
-            generated_wav = generate_voice_clone(
-                base_wav_bytes=base_wav,
-                target_words=list(voice_request.target_words or []),
-                language=voice_request.language or "en",
-                target_text=getattr(voice_request, "target_text", "") or "",
-                deadline=deadline,
+        # A validator from before P5 C2 sends no variations: one plain clip.
+        variations = list(getattr(voice_request, "variation_requests", None) or []) or [None]
+        clips: List[Tuple[str, bytes]] = []
+        for index, variation in enumerate(variations):
+            variation_type = getattr(variation, "type", None) or "voice"
+            noise = getattr(variation, "noise", "") or ""
+            entry = {"type": variation_type, "noise": noise}
+            if clips_report is not None:
+                clips_report.append(entry)
+
+            now = time.time()
+            if deadline is not None and index > 0 and now + VOICE_GPU_SECONDS_PER_CLIP > deadline:
+                bt.logging.warning(
+                    f"Voice: {variation_type} skipped, only {deadline - now:.0f}s left for voice."
+                )
+                entry["outcome"] = "skipped_deadline"
+                continue
+            clip_deadline = (
+                None if deadline is None else now + (deadline - now) / (len(variations) - index)
+            )
+            try:
+                generated_wav = generate_voice_clone(
+                    base_wav_bytes=base_wav,
+                    target_words=list(voice_request.target_words or []),
+                    language=voice_request.language or "en",
+                    target_text=getattr(voice_request, "target_text", "") or "",
+                    variation_type=variation_type,
+                    noise=noise,
+                    variation_detail=getattr(variation, "detail", "") or "",
+                    deadline=clip_deadline,
+                )
+            except Exception as e:
+                bt.logging.error(f"Voice: {variation_type} clone failed: {e}")
+                entry.update(outcome="error", error=f"{type(e).__name__}: {e}")
+                continue
+            entry.update(
+                similarity=_voice_generator.last_similarity,
+                words=_voice_generator.last_words,
+                render=_voice_generator.last_render,
+                seconds=round(time.time() - now, 2),
             )
             if not generated_wav:
-                bt.logging.info(
-                    "Voice: generate_voice_clone returned None — no voice submission"
-                )
-                return None
-            self._archive_voice_clip(save_dir, "voice_clone.wav", generated_wav)
+                bt.logging.info(f"Voice: generate_voice_clone returned None for {variation_type}")
+                entry["outcome"] = "empty"
+                continue
+            self._archive_voice_clip(save_dir, f"voice_clone_{variation_type}.wav", generated_wav)
 
             if not validate_voice_identity(
                 base_wav, generated_wav, min_similarity=VOICE_MIN_SIMILARITY,
             ):
-                bt.logging.warning("Voice: Skipping — speaker identity not preserved")
-                return None
-            return base_wav, generated_wav
-
-        except Exception as e:
-            bt.logging.error(f"Voice: Error in clone_voice_request: {e}")
-            return None
+                bt.logging.warning(
+                    f"Voice: Skipping {variation_type} — speaker identity not preserved"
+                )
+                entry["outcome"] = "identity_failed"
+                continue
+            entry["outcome"] = "generated"
+            clips.append((variation_type, generated_wav))
+        return clips
 
     def upload_voice_clone(
-        self, synapse: IdentitySynapse, clip: Optional[Tuple[bytes, bytes]],
+        self, synapse: IdentitySynapse, clips: Optional[List[Tuple[str, bytes]]],
     ) -> List[S3Submission]:
-        """The CPU half: sign, encrypt and upload a clone from clone_voice_request.
+        """The CPU half: sign, encrypt and upload the clones from clone_voice_request.
+
+        The clips are signed and encrypted in turn and uploaded in parallel
+        (one PUT takes 2–8 s).
 
         Returns:
-            List of S3Submission objects (variation_type="voice")
+            List of S3Submission objects, one per uploaded clip, with
+            variation_type set to the clip's style.
         """
         voice_request = synapse.voice_request
-        if not voice_request or not clip:
+        if not voice_request or not clips:
             return []
-        _, generated_wav = clip
 
-        try:
-            voice_hash = hash_voice_bytes(generated_wav)
-            challenge_id = voice_request.challenge_id or "sandbox_test"
-            target_round = voice_request.target_drand_round
+        challenge_id = voice_request.challenge_id or "sandbox_test"
+        target_round = voice_request.target_drand_round
+        hotkey = self.wallet.hotkey.ss58_address
+        path_message = f"{challenge_id}:{hotkey}"
+        path_signature = self.wallet.hotkey.sign(path_message.encode()).hex()[:16]
 
-            path_message = f"{challenge_id}:{self.wallet.hotkey.ss58_address}"
-            path_signature = self.wallet.hotkey.sign(path_message.encode()).hex()[:16]
+        seed_name = voice_request.voice_filename
+        for ext in (".wav", ".mp3", ".flac", ".ogg"):
+            if seed_name.lower().endswith(ext):
+                seed_name = seed_name[: -len(ext)]
+                break
 
-            message = f"challenge:{challenge_id}:hash:{voice_hash}"
-            signature = self.wallet.hotkey.sign(message.encode()).hex()
-
-            if is_timelock_available():
-                encrypted_data = encrypt_image_for_drand(generated_wav, target_round)
-                if encrypted_data is None:
-                    bt.logging.warning("Voice: Encryption failed")
-                    return []
-            else:
-                bt.logging.warning("Voice: Timelock not available, using raw bytes (SANDBOX ONLY)")
-                encrypted_data = generated_wav
-
-            seed_name = voice_request.voice_filename
-            for ext in (".wav", ".mp3", ".flac", ".ogg"):
-                if seed_name.lower().endswith(ext):
-                    seed_name = seed_name[: -len(ext)]
-                    break
-
-            s3_key = upload_to_s3(
-                encrypted_data=encrypted_data,
-                miner_hotkey=self.wallet.hotkey.ss58_address,
-                signature=signature,
-                image_hash=voice_hash,
-                target_round=target_round,
-                challenge_id=challenge_id,
-                variation_type="voice",
-                path_signature=path_signature,
-                seed_image_name=seed_name,
-                source_ext=".wav",
-            )
-
-            if not s3_key:
-                bt.logging.warning("Voice: S3 upload failed")
-                return []
-
-            submission = S3Submission(
-                s3_key=s3_key,
-                image_hash=voice_hash,
-                signature=signature,
-                variation_type="voice",
-                path_signature=path_signature,
-            )
-            problem = commitment_error(
-                challenge_id, self.wallet.hotkey.ss58_address, submission, generated_wav
-            )
-            if problem:
-                bt.logging.error(
-                    f"Voice: submission fails the validator's commitment check ({problem}); "
-                    f"validators will mark it invalid"
+        prepared = []
+        for variation_type, generated_wav in clips:
+            try:
+                voice_hash = hash_voice_bytes(generated_wav)
+                message = f"challenge:{challenge_id}:hash:{voice_hash}"
+                signature = self.wallet.hotkey.sign(message.encode()).hex()
+                if is_timelock_available():
+                    encrypted_data = encrypt_image_for_drand(generated_wav, target_round)
+                    if encrypted_data is None:
+                        bt.logging.warning(f"Voice: Encryption failed for {variation_type}")
+                        continue
+                else:
+                    bt.logging.warning(
+                        "Voice: Timelock not available, using raw bytes (SANDBOX ONLY)"
+                    )
+                    encrypted_data = generated_wav
+                prepared.append(
+                    (variation_type, generated_wav, voice_hash, signature, encrypted_data)
                 )
-            bt.logging.info(f"Voice: Created submission s3_key={s3_key}")
-            return [submission]
+            except Exception as e:
+                bt.logging.error(f"Voice: could not prepare {variation_type} for upload: {e}")
 
-        except Exception as e:
-            bt.logging.error(f"Voice: Error in upload_voice_clone: {e}")
+        def upload(item) -> Optional[S3Submission]:
+            variation_type, generated_wav, voice_hash, signature, encrypted_data = item
+            try:
+                s3_key = upload_to_s3(
+                    encrypted_data=encrypted_data,
+                    miner_hotkey=hotkey,
+                    signature=signature,
+                    image_hash=voice_hash,
+                    target_round=target_round,
+                    challenge_id=challenge_id,
+                    variation_type=variation_type,
+                    path_signature=path_signature,
+                    seed_image_name=seed_name,
+                    source_ext=".wav",
+                )
+                if not s3_key:
+                    bt.logging.warning(f"Voice: S3 upload failed for {variation_type}")
+                    return None
+                submission = S3Submission(
+                    s3_key=s3_key,
+                    image_hash=voice_hash,
+                    signature=signature,
+                    variation_type=variation_type,
+                    path_signature=path_signature,
+                )
+                problem = commitment_error(challenge_id, hotkey, submission, generated_wav)
+                if problem:
+                    bt.logging.error(
+                        f"Voice: {variation_type} submission fails the validator's commitment "
+                        f"check ({problem}); validators will mark it invalid"
+                    )
+                bt.logging.info(f"Voice: Created {variation_type} submission s3_key={s3_key}")
+                return submission
+            except Exception as e:
+                bt.logging.error(f"Voice: Error uploading {variation_type}: {e}")
+                return None
+
+        if not prepared:
             return []
+        with ThreadPoolExecutor(max_workers=len(prepared), thread_name_prefix="voice-upload") as pool:
+            return [s for s in pool.map(upload, prepared) if s is not None]
 
     def process_voice_request(
         self, synapse: IdentitySynapse, save_dir: Optional[str] = None,
     ) -> List[S3Submission]:
         """Process a voice clone request end-to-end.
 
-        Decodes the reference WAV, generates a clone speaking target_words,
-        checks speaker identity with SpeechBrain when available, encrypts with
-        drand, uploads to S3, and returns S3Submission refs. The live miner
-        runs the two halves itself (clone_voice_request while it holds the
-        GPU, upload_voice_clone after); this is the same sequence in one call.
+        Decodes the reference WAV, generates one clone per requested
+        variation speaking target_words, checks speaker identity with
+        SpeechBrain when available, encrypts with drand, uploads to S3, and
+        returns S3Submission refs. The live miner runs the two halves itself
+        (clone_voice_request while it holds the GPU, upload_voice_clone
+        after); this is the same sequence in one call.
         """
         return self.upload_voice_clone(
             synapse, self.clone_voice_request(synapse, save_dir=save_dir),

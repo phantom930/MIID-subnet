@@ -188,14 +188,16 @@ On mainnet, local `validator_results` JSON is deleted after a successful upload 
    5. Combined: pose + expression
    6. `screen_replay` (device named + ≥2 visual cues; FLUX synthetic; PL v3)
 4. Attach a **drand target round** / reveal timestamp (~T+40 minutes)
-5. Wrap into an `IdentitySynapse` with an `ImageRequest` (base image + variation requests + challenge ID)
+5. Fetch a reference WAV and attach five voice variations (`neutral`, `surprised`, `excited`, `angry`, `whisper`). Each clip gets a random background-noise level (`none`, `light`, or `high`). Every clip speaks the same challenge text, with that miner’s hotkey bookends.
+6. Wrap into an `IdentitySynapse` with an `ImageRequest` and a `VoiceRequest`. The results payload cycle id is `Phase5-C2-Sandbox`.
 
-Synthetic face slots expect professional passport-style portraits (3:4, head-and-shoulders; recommended ~1015×1350). The `screen_replay` slot uses its own device/cue instructions instead. Fixed IOTD seeds and real physical screen-replay are paused.
+Synthetic face slots expect professional passport-style portraits (3:4, head-and-shoulders; recommended ~1015×1350). The `screen_replay` slot uses its own device/cue instructions instead. Fixed IOTD seeds and real physical screen-replay are paused. Voice prompts live in `MIID/validator/voice_variations.py`.
+
 ### Miner querying
 
 1. Query miners in batches of `batch_size`
 2. Retry failed connections (up to 3 attempts); if ≤50 miners fail, assign empty default responses instead of retrying
-3. Collect `s3_submissions` (S3 key, image hash, signatures, variation type)
+3. Collect `s3_submissions` (S3 key, image hash, signatures, variation type) and `voice_s3_submissions` (one per voice variation)
 
 Miners encrypt outputs until the drand round unlocks; the validator only stores submission metadata until grading time.
 
@@ -251,12 +253,12 @@ Relevant modules:
 
 ### Validator data API configuration
 
-Set `MIID_VALIDATOR_API_URL` to the HTTPS origin for validator uploads, images, and
-voice. Deploy matching client and server versions together. The API accepts the
-new request proof format only. The proxy must forward the original request path
-without rewriting it and must preserve the proof header and exact body bytes.
-For separate environments, set a distinct `MIID_VALIDATOR_AUDIENCE` on both the
-client and server.
+Default API origin is `https://api.yanez.ai:5000`. Override with
+`MIID_VALIDATOR_API_URL` if needed. Deploy matching client and server versions
+together. The API accepts the new request proof format only. The proxy must
+forward the original request path without rewriting it and must preserve the
+proof header and exact body bytes. For separate environments, set a distinct
+`MIID_VALIDATOR_AUDIENCE` on both the client and server.
 
 Keep the Gunicorn listener on a private interface behind the TLS proxy. All
 Gunicorn workers must share the same writable local `DATA_DIR` for nonce storage.
@@ -265,6 +267,9 @@ the new verifier across replicas.
 
 ### Grading service configuration
 
-Set `MIID_GRADING_API_URL` to the grading service's HTTPS base URL. Both job
-submission and polling reject redirects, and completed results must match the
-requested challenge. Configure TLS ingress before deploying the validator.
+Default grading origin is also `https://api.yanez.ai:5000` (this host proxies
+`/grade_v3` and `/grade_results` to the grading server). Override with
+`MIID_GRADING_API_URL` if needed. `/grade_v3` has the same request and the
+same polled result as `/grade_v2`. The score and comment use the new face
+rubric. Both job submission and polling reject redirects, and completed
+results must match the requested challenge.
