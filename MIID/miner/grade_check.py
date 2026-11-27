@@ -28,6 +28,7 @@ import heapq
 import io
 import itertools
 import os
+import re
 import threading
 import time
 from datetime import datetime
@@ -334,6 +335,29 @@ def _call(job: Job) -> None:
         _set_access(True, "a grade came back")
     bt.logging.info(f"Grade check: {job.label} — {describe_grade(result)}")
     job.finish(result)
+
+
+# What the grader's comment names as the failure, turned into the prompt hint
+# that answers it (generate_variations.BACKGROUND_HINTS / FRAMING_HINTS).
+# 2026-11-26/27: every background_out 0 it gave us read "Score 0. Background
+# environment mismatch: expected outdoor, CLIP classified indoor." (41% of 139
+# graded attempts, 62% of light ones), and the -1s on far backgrounds "Face
+# not dominant (face_ratio=0.0946, threshold=0.10)".
+_ENVIRONMENT_MISMATCH = re.compile(r"expected (indoor|outdoor), CLIP classified (indoor|outdoor)")
+
+
+def hints(grade: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Prompt hints, by component, for the failure a grade's comment names:
+    ``background`` = the environment the grader's CLIP saw ("indoor" /
+    "outdoor"), ``framing`` = "closer" when the face was too small."""
+    comment = (grade or {}).get("comment") or ""
+    found: Dict[str, str] = {}
+    mismatch = _ENVIRONMENT_MISMATCH.search(comment)
+    if mismatch and mismatch.group(1) != mismatch.group(2):
+        found["background"] = mismatch.group(2)
+    if "face not dominant" in comment.lower():
+        found["framing"] = "closer"
+    return found
 
 
 def describe_grade(grade: Optional[Dict[str, Any]]) -> str:

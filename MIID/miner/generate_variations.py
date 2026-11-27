@@ -518,25 +518,40 @@ EDIT_PHRASES: Dict[Tuple[str, str], str] = {
         "Place the subject in a different but plausible indoor setting: "
         "{scene}. Entirely indoors, with the room clearly visible behind them."
     ),
+    #
+    # Far scenes keep the face as large as the seed's: the grader scores -1
+    # "Face not dominant" under a face_ratio of 0.10, which 18% of graded far
+    # background_out attempts hit on 2026-11-26/27.
     ("background_in", "far"): (
         "Place the subject in a clearly different indoor setting with its own "
         "interior design and visible depth: {scene}. Colourful and detailed, "
         "not white walls, and fully indoors, with no windows, sky or outdoor "
-        "elements anywhere in the frame."
+        "elements anywhere in the frame. The subject stays as large in the "
+        "frame as in the reference photo."
     ),
+    # Outdoor must read outdoor to the grader's own CLIP check, which scores
+    # 0 ("expected outdoor, CLIP classified indoor") on 41% of our graded
+    # attempts, 62% of light ones (2026-11-26/27). What it called indoor was
+    # a wall, fence, door or stall close behind the subject; what passed
+    # showed open sky, water, trees or landscape receding behind them. So
+    # every level asks for open sky and depth, light included: a light take
+    # the grader reads as medium is still scored in full ("Label close").
     ("background_out", "light"): (
-        "Replace the plain backdrop with a real outdoor scene close behind the "
-        "subject: {scene}. Slightly out of focus but clearly recognisable as "
-        "outdoors, never a blank backdrop."
+        "Replace the plain backdrop with a real open-air outdoor scene behind "
+        "the subject: {scene}. Open sky is visible above and behind them, with "
+        "open space between the subject and the scenery. Softly out of focus "
+        "but clearly recognisable as outdoors, never a blank backdrop."
     ),
     ("background_out", "medium"): (
         "Place the subject in a different but plausible outdoor setting: "
-        "{scene}. The place is clearly visible behind them."
+        "{scene}. The place is clearly visible behind them, open to the sky, "
+        "with open space between the subject and the scenery."
     ),
     ("background_out", "far"): (
         "Place the subject in a clearly different outdoor setting with its own "
         "composition and depth: {scene}. The scene recedes into the distance "
-        "behind them."
+        "behind them under open sky. The subject stays as large in the frame "
+        "as in the reference photo."
     ),
 }
 
@@ -563,20 +578,34 @@ POSE_HINTS: Dict[str, str] = {
 }
 
 # Appended on a retry after the background check (MIID/miner/background_check.py)
-# read an attempt's environment as the wrong kind of scene; keyed by what the
-# check saw, so the hint names the failure the model just produced.
+# or the owner's grader (grade_check.hints) read an attempt's environment as
+# the wrong kind of scene; keyed by what the check saw, so the hint names the
+# failure the model just produced. The grader called clearly outdoor takes
+# indoor when a wall, fence or building front stood close behind the subject
+# (2026-11-26/27), so "outdoors" here means open sky and depth.
 BACKGROUND_HINTS: Dict[str, str] = {
     "indoor": (
-        "The previous attempt placed the subject indoors. This time the scene "
-        "behind the subject must be unmistakably outdoors: open sky or "
-        "daylight, trees, streets, buildings or landscape, with no walls, "
-        "ceilings or interior furniture anywhere in view."
+        "The previous attempt's background read as indoors. This time the "
+        "scene behind the subject must be unmistakably open-air: a wide view "
+        "with plenty of open sky, and trees, water, fields, hills or a distant "
+        "skyline receding behind them, with no wall, fence, ceiling or "
+        "building front close behind the subject."
     ),
     "outdoor": (
         "The previous attempt placed the subject outdoors. This time the scene "
         "behind the subject must be unmistakably indoors: a room with walls, "
         "interior furniture or shelving and indoor lighting, with no sky, "
         "trees or street anywhere in view."
+    ),
+}
+
+# Appended on a retry after the owner's grader scored the face too small
+# ("Face not dominant", face_ratio under 0.10; see grade_check.hints).
+FRAMING_HINTS: Dict[str, str] = {
+    "closer": (
+        "The previous attempt showed the subject too small in the frame: frame "
+        "them head-and-shoulders exactly as in the reference photo, the head "
+        "as large in the picture as it is there."
     ),
 }
 
@@ -1273,8 +1302,8 @@ def _get_prompt_from_request(
     whose environment read wrong, and names the failure to avoid.
 
     ``hints`` carries any of these and more by component — ``pose``,
-    ``background``, ``lighting``, ``expression``, ``accessory`` — each a key
-    into the matching *_HINTS table (image_generator._Slot.next_settings).
+    ``background``, ``lighting``, ``expression``, ``accessory``, ``framing``
+    — each a key into the matching *_HINTS table (image_generator._Slot.next_settings).
     The two named arguments are the older spelling of the first two.
     """
     description = _req_field(req, "description")
@@ -1295,7 +1324,7 @@ def _get_prompt_from_request(
         for component, table in (
             ("pose", POSE_HINTS), ("background", BACKGROUND_HINTS),
             ("lighting", LIGHT_HINTS), ("expression", EXPRESSION_HINTS),
-            ("accessory", ACCESSORY_HINTS),
+            ("accessory", ACCESSORY_HINTS), ("framing", FRAMING_HINTS),
         ):
             hint = merged.get(component)
             if hint in table:
